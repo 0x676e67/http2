@@ -78,6 +78,30 @@ pub struct Pseudo {
     pub order: PseudoOrders,
 }
 
+/// Represents the order of HTTP/2 pseudo-header fields in the header block.
+///
+/// HTTP/2 pseudo-header fields are a set of predefined header fields that start with ':'.
+/// The order of these fields in a header block is significant. This enum defines the
+/// possible pseudo-header fields and their standard order according to RFC 7540.
+///
+/// # Fields
+/// - `Method`: The `:method` pseudo-header field
+/// - `Scheme`: The `:scheme` pseudo-header field
+/// - `Authority`: The `:authority` pseudo-header field
+/// - `Path`: The `:path` pseudo-header field
+///
+/// # Ordering Rules
+/// According to RFC 7540, pseudo-header fields:
+/// - Must appear before regular header fields
+/// - Must not appear after regular header fields
+/// - Must not be repeated
+/// - Must be in the correct order as defined by the protocol
+///
+/// # Protocol Requirements
+/// - All HTTP/2 requests must include exactly one `:method`, `:scheme`, and `:path`
+///   pseudo-header field, unless it is a CONNECT request
+/// - The `:authority` pseudo-header field is optional but recommended
+/// - CONNECT requests have special rules for pseudo-headers
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PseudoOrder {
     Method,

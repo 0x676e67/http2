@@ -2,10 +2,10 @@ use crate::frame::*;
 use crate::tracing;
 use bytes::BufMut;
 
-// The PRIORITY frame (type=0x2) specifies the sender-advised priority
-// of a stream [Section 5.3].  It can be sent in any stream state,
-// including idle or closed streams.
-// [Section 5.3]: https://tools.ietf.org/html/rfc7540#section-5.3
+/// The PRIORITY frame (type=0x2) specifies the sender-advised priority
+/// of a stream [Section 5.3].  It can be sent in any stream state,
+/// including idle or closed streams.
+/// [Section 5.3]: https://tools.ietf.org/html/rfc7540#section-5.3
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Priority {
     /// The stream ID of the stream that this priority frame is for
@@ -15,6 +15,18 @@ pub struct Priority {
     dependency: StreamDependency,
 }
 
+/// Represents a stream dependency in HTTP/2 priority frames.
+///
+/// A stream dependency consists of three components:
+/// * A stream identifier that the stream depends on
+/// * A weight value between 0 and 255 (representing 1-256 in the protocol)
+/// * An exclusive flag indicating whether this is an exclusive dependency
+///
+/// # Stream Dependencies
+///
+/// In HTTP/2, stream dependencies form a dependency tree where each stream
+/// can depend on another stream. This creates a priority hierarchy that helps
+/// determine the relative order in which streams should be processed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StreamDependency {
     /// The ID of the stream dependency target

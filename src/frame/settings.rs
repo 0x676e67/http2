@@ -4,6 +4,22 @@ use crate::frame::{util, Error, Frame, FrameSize, Head, Kind, StreamId};
 use crate::tracing;
 use bytes::{BufMut, BytesMut};
 
+/// Represents the order of settings parameters in an HTTP/2 SETTINGS frame.
+///
+/// HTTP/2 settings parameters are transmitted in pairs of an unsigned 16-bit
+/// identifier and an unsigned 32-bit value. While the order of settings is not
+/// significant according to the protocol, maintaining a consistent order can be
+/// useful for testing and debugging.
+///
+/// # Parameters
+/// - `HeaderTableSize`: SETTINGS_HEADER_TABLE_SIZE (0x1)
+/// - `EnablePush`: SETTINGS_ENABLE_PUSH (0x2)
+/// - `InitialWindowSize`: SETTINGS_INITIAL_WINDOW_SIZE (0x4)
+/// - `MaxConcurrentStreams`: SETTINGS_MAX_CONCURRENT_STREAMS (0x3)
+/// - `MaxFrameSize`: SETTINGS_MAX_FRAME_SIZE (0x5)
+/// - `MaxHeaderListSize`: SETTINGS_MAX_HEADER_LIST_SIZE (0x6)
+/// - `UnknownSetting8`: SETTINGS_ENABLE_CONNECT_PROTOCOL (0x8)
+/// - `UnknownSetting9`: Reserved for future use (0x9)
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SettingsOrder {
     HeaderTableSize,
