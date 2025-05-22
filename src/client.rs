@@ -1194,7 +1194,7 @@ impl Builder {
     }
 
     /// Configures HTTP/2 setting with identifier 9.
-    /// 
+    ///
     /// This setting is reserved for future use or experimental purposes.
     /// Enabling or disabling it may have no effect unless explicitly supported
     /// by the server or client implementation.
