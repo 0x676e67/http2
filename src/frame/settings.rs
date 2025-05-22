@@ -46,14 +46,14 @@ pub enum SettingId {
 const SETTING_ORDER_STACK_SIZE: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SettingsOrder {
+pub struct SettingOrder {
     ids: smallvec::SmallVec<[SettingId; SETTING_ORDER_STACK_SIZE]>,
     mask: u16,
 }
 
-impl Default for SettingsOrder {
+impl Default for SettingOrder {
     fn default() -> Self {
-        SettingsOrder {
+        SettingOrder {
             ids: [
                 SettingId::HeaderTableSize,
                 SettingId::EnablePush,
@@ -71,7 +71,7 @@ impl Default for SettingsOrder {
     }
 }
 
-impl SettingsOrder {
+impl SettingOrder {
     pub fn push(&mut self, id: SettingId) {
         let mask_id = {
             let n = u16::from(id as u16);
@@ -109,7 +109,7 @@ pub struct Settings {
     enable_connect_protocol: Option<u32>,
     unknown_setting_9: Option<u32>,
     // Settings order
-    settings_order: SettingsOrder,
+    settings_order: SettingOrder,
 }
 
 /// An enum that lists all valid settings that can be sent in a SETTINGS
@@ -226,7 +226,7 @@ impl Settings {
         self.unknown_setting_9 = Some(enable as u32);
     }
 
-    pub fn set_settings_order(&mut self, order: Option<SettingsOrder>) {
+    pub fn set_settings_order(&mut self, order: Option<SettingOrder>) {
         self.settings_order = order.unwrap_or_default();
     }
 
