@@ -1193,7 +1193,11 @@ impl Builder {
         self
     }
 
-    /// Sets the unknown setting 9.
+    /// Configures HTTP/2 setting with identifier 9.
+    /// 
+    /// This setting is reserved for future use or experimental purposes.
+    /// Enabling or disabling it may have no effect unless explicitly supported
+    /// by the server or client implementation.
     pub fn unknown_setting9(&mut self, enabled: bool) -> &mut Self {
         self.settings.set_unknown_setting_9(enabled);
         self
