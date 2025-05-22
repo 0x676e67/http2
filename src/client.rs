@@ -696,7 +696,7 @@ impl Builder {
     }
 
     /// Settings frame order
-    pub fn settings_order(&mut self, order: [SettingsOrder; 8]) -> &mut Self {
+    pub fn settings_order(&mut self, order: SettingsOrder) -> &mut Self {
         self.settings.set_settings_order(Some(order));
         self
     }

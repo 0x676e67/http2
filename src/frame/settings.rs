@@ -4,55 +4,95 @@ use crate::frame::{util, Error, Frame, FrameSize, Head, Kind, StreamId};
 use crate::tracing;
 use bytes::{BufMut, BytesMut};
 
-/// Represents the order of settings parameters in an HTTP/2 SETTINGS frame.
+/// Represents all valid HTTP/2 settings that may appear in a SETTINGS frame.
 ///
-/// HTTP/2 settings parameters are transmitted in pairs of an unsigned 16-bit
-/// identifier and an unsigned 32-bit value. While the order of settings is not
-/// significant according to the protocol, maintaining a consistent order can be
-/// useful for testing and debugging.
-///
-/// # Parameters
-/// - `HeaderTableSize`: SETTINGS_HEADER_TABLE_SIZE (0x1)
-/// - `EnablePush`: SETTINGS_ENABLE_PUSH (0x2)
-/// - `InitialWindowSize`: SETTINGS_INITIAL_WINDOW_SIZE (0x4)
-/// - `MaxConcurrentStreams`: SETTINGS_MAX_CONCURRENT_STREAMS (0x3)
-/// - `MaxFrameSize`: SETTINGS_MAX_FRAME_SIZE (0x5)
-/// - `MaxHeaderListSize`: SETTINGS_MAX_HEADER_LIST_SIZE (0x6)
-/// - `UnknownSetting8`: SETTINGS_ENABLE_CONNECT_PROTOCOL (0x8)
-/// - `UnknownSetting9`: Reserved for future use (0x9)
+/// Each variant corresponds to a defined setting with a 32-bit unsigned integer value,
+/// as specified in [RFC 9113 §6.5.1](https://datatracker.ietf.org/doc/html/rfc9113#name-defined-settings).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum SettingsOrder {
-    HeaderTableSize,
-    EnablePush,
-    InitialWindowSize,
-    MaxConcurrentStreams,
-    MaxFrameSize,
-    MaxHeaderListSize,
-    UnknownSetting8,
-    UnknownSetting9,
+pub enum SettingId {
+    /// Advertises the maximum size (in octets) of the dynamic table
+    /// used for HPACK header compression (RFC 7541 §4.2).
+    HeaderTableSize = 0x0001,
+
+    /// Enables or disables server push. A client setting this to `0` and receiving
+    /// a PUSH_PROMISE frame must treat it as a connection error (PROTOCOL_ERROR).
+    /// A server must not send `1`; it may omit this setting or send `0`.
+    EnablePush = 0x0002,
+
+    /// Specifies the maximum number of concurrent streams the sender allows.
+    /// A value of `0` temporarily disallows new streams but is not special.
+    MaxConcurrentStreams = 0x0003,
+
+    /// Sets the initial stream-level flow control window size (in octets).
+    /// Values > 2^31 - 1 are considered FLOW_CONTROL_ERRORs (RFC 9113 §6.9.2).
+    InitialWindowSize = 0x0004,
+
+    /// Indicates the largest acceptable frame payload size (in octets).
+    /// Must be between 2^14 (16,384) and 2^24 - 1 (16,777,215), inclusive.
+    MaxFrameSize = 0x0005,
+
+    /// Advises the peer of the max field section size (in octets, uncompressed).
+    /// Includes field name/value lengths plus 32 bytes overhead per field.
+    MaxHeaderListSize = 0x0006,
+
+    /// Enables support for the Extended CONNECT protocol (RFC 8441),
+    /// which introduces the `:protocol` pseudo-header.
+    EnableConnectProtocol = 0x0008,
+
+    /// Reserved for future use.
+    UnknownSetting9 = 0x0009,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SettingsOrders([SettingsOrder; 8]);
+const SETTING_ORDER_STACK_SIZE: usize = 8;
 
-impl From<[SettingsOrder; 8]> for SettingsOrders {
-    fn from(order: [SettingsOrder; 8]) -> Self {
-        SettingsOrders(order)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettingsOrder {
+    ids: smallvec::SmallVec<[SettingId; SETTING_ORDER_STACK_SIZE]>,
+    mask: u16,
+}
+
+impl Default for SettingsOrder {
+    fn default() -> Self {
+        SettingsOrder {
+            ids: [
+                SettingId::HeaderTableSize,
+                SettingId::EnablePush,
+                SettingId::InitialWindowSize,
+                SettingId::MaxConcurrentStreams,
+                SettingId::MaxFrameSize,
+                SettingId::MaxHeaderListSize,
+                SettingId::EnableConnectProtocol,
+                SettingId::UnknownSetting9,
+            ]
+            .into_iter()
+            .collect(),
+            mask: 0,
+        }
     }
 }
 
-impl Default for SettingsOrders {
-    fn default() -> Self {
-        SettingsOrders([
-            SettingsOrder::HeaderTableSize,
-            SettingsOrder::EnablePush,
-            SettingsOrder::InitialWindowSize,
-            SettingsOrder::MaxConcurrentStreams,
-            SettingsOrder::MaxFrameSize,
-            SettingsOrder::MaxHeaderListSize,
-            SettingsOrder::UnknownSetting8,
-            SettingsOrder::UnknownSetting9,
-        ])
+impl SettingsOrder {
+    pub fn push(&mut self, id: SettingId) {
+        let mask_id = {
+            let n = u16::from(id as u16);
+            if n == 0 || n > 15 {
+                0
+            } else {
+                1 << ((u16::from(id as u16) - 1) as usize)
+            }
+        };
+        if self.mask & mask_id == 0 {
+            self.mask |= mask_id;
+            self.ids.push(id);
+        } else {
+            tracing::trace!("duplicate setting ID ignored: {id:?}");
+        }
+    }
+
+    pub fn extend(&mut self, iter: impl IntoIterator<Item = SettingId>) {
+        for header in iter {
+            self.push(header);
+        }
     }
 }
 
@@ -68,8 +108,8 @@ pub struct Settings {
     max_header_list_size: Option<u32>,
     enable_connect_protocol: Option<u32>,
     unknown_setting_9: Option<u32>,
-    // Fields for the settings frame order
-    settings_orders: SettingsOrders,
+    // Settings order
+    settings_order: SettingsOrder,
 }
 
 /// An enum that lists all valid settings that can be sent in a SETTINGS
@@ -186,8 +226,8 @@ impl Settings {
         self.unknown_setting_9 = Some(enable as u32);
     }
 
-    pub fn set_settings_order(&mut self, order: Option<[SettingsOrder; 8]>) {
-        self.settings_orders = order.map_or(SettingsOrders::default(), SettingsOrders::from);
+    pub fn set_settings_order(&mut self, order: Option<SettingsOrder>) {
+        self.settings_order = order.unwrap_or_default();
     }
 
     pub fn load(head: Head, payload: &[u8]) -> Result<Settings, Error> {
@@ -302,44 +342,44 @@ impl Settings {
     fn for_each<F: FnMut(Setting)>(&self, mut f: F) {
         use self::Setting::*;
 
-        for order in self.settings_orders.0.iter() {
+        for order in self.settings_order.ids.iter() {
             match order {
-                SettingsOrder::HeaderTableSize => {
+                SettingId::HeaderTableSize => {
                     if let Some(v) = self.header_table_size {
                         f(HeaderTableSize(v));
                     }
                 }
-                SettingsOrder::EnablePush => {
+                SettingId::EnablePush => {
                     if let Some(v) = self.enable_push {
                         f(EnablePush(v));
                     }
                 }
-                SettingsOrder::InitialWindowSize => {
+                SettingId::InitialWindowSize => {
                     if let Some(v) = self.initial_window_size {
                         f(InitialWindowSize(v));
                     }
                 }
-                SettingsOrder::MaxConcurrentStreams => {
+                SettingId::MaxConcurrentStreams => {
                     if let Some(v) = self.max_concurrent_streams {
                         f(MaxConcurrentStreams(v));
                     }
                 }
-                SettingsOrder::UnknownSetting8 => {
+                SettingId::EnableConnectProtocol => {
                     if let Some(v) = self.enable_connect_protocol {
                         f(EnableConnectProtocol(v));
                     }
                 }
-                SettingsOrder::UnknownSetting9 => {
+                SettingId::UnknownSetting9 => {
                     if let Some(v) = self.unknown_setting_9 {
                         f(UnknownSetting9(v));
                     }
                 }
-                SettingsOrder::MaxFrameSize => {
+                SettingId::MaxFrameSize => {
                     if let Some(v) = self.max_frame_size {
                         f(MaxFrameSize(v));
                     }
                 }
-                SettingsOrder::MaxHeaderListSize => {
+                SettingId::MaxHeaderListSize => {
                     if let Some(v) = self.max_header_list_size {
                         f(MaxHeaderListSize(v));
                     }
