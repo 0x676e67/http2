@@ -1721,7 +1721,7 @@ impl Peer {
         // Create the HEADERS frame
         let mut headers_frame = Headers::new(id, pseudo, headers);
         if let Some(stream_dep) = headers_priority {
-              headers_frame.set_stream_dependency(stream_dep);
+            headers_frame.set_stream_dependency(stream_dep);
         }
 
         if end_of_stream {
