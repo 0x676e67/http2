@@ -1,7 +1,6 @@
-use http2 as h2;
-
 use bytes::{BufMut, Bytes};
 use futures::ready;
+use http2 as h2;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};

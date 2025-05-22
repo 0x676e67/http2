@@ -223,7 +223,6 @@ impl Recv {
                     stream.id,
                     frame::Pseudo::response(::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
                     HeaderMap::new(),
-                    None,
                 );
                 res.set_end_stream();
                 Err(RecvHeaderBlockError::Oversize(Some(res)))

@@ -170,29 +170,17 @@ const ALL: u8 = END_STREAM | END_HEADERS | PADDED | PRIORITY;
 
 impl Headers {
     /// Create a new HEADERS frame
-    pub fn new(
-        stream_id: StreamId,
-        pseudo: Pseudo,
-        fields: HeaderMap,
-        stream_dep: Option<StreamDependency>,
-    ) -> Self {
-        // If the stream dependency is set, the PRIORITY flag must be set
-        let flags = if stream_dep.is_some() {
-            HeadersFlag(END_HEADERS | PRIORITY)
-        } else {
-            HeadersFlag::default()
-        };
-
+    pub fn new(stream_id: StreamId, pseudo: Pseudo, fields: HeaderMap) -> Self {
         Headers {
             stream_id,
-            stream_dep,
+            stream_dep: None,
             header_block: HeaderBlock {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
                 pseudo,
             },
-            flags,
+            flags: HeadersFlag::default(),
         }
     }
 
@@ -324,6 +312,12 @@ impl Headers {
 
     pub(crate) fn pseudo(&self) -> &Pseudo {
         &self.header_block.pseudo
+    }
+
+    // If the stream dependency is set, the PRIORITY flag must be set
+    pub fn set_stream_dependency(&mut self, stream_dep: StreamDependency) {
+        self.flags = HeadersFlag(END_HEADERS | PRIORITY);
+        self.stream_dep = Some(stream_dep);
     }
 
     /// Whether it has status 1xx
@@ -1109,7 +1103,6 @@ mod test {
                     HeaderValue::from_static("sup"),
                 ),
             ]),
-            None,
         );
 
         let continuation = headers

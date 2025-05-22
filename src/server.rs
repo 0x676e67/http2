@@ -1463,7 +1463,7 @@ impl Peer {
         let pseudo = Pseudo::response(status);
 
         // Create the HEADERS frame
-        let mut frame = frame::Headers::new(id, pseudo, headers, None);
+        let mut frame = frame::Headers::new(id, pseudo, headers);
 
         if end_of_stream {
             frame.set_end_stream()
