@@ -404,7 +404,7 @@ impl Settings {
                     if let Some(ref unknown_settings) = self.unknown_settings {
                         if let Some(setting) = unknown_settings
                             .iter()
-                            .find(|setting| setting.id() == SettingId::Unknown(*id))
+                            .find(|setting| setting.id == SettingId::Unknown(*id))
                         {
                             f(setting.clone());
                         }
@@ -498,10 +498,6 @@ impl Setting {
 
         dst.put_u16(kind);
         dst.put_u32(val);
-    }
-
-    const fn id(&self) -> SettingId {
-        self.id
     }
 }
 
