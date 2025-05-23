@@ -43,7 +43,7 @@ define_enum_with_values! {
         /// Enables support for the Extended CONNECT protocol.
         EnableConnectProtocol => 0x0008,
 
-        /// Disabling RFC 7540 Stream Priorities
+        /// Disable RFC 7540 Stream Priorities.
         /// [RFC 9218]: https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1
         NoRfc7540Priorities => 0x0009,
     }
