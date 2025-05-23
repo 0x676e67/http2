@@ -138,7 +138,7 @@
 use crate::codec::{Codec, SendError, UserError};
 use crate::ext::Protocol;
 use crate::frame::{
-    Headers, Priority, Pseudo, PseudoOrder, PseudoOrders, Reason, Settings, SettingOrder,
+    Headers, Priority, Pseudo, PseudoOrder, PseudoOrders, Reason, Setting, SettingOrder, Settings,
     StreamDependency, StreamId,
 };
 use crate::proto::{self, Error};
@@ -1193,9 +1193,9 @@ impl Builder {
         self
     }
 
-    /// Sets the unknown setting 9.
-    pub fn unknown_setting9(&mut self, enabled: bool) -> &mut Self {
-        self.settings.set_unknown_setting_9(enabled);
+    /// Sets the unknown settings.
+    pub fn unknown_settings(&mut self, iter: impl IntoIterator<Item = Setting>) -> &mut Self {
+        self.settings.set_unknown_settings(iter);
         self
     }
 
