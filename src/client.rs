@@ -138,7 +138,7 @@
 use crate::codec::{Codec, SendError, UserError};
 use crate::ext::Protocol;
 use crate::frame::{
-    Headers, Priority, Pseudo, PseudoOrder, PseudoOrders, Reason, Setting, SettingOrder, Settings,
+    Headers, Priority, Pseudo, PseudoOrder, PseudoOrders, Reason, Setting, Settings, SettingsOrder,
     StreamDependency, StreamId,
 };
 use crate::proto::{self, Error};
@@ -696,7 +696,7 @@ impl Builder {
     }
 
     /// Settings frame order
-    pub fn settings_order(&mut self, order: SettingOrder) -> &mut Self {
+    pub fn settings_order(&mut self, order: SettingsOrder) -> &mut Self {
         self.settings.set_settings_order(Some(order));
         self
     }

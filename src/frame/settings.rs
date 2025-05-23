@@ -73,12 +73,12 @@ impl SettingId {
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
-pub struct SettingOrder {
+pub struct SettingsOrder {
     ids: SmallVec<[SettingId; DEFAULT_SETTING_STACK_SIZE]>,
     mask: u16,
 }
 
-impl SettingOrder {
+impl SettingsOrder {
     /// Push a setting ID into the order.
     pub fn push(&mut self, id: SettingId) {
         let mask_id = id.mask_id();
@@ -116,8 +116,8 @@ pub struct Settings {
     max_header_list_size: Option<u32>,
     enable_connect_protocol: Option<u32>,
     unknown_settings: Option<SmallVec<[Setting; DEFAULT_SETTING_STACK_SIZE]>>,
-    // Setting order
-    setting_order: Option<SettingOrder>,
+    // Settings order
+    settings_order: Option<SettingsOrder>,
 }
 
 /// An enum that lists all valid settings that can be sent in a SETTINGS
@@ -229,8 +229,8 @@ impl Settings {
         unknown_settings.extend(settings);
     }
 
-    pub fn set_settings_order(&mut self, setting_order: Option<SettingOrder>) {
-        self.setting_order = setting_order;
+    pub fn set_settings_order(&mut self, settings_order: Option<SettingsOrder>) {
+        self.settings_order = settings_order;
     }
 
     pub fn load(head: Head, payload: &[u8]) -> Result<Settings, Error> {
@@ -344,7 +344,7 @@ impl Settings {
 
     fn for_each<F: FnMut(Setting)>(&self, mut f: F) {
         let ids = self
-            .setting_order
+            .settings_order
             .as_ref()
             .map(|order| order.ids.as_ref())
             .unwrap_or(&SettingId::DEFAULT_IDS);
@@ -539,7 +539,7 @@ impl fmt::Debug for SettingsFlags {
 mod tests {
     use super::*;
 
-    fn extend_with_default(order: &mut SettingOrder) {
+    fn extend_with_default(order: &mut SettingsOrder) {
         const MASK: u16 = 1 << SettingId::MAX_SETTING_ID;
         if order.mask & MASK == MASK {
             return;
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_extend_with_default_only_adds_once() {
-        let mut order = SettingOrder::default();
+        let mut order = SettingsOrder::default();
         assert!(order.ids.is_empty());
         assert_eq!(order.mask, 0);
 
@@ -565,7 +565,7 @@ mod tests {
 
     #[test]
     fn test_extend_with_default_and_unknown_ids() {
-        let mut order = SettingOrder::default();
+        let mut order = SettingsOrder::default();
         extend_with_default(&mut order);
         order.extend([SettingId::Unknown(10)]);
         assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 1);
