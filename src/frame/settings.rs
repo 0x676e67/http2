@@ -42,6 +42,10 @@ define_enum_with_values! {
 
         /// Enables support for the Extended CONNECT protocol.
         EnableConnectProtocol => 0x0008,
+
+        /// Disabling RFC 7540 Stream Priorities
+        /// [RFC 9218]: https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1
+        NoRfc7540Priorities => 0x0009,
     }
 }
 
@@ -59,7 +63,7 @@ impl SettingId {
         SettingId::MaxFrameSize,
         SettingId::MaxHeaderListSize,
         SettingId::EnableConnectProtocol,
-        SettingId::Unknown(0x09),
+        SettingId::NoRfc7540Priorities,
     ];
 
     fn mask_id(self) -> u16 {
@@ -115,6 +119,7 @@ pub struct Settings {
     max_frame_size: Option<u32>,
     max_header_list_size: Option<u32>,
     enable_connect_protocol: Option<u32>,
+    no_rfc7540_priorities: Option<u32>,
     unknown_settings: Option<SmallVec<[Setting; DEFAULT_SETTING_STACK_SIZE]>>,
     // Settings order
     settings_order: Option<SettingsOrder>,
@@ -224,6 +229,10 @@ impl Settings {
         self.header_table_size = size;
     }
 
+    pub fn set_no_rfc7540_priorities(&mut self, enable: bool) {
+        self.no_rfc7540_priorities = Some(enable as u32);
+    }
+
     pub fn set_unknown_settings(&mut self, settings: impl IntoIterator<Item = Setting>) {
         let unknown_settings = self.unknown_settings.get_or_insert_with(SmallVec::new);
         unknown_settings.extend(settings);
@@ -301,6 +310,14 @@ impl Settings {
                     SettingId::EnableConnectProtocol => match setting.value {
                         0 | 1 => {
                             settings.enable_connect_protocol = Some(setting.value);
+                        }
+                        _ => {
+                            return Err(Error::InvalidSettingValue);
+                        }
+                    },
+                    SettingId::NoRfc7540Priorities => match setting.value {
+                        0 | 1 => {
+                            settings.no_rfc7540_priorities = Some(setting.value);
                         }
                         _ => {
                             return Err(Error::InvalidSettingValue);
@@ -400,6 +417,13 @@ impl Settings {
                         }
                     }
                 }
+                SettingId::NoRfc7540Priorities => {
+                    if let Some(v) = self.no_rfc7540_priorities {
+                        if let Some(setting) = Setting::from_id(*id, v) {
+                            f(setting);
+                        }
+                    }
+                }
                 SettingId::Unknown(id) => {
                     if let Some(ref unknown_settings) = self.unknown_settings {
                         if let Some(setting) = unknown_settings
@@ -447,6 +471,9 @@ impl fmt::Debug for Settings {
             }
             SettingId::EnableConnectProtocol => {
                 builder.field("enable_connect_protocol", &setting.value);
+            }
+            SettingId::NoRfc7540Priorities => {
+                builder.field("no_rfc7540_priorities", &setting.value);
             }
             SettingId::Unknown(id) => {
                 builder.field("unknown", &format!("id={id:?}, val={}", setting.value));

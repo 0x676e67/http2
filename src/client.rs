@@ -1193,6 +1193,13 @@ impl Builder {
         self
     }
 
+    /// Sets the RFC 7540 Stream Priorities
+    /// [RFC 9218]: https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1
+    pub fn no_rfc7540_priorities(&mut self, enabled: bool) -> &mut Self {
+        self.settings.set_no_rfc7540_priorities(enabled);
+        self
+    }
+
     /// Configures custom HTTP/2 setting.
     ///
     /// This setting is reserved for future use or experimental purposes.
