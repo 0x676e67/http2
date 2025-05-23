@@ -1193,7 +1193,11 @@ impl Builder {
         self
     }
 
-    /// Sets the unknown settings.
+    /// Configures custom HTTP/2 setting.
+    ///
+    /// This setting is reserved for future use or experimental purposes.
+    /// Enabling or disabling it may have no effect unless explicitly supported
+    /// by the server or client implementation.
     pub fn unknown_settings(&mut self, iter: impl IntoIterator<Item = Setting>) -> &mut Self {
         self.settings.set_unknown_settings(iter);
         self
