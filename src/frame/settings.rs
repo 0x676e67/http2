@@ -5,6 +5,9 @@ use crate::tracing;
 use bytes::{BufMut, BytesMut};
 use smallvec::SmallVec;
 
+/// The maximum number of settings that can be sent in a SETTINGS frame.
+const DEFAULT_SETTING_STACK_SIZE: usize = 8;
+
 define_enum_with_values! {
     /// An enum that lists all valid settings that can be sent in a SETTINGS
     /// frame.
@@ -42,44 +45,43 @@ define_enum_with_values! {
     }
 }
 
-const DEFAULT_SETTING_STACK_SIZE: usize = 8;
+impl SettingId {
+    /// The maximum allowed SettingId value for bitmask operations.
+    /// This should not exceed the number of bits in the mask type (u16: 16, u32: 32, etc.)
+    const MAX_SETTING_ID: u16 = 15;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+    /// The default setting IDs that are used when no specific order is provided.
+    const DEFAULT_IDS: [SettingId; DEFAULT_SETTING_STACK_SIZE] = [
+        SettingId::HeaderTableSize,
+        SettingId::EnablePush,
+        SettingId::InitialWindowSize,
+        SettingId::MaxConcurrentStreams,
+        SettingId::MaxFrameSize,
+        SettingId::MaxHeaderListSize,
+        SettingId::EnableConnectProtocol,
+        SettingId::Unknown(0x09),
+    ];
+
+    fn mask_id(self) -> u16 {
+        let value = u16::from(self);
+        if value == 0 || value > Self::MAX_SETTING_ID {
+            return 0;
+        }
+
+        1 << (value - 1)
+    }
+}
+
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct SettingOrder {
     ids: SmallVec<[SettingId; DEFAULT_SETTING_STACK_SIZE]>,
     mask: u16,
 }
 
-impl Default for SettingOrder {
-    fn default() -> Self {
-        SettingOrder {
-            ids: [
-                SettingId::HeaderTableSize,
-                SettingId::EnablePush,
-                SettingId::InitialWindowSize,
-                SettingId::MaxConcurrentStreams,
-                SettingId::MaxFrameSize,
-                SettingId::MaxHeaderListSize,
-                SettingId::EnableConnectProtocol,
-                SettingId::Unknown(0x09),
-            ]
-            .into_iter()
-            .collect(),
-            mask: 0,
-        }
-    }
-}
-
 impl SettingOrder {
+    /// Push a setting ID into the order.
     pub fn push(&mut self, id: SettingId) {
-        let mask_id = {
-            let value = u16::from(id);
-            if value == 0 || value > 15 {
-                0
-            } else {
-                1 << ((value - 1) as usize)
-            }
-        };
+        let mask_id = id.mask_id();
         if self.mask & mask_id == 0 {
             self.mask |= mask_id;
             self.ids.push(id);
@@ -88,9 +90,10 @@ impl SettingOrder {
         }
     }
 
+    /// Push a setting ID into the order, and extend the order with default IDs.
     pub fn extend(&mut self, iter: impl IntoIterator<Item = SettingId>) {
-        for header in iter {
-            self.push(header);
+        for id in iter {
+            self.push(id);
         }
     }
 }
@@ -108,7 +111,7 @@ pub struct Settings {
     enable_connect_protocol: Option<u32>,
     unknown_settings: Option<SmallVec<[Setting; DEFAULT_SETTING_STACK_SIZE]>>,
     // Setting order
-    setting_order: SettingOrder,
+    setting_order: Option<SettingOrder>,
 }
 
 /// An enum that lists all valid settings that can be sent in a SETTINGS
@@ -116,15 +119,9 @@ pub struct Settings {
 ///
 /// Each setting has a value that is a 32 bit unsigned integer (6.5.1.).
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Setting {
-    HeaderTableSize(u32),
-    EnablePush(u32),
-    MaxConcurrentStreams(u32),
-    InitialWindowSize(u32),
-    MaxFrameSize(u32),
-    MaxHeaderListSize(u32),
-    EnableConnectProtocol(u32),
-    Unknown(u16, u32),
+pub struct Setting {
+    id: SettingId,
+    value: u32,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Default)]
@@ -221,20 +218,16 @@ impl Settings {
         self.header_table_size = size;
     }
 
-    pub fn set_unknown_settings(&mut self, iter: impl IntoIterator<Item = Setting>) {
+    pub fn set_unknown_settings(&mut self, settings: impl IntoIterator<Item = Setting>) {
         let unknown_settings = self.unknown_settings.get_or_insert_with(SmallVec::new);
-        unknown_settings.extend(iter);
+        unknown_settings.extend(settings);
     }
 
     pub fn set_settings_order(&mut self, setting_order: Option<SettingOrder>) {
-        if let Some(setting_order) = setting_order {
-            self.setting_order = setting_order;
-        }
+        self.setting_order = setting_order;
     }
 
     pub fn load(head: Head, payload: &[u8]) -> Result<Settings, Error> {
-        use self::Setting::*;
-
         debug_assert_eq!(head.kind(), crate::frame::Kind::Settings);
 
         if !head.stream_id().is_zero() {
@@ -265,51 +258,55 @@ impl Settings {
 
         for raw in payload.chunks(6) {
             match Setting::load(raw) {
-                Some(HeaderTableSize(val)) => {
-                    settings.header_table_size = Some(val);
-                }
-                Some(EnablePush(val)) => match val {
-                    0 | 1 => {
-                        settings.enable_push = Some(val);
+                Some(setting) => match setting.id {
+                    SettingId::HeaderTableSize => {
+                        settings.header_table_size = Some(setting.value);
                     }
-                    _ => {
-                        return Err(Error::InvalidSettingValue);
+                    SettingId::EnablePush => match setting.value {
+                        0 | 1 => {
+                            settings.enable_push = Some(setting.value);
+                        }
+                        _ => {
+                            return Err(Error::InvalidSettingValue);
+                        }
+                    },
+                    SettingId::MaxConcurrentStreams => {
+                        settings.max_concurrent_streams = Some(setting.value);
+                    }
+                    SettingId::InitialWindowSize => {
+                        if setting.value as usize > MAX_INITIAL_WINDOW_SIZE {
+                            return Err(Error::InvalidSettingValue);
+                        } else {
+                            settings.initial_window_size = Some(setting.value);
+                        }
+                    }
+                    SettingId::MaxFrameSize => {
+                        if DEFAULT_MAX_FRAME_SIZE <= setting.value
+                            && setting.value <= MAX_MAX_FRAME_SIZE
+                        {
+                            settings.max_frame_size = Some(setting.value);
+                        } else {
+                            return Err(Error::InvalidSettingValue);
+                        }
+                    }
+                    SettingId::MaxHeaderListSize => {
+                        settings.max_header_list_size = Some(setting.value);
+                    }
+                    SettingId::EnableConnectProtocol => match setting.value {
+                        0 | 1 => {
+                            settings.enable_connect_protocol = Some(setting.value);
+                        }
+                        _ => {
+                            return Err(Error::InvalidSettingValue);
+                        }
+                    },
+                    SettingId::Unknown(_) => {
+                        settings
+                            .unknown_settings
+                            .get_or_insert_with(SmallVec::new)
+                            .push(setting);
                     }
                 },
-                Some(MaxConcurrentStreams(val)) => {
-                    settings.max_concurrent_streams = Some(val);
-                }
-                Some(InitialWindowSize(val)) => {
-                    if val as usize > MAX_INITIAL_WINDOW_SIZE {
-                        return Err(Error::InvalidSettingValue);
-                    } else {
-                        settings.initial_window_size = Some(val);
-                    }
-                }
-                Some(MaxFrameSize(val)) => {
-                    if DEFAULT_MAX_FRAME_SIZE <= val && val <= MAX_MAX_FRAME_SIZE {
-                        settings.max_frame_size = Some(val);
-                    } else {
-                        return Err(Error::InvalidSettingValue);
-                    }
-                }
-                Some(MaxHeaderListSize(val)) => {
-                    settings.max_header_list_size = Some(val);
-                }
-                Some(EnableConnectProtocol(val)) => match val {
-                    0 | 1 => {
-                        settings.enable_connect_protocol = Some(val);
-                    }
-                    _ => {
-                        return Err(Error::InvalidSettingValue);
-                    }
-                },
-                Some(Unknown(id, val)) => {
-                    settings
-                        .unknown_settings
-                        .get_or_insert_with(SmallVec::new)
-                        .push(Setting::from_id(id, val));
-                }
                 None => {}
             }
         }
@@ -340,43 +337,61 @@ impl Settings {
     }
 
     fn for_each<F: FnMut(Setting)>(&self, mut f: F) {
-        use self::Setting::*;
+        let ids = self
+            .setting_order
+            .as_ref()
+            .map(|order| order.ids.as_ref())
+            .unwrap_or(&SettingId::DEFAULT_IDS);
 
-        for order in self.setting_order.ids.iter() {
-            match order {
+        for id in ids {
+            match id {
                 SettingId::HeaderTableSize => {
                     if let Some(v) = self.header_table_size {
-                        f(HeaderTableSize(v));
+                        if let Some(setting) = Setting::from_id(*id, v) {
+                            f(setting);
+                        }
                     }
                 }
                 SettingId::EnablePush => {
                     if let Some(v) = self.enable_push {
-                        f(EnablePush(v));
+                        if let Some(setting) = Setting::from_id(*id, v) {
+                            f(setting);
+                        }
                     }
                 }
                 SettingId::MaxConcurrentStreams => {
                     if let Some(v) = self.max_concurrent_streams {
-                        f(MaxConcurrentStreams(v));
+                        if let Some(setting) = Setting::from_id(*id, v) {
+                            f(setting);
+                        }
                     }
                 }
                 SettingId::InitialWindowSize => {
                     if let Some(v) = self.initial_window_size {
-                        f(InitialWindowSize(v));
+                        if let Some(setting) = Setting::from_id(*id, v) {
+                            f(setting);
+                        }
                     }
                 }
                 SettingId::MaxFrameSize => {
                     if let Some(v) = self.max_frame_size {
-                        f(MaxFrameSize(v));
+                        if let Some(setting) = Setting::from_id(*id, v) {
+                            f(setting);
+                        }
                     }
                 }
                 SettingId::MaxHeaderListSize => {
                     if let Some(v) = self.max_header_list_size {
-                        f(MaxHeaderListSize(v));
+                        if let Some(setting) = Setting::from_id(*id, v) {
+                            f(setting);
+                        }
                     }
                 }
                 SettingId::EnableConnectProtocol => {
                     if let Some(v) = self.enable_connect_protocol {
-                        f(EnableConnectProtocol(v));
+                        if let Some(setting) = Setting::from_id(*id, v) {
+                            f(setting);
+                        }
                     }
                 }
                 SettingId::Unknown(id) => {
@@ -405,30 +420,30 @@ impl fmt::Debug for Settings {
         let mut builder = f.debug_struct("Settings");
         builder.field("flags", &self.flags);
 
-        self.for_each(|setting| match setting {
-            Setting::EnablePush(v) => {
-                builder.field("enable_push", &v);
+        self.for_each(|setting| match setting.id {
+            SettingId::EnablePush => {
+                builder.field("enable_push", &setting.value);
             }
-            Setting::HeaderTableSize(v) => {
-                builder.field("header_table_size", &v);
+            SettingId::HeaderTableSize => {
+                builder.field("header_table_size", &setting.value);
             }
-            Setting::InitialWindowSize(v) => {
-                builder.field("initial_window_size", &v);
+            SettingId::InitialWindowSize => {
+                builder.field("initial_window_size", &setting.value);
             }
-            Setting::MaxConcurrentStreams(v) => {
-                builder.field("max_concurrent_streams", &v);
+            SettingId::MaxConcurrentStreams => {
+                builder.field("max_concurrent_streams", &setting.value);
             }
-            Setting::MaxFrameSize(v) => {
-                builder.field("max_frame_size", &v);
+            SettingId::MaxFrameSize => {
+                builder.field("max_frame_size", &setting.value);
             }
-            Setting::MaxHeaderListSize(v) => {
-                builder.field("max_header_list_size", &v);
+            SettingId::MaxHeaderListSize => {
+                builder.field("max_header_list_size", &setting.value);
             }
-            Setting::EnableConnectProtocol(v) => {
-                builder.field("enable_connect_protocol", &v);
+            SettingId::EnableConnectProtocol => {
+                builder.field("enable_connect_protocol", &setting.value);
             }
-            Setting::Unknown(id, v) => {
-                builder.field("unknown", &format!("id={id:?}, val={v}"));
+            SettingId::Unknown(id) => {
+                builder.field("unknown", &format!("id={id:?}, val={}", setting.value));
             }
         });
 
@@ -442,18 +457,16 @@ impl Setting {
     /// Creates a new `Setting` with the correct variant corresponding to the
     /// given setting id, based on the settings IDs defined in section
     /// 6.5.2.
-    pub fn from_id(id: impl Into<SettingId>, val: u32) -> Setting {
-        use self::Setting::*;
-        match id.into() {
-            SettingId::HeaderTableSize => HeaderTableSize(val),
-            SettingId::EnablePush => EnablePush(val),
-            SettingId::MaxConcurrentStreams => MaxConcurrentStreams(val),
-            SettingId::InitialWindowSize => InitialWindowSize(val),
-            SettingId::MaxFrameSize => MaxFrameSize(val),
-            SettingId::MaxHeaderListSize => MaxHeaderListSize(val),
-            SettingId::EnableConnectProtocol => EnableConnectProtocol(val),
-            SettingId::Unknown(id) => Unknown(id, val),
+    pub fn from_id(id: impl Into<SettingId>, value: u32) -> Option<Setting> {
+        let id = id.into();
+        if let SettingId::Unknown(id) = id {
+            if id == 0 || id > SettingId::MAX_SETTING_ID {
+                tracing::debug!("limiting unknown setting id to 0x0..0xF");
+                return None;
+            }
         }
+
+        Some(Setting { id, value })
     }
 
     /// Creates a new `Setting` by parsing the given buffer of 6 bytes, which
@@ -470,40 +483,19 @@ impl Setting {
         let id: u16 = (u16::from(raw[0]) << 8) | u16::from(raw[1]);
         let val: u32 = unpack_octets_4!(raw, 2, u32);
 
-        Some(Setting::from_id(id, val))
+        Setting::from_id(id, val)
     }
 
     fn encode(&self, dst: &mut BytesMut) {
-        use self::Setting::*;
-
-        let (kind, val) = match *self {
-            HeaderTableSize(v) => (1, v),
-            EnablePush(v) => (2, v),
-            MaxConcurrentStreams(v) => (3, v),
-            InitialWindowSize(v) => (4, v),
-            MaxFrameSize(v) => (5, v),
-            MaxHeaderListSize(v) => (6, v),
-            EnableConnectProtocol(v) => (8, v),
-            Unknown(id, v) => (u16::from(id), v),
-        };
+        let kind = u16::from(self.id);
+        let val = self.value;
 
         dst.put_u16(kind);
         dst.put_u32(val);
     }
 
     const fn id(&self) -> SettingId {
-        use self::Setting::*;
-
-        match *self {
-            HeaderTableSize(_) => SettingId::HeaderTableSize,
-            EnablePush(_) => SettingId::EnablePush,
-            MaxConcurrentStreams(_) => SettingId::MaxConcurrentStreams,
-            InitialWindowSize(_) => SettingId::InitialWindowSize,
-            MaxFrameSize(_) => SettingId::MaxFrameSize,
-            MaxHeaderListSize(_) => SettingId::MaxHeaderListSize,
-            EnableConnectProtocol(_) => SettingId::EnableConnectProtocol,
-            Unknown(id, _) => SettingId::Unknown(id),
-        }
+        self.id
     }
 }
 
@@ -538,5 +530,51 @@ impl fmt::Debug for SettingsFlags {
         util::debug_flags(f, self.0)
             .flag_if(self.is_ack(), "ACK")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extend_with_default(order: &mut SettingOrder) {
+        const MASK: u16 = 1 << SettingId::MAX_SETTING_ID;
+        if order.mask & MASK == MASK {
+            return;
+        }
+        order.extend(SettingId::DEFAULT_IDS);
+    }
+
+    #[test]
+    fn test_extend_with_default_only_adds_once() {
+        let mut order = SettingOrder::default();
+        assert!(order.ids.is_empty());
+        assert_eq!(order.mask, 0);
+
+        extend_with_default(&mut order);
+        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE);
+
+        let orig_order = order.clone();
+        let n = order.ids.len();
+        extend_with_default(&mut order);
+        assert_eq!(order.ids.len(), n);
+        assert_eq!(order, orig_order);
+    }
+
+    #[test]
+    fn test_extend_with_default_and_unknown_ids() {
+        let mut order = SettingOrder::default();
+        extend_with_default(&mut order);
+        order.extend([SettingId::Unknown(10)]);
+        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 1);
+
+        extend_with_default(&mut order);
+        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 1);
+
+        order.extend([SettingId::Unknown(10)]);
+        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 1);
+
+        order.extend([SettingId::Unknown(11)]);
+        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 2);
     }
 }

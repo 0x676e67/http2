@@ -16,7 +16,6 @@ macro_rules! define_enum_with_values {
                 $(#[$variant_meta])*
                 $variant = $value,
             )*
-            /// Represents unknown or future values not currently defined in the spec.
             Unknown(u16),
         }
 
