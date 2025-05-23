@@ -82,6 +82,12 @@ impl SettingOrder {
     /// Push a setting ID into the order.
     pub fn push(&mut self, id: SettingId) {
         let mask_id = id.mask_id();
+
+        // If the ID is 0 or greater than the max setting ID, ignore it.
+        if mask_id == 0 {
+            return;
+        }
+
         if self.mask & mask_id == 0 {
             self.mask |= mask_id;
             self.ids.push(id);
@@ -576,5 +582,12 @@ mod tests {
 
         order.extend([SettingId::Unknown(11)]);
         assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 2);
+
+        order.extend([SettingId::Unknown(15)]);
+        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 3);
+
+        // ID > MAX_SETTING_ID
+        order.extend([SettingId::Unknown(16)]);
+        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 3);
     }
 }
