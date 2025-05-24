@@ -181,6 +181,7 @@ pub struct Priorities {
 pub struct PrioritiesBuilder {
     priorities: SmallVec<[Priority; 8]>,
     max_stream_id: StreamId,
+    inserted_bitmap: u32,
 }
 
 // ===== impl Priorities =====
@@ -190,6 +191,7 @@ impl Priorities {
         PrioritiesBuilder {
             priorities: SmallVec::new(),
             max_stream_id: StreamId::zero(),
+            inserted_bitmap: 0,
         }
     }
 
@@ -214,6 +216,34 @@ impl PrioritiesBuilder {
         if priority.stream_id.is_zero() {
             tracing::warn!("ignoring priority frame with stream ID 0");
             return self;
+        }
+
+        let id: u32 = priority.stream_id.into();
+        // Check for duplicate priorities based on stream ID.
+        // For stream IDs less than 32, we use a bitmap to track inserted priorities.
+        if id < 32 {
+            let mask = 1u32 << id;
+            if self.inserted_bitmap & mask != 0 {
+                tracing::debug!(
+                    "duplicate priority for stream_id={:?} ignored",
+                    priority.stream_id
+                );
+                return self;
+            }
+            self.inserted_bitmap |= mask;
+        } else {
+            // For stream_id greater than 31, duplicate checking is still performed using iterators.
+            if self
+                .priorities
+                .iter()
+                .any(|p| p.stream_id == priority.stream_id)
+            {
+                tracing::debug!(
+                    "duplicate priority for stream_id={:?} ignored",
+                    priority.stream_id
+                );
+                return self;
+            }
         }
 
         if priority.stream_id > self.max_stream_id {
