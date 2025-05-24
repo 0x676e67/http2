@@ -220,10 +220,12 @@ impl PrioritiesBuilder {
             return self;
         }
 
+        const MAX_BITMAP_STREAMS: u32 = 32;
+
         let id: u32 = priority.stream_id.into();
         // Check for duplicate priorities based on stream ID.
-        // For stream IDs less than 32, we use a bitmap to track inserted priorities.
-        if id < 32 {
+        // For stream IDs less than MAX_BITMAP_STREAMS, we use a bitmap to track inserted priorities.
+        if id < MAX_BITMAP_STREAMS {
             let mask = 1u32 << id;
             if self.inserted_bitmap & mask != 0 {
                 tracing::debug!(
@@ -323,9 +325,7 @@ mod tests {
         let dependency2 = StreamDependency::new(StreamId::from(2), 100, false);
         let priority2 = Priority::new(StreamId::from(4), dependency2); // Duplicate stream ID
 
-        let priorities = Priorities::builder()
-            .extend([priority1, priority2])
-            .build();
+        let priorities = Priorities::builder().extend([priority1, priority2]).build();
 
         assert_eq!(priorities.priorities.len(), 1);
         assert_eq!(priorities.priorities[0].stream_id(), StreamId::from(4));
