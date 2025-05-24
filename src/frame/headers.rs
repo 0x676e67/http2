@@ -164,7 +164,7 @@ impl PseudoOrderBuilder {
                 self.mask |= mask_id;
                 self.ids.push(id);
             } else {
-                tracing::trace!("dulicate pseudo header: {:?}", id);
+                tracing::trace!("duplicate pseudo header: {:?}", id);
             }
         }
         self
