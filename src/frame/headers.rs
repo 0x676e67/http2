@@ -76,7 +76,7 @@ pub struct Pseudo {
     pub status: Option<StatusCode>,
 
     // Pseudo order
-    pub order: Option<PseudoOrder>,
+    pub order: PseudoOrder,
 }
 
 /// The size of the pseudo header stack
@@ -147,6 +147,8 @@ pub struct PseudoOrderBuilder {
     mask: u8,
 }
 
+// ===== impl PseudoOrder =====
+
 impl PseudoOrder {
     pub fn builder() -> PseudoOrderBuilder {
         PseudoOrderBuilder {
@@ -155,6 +157,25 @@ impl PseudoOrder {
         }
     }
 }
+
+impl Default for PseudoOrder {
+    fn default() -> Self {
+        PseudoOrder {
+            ids: SmallVec::from(PseudoId::DEFAULT_IDS),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a PseudoOrder {
+    type Item = &'a PseudoId;
+    type IntoIter = std::slice::Iter<'a, PseudoId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.ids.iter()
+    }
+}
+
+// ===== impl PseudoOrderBuilder =====
 
 impl PseudoOrderBuilder {
     pub fn push(mut self, id: PseudoId) -> Self {
@@ -178,7 +199,9 @@ impl PseudoOrderBuilder {
     }
 
     pub fn build(mut self) -> PseudoOrder {
-        self = self.extend(PseudoId::DEFAULT_IDS);
+        if self.ids.len() != PseudoId::DEFAULT_IDS.len() {
+            self = self.extend(PseudoId::DEFAULT_IDS);
+        }
         PseudoOrder { ids: self.ids }
     }
 }
@@ -757,7 +780,7 @@ impl Pseudo {
     }
 
     pub fn set_pseudo_order(&mut self, order: PseudoOrder) {
-        self.order = Some(order);
+        self.order = order;
     }
 
     /// Whether it has status 1xx
@@ -828,13 +851,7 @@ impl Iterator for Iter {
         use crate::hpack::Header::*;
 
         if let Some(ref mut pseudo) = self.pseudo {
-            let order = pseudo
-                .order
-                .as_ref()
-                .map(|order| order.ids.as_slice())
-                .unwrap_or(&PseudoId::DEFAULT_IDS);
-
-            for pseudo_type in order {
+            for pseudo_type in &pseudo.order {
                 match pseudo_type {
                     PseudoId::Method => {
                         if let Some(method) = pseudo.method.take() {

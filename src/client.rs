@@ -708,7 +708,7 @@ impl Builder {
     /// This determines the order in which settings are sent during the HTTP/2 handshake.
     /// Customizing the order may be useful for testing or protocol compliance.
     pub fn settings_order(&mut self, order: SettingsOrder) -> &mut Self {
-        self.settings.set_settings_order(Some(order));
+        self.settings.set_settings_order(order);
         self
     }
 

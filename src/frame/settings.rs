@@ -99,6 +99,8 @@ pub struct SettingsOrderBuilder {
     mask: u16,
 }
 
+// ===== impl SettingsOrder =====
+
 impl SettingsOrder {
     /// Creates a new `SettingsOrderBuilder`.
     pub fn builder() -> SettingsOrderBuilder {
@@ -108,6 +110,25 @@ impl SettingsOrder {
         }
     }
 }
+
+impl Default for SettingsOrder {
+    fn default() -> Self {
+        SettingsOrder {
+            ids: SmallVec::from(SettingId::DEFAULT_IDS),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a SettingsOrder {
+    type Item = &'a SettingId;
+    type IntoIter = std::slice::Iter<'a, SettingId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.ids.iter()
+    }
+}
+
+// ===== impl SettingsOrderBuilder =====
 
 impl SettingsOrderBuilder {
     pub fn push(mut self, id: SettingId) -> Self {
@@ -150,7 +171,7 @@ pub struct Settings {
     no_rfc7540_priorities: Option<u32>,
     unknown_settings: Option<SmallVec<[Setting; DEFAULT_SETTING_STACK_SIZE]>>,
     // Settings order
-    settings_order: Option<SettingsOrder>,
+    settings_order: SettingsOrder,
 }
 
 /// An enum that lists all valid settings that can be sent in a SETTINGS
@@ -266,7 +287,7 @@ impl Settings {
         unknown_settings.extend(settings);
     }
 
-    pub fn set_settings_order(&mut self, settings_order: Option<SettingsOrder>) {
+    pub fn set_settings_order(&mut self, settings_order: SettingsOrder) {
         self.settings_order = settings_order;
     }
 
@@ -387,13 +408,7 @@ impl Settings {
     }
 
     fn for_each<F: FnMut(Setting)>(&self, mut f: F) {
-        let ids = self
-            .settings_order
-            .as_ref()
-            .map(|order| order.ids.as_ref())
-            .unwrap_or(&SettingId::DEFAULT_IDS);
-
-        for id in ids {
+        for id in &self.settings_order {
             match id {
                 SettingId::HeaderTableSize => {
                     if let Some(v) = self.header_table_size {
