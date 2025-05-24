@@ -1,4 +1,4 @@
-use super::frame::{Priority, PseudoOrder, StreamDependency};
+use super::frame::{Priorities, PseudoOrder, StreamDependency};
 use super::recv::RecvHeaderBlockError;
 use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
@@ -10,7 +10,6 @@ use crate::{client, proto, server, tracing};
 
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Request, Response};
-use std::borrow::Cow;
 use std::task::{Context, Poll, Waker};
 use tokio::io::AsyncWrite;
 
@@ -88,7 +87,7 @@ struct Inner {
     headers_pseudo_order: Option<PseudoOrder>,
 
     /// Priority of the headers stream
-    priority: Option<Cow<'static, [Priority]>>,
+    priorities: Option<Priorities>,
 }
 
 #[derive(Debug)]
@@ -284,21 +283,32 @@ where
             stream.content_length = ContentLength::Head;
         }
 
+        // Priorities frame check before sending the request.
+        if let Some(priorities) = &me.priorities {
+            let next_id = priorities
+                .max_stream_id()
+                .next_id()
+                .map_err(|_| SendError::User(UserError::OverflowedStreamId))?;
+
+            if next_id > stream_id {
+                return Err(SendError::User(UserError::OverflowedStreamId));
+            }
+        }
+
         // Convert the message
-        let (priority, headers) = client::Peer::convert_send_message(
+        let headers = client::Peer::convert_send_message(
             stream_id,
             request,
             protocol,
             end_of_stream,
             me.headers_pseudo_order.clone(),
             me.headers_priority,
-            me.priority.clone(),
         )?;
 
         let mut stream = me.store.insert(stream.id, stream);
 
         let sent = me.actions.send.send_priority_and_headers(
-            priority,
+            me.priorities.clone(),
             headers,
             send_buffer,
             &mut stream,
@@ -433,7 +443,7 @@ impl Inner {
             refs: 1,
             headers_priority: config.headers_priority,
             headers_pseudo_order: config.headers_pseudo_order,
-            priority: config.priority,
+            priorities: config.priorities,
         }))
     }
 

@@ -1,6 +1,7 @@
 use crate::frame::*;
 use crate::tracing;
 use bytes::BufMut;
+use smallvec::SmallVec;
 
 /// The PRIORITY frame (type=0x2) specifies the sender-advised priority
 /// of a stream [Section 5.3].  It can be sent in any stream state,
@@ -156,6 +157,88 @@ impl StreamDependency {
     }
 }
 
+/// A collection of HTTP/2 PRIORITY frames.
+///
+/// The `Priorities` struct maintains an ordered list of `Priority` frames,
+/// which can be used to represent and manage the stream dependency tree
+/// in HTTP/2. This is useful for pre-configuring stream priorities or
+/// sending multiple PRIORITY frames at once during connection setup or
+/// stream reprioritization.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Priorities {
+    priorities: SmallVec<[Priority; 8]>,
+    max_stream_id: StreamId,
+}
+
+/// A builder for constructing a `Priorities` collection.
+///
+/// `PrioritiesBuilder` provides a convenient way to incrementally add
+/// `Priority` frames to a collection, ensuring that invalid priorities
+/// (such as those with a stream ID of zero) are ignored. Once all desired
+/// priorities have been added, call `.build()` to obtain a `Priorities`
+/// instance for use in the HTTP/2 connection or frame layer.
+#[derive(Debug)]
+pub struct PrioritiesBuilder {
+    priorities: SmallVec<[Priority; 8]>,
+    max_stream_id: StreamId,
+}
+
+// ===== impl Priorities =====
+
+impl Priorities {
+    pub fn builder() -> PrioritiesBuilder {
+        PrioritiesBuilder {
+            priorities: SmallVec::new(),
+            max_stream_id: StreamId::zero(),
+        }
+    }
+
+    pub(crate) fn max_stream_id(&self) -> StreamId {
+        self.max_stream_id
+    }
+}
+
+impl IntoIterator for Priorities {
+    type Item = Priority;
+    type IntoIter = std::vec::IntoIter<Priority>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.priorities.into_vec().into_iter()
+    }
+}
+
+// ===== impl PrioritiesBuilder =====
+
+impl PrioritiesBuilder {
+    pub fn push(mut self, priority: Priority) -> Self {
+        if priority.stream_id.is_zero() {
+            tracing::warn!("ignoring priority frame with stream ID 0");
+            return self;
+        }
+
+        if priority.stream_id > self.max_stream_id {
+            self.max_stream_id = priority.stream_id;
+        }
+
+        self.priorities.push(priority);
+        self
+    }
+
+    pub fn extend(mut self, priorities: impl IntoIterator<Item = Priority>) -> Self {
+        for priority in priorities {
+            self = self.push(priority);
+        }
+        self
+    }
+
+    pub fn build(self) -> Priorities {
+        Priorities {
+            priorities: self.priorities,
+            max_stream_id: self.max_stream_id,
+        }
+    }
+}
+
 mod tests {
 
     #[test]
@@ -178,5 +261,23 @@ mod tests {
         assert_eq!(priority.dependency.dependency_id(), StreamId::zero());
         assert_eq!(priority.dependency.weight(), 201);
         assert!(!priority.dependency.is_exclusive());
+    }
+
+    #[test]
+    fn test_priorities_builder_ignores_stream_id_zero() {
+        use crate::frame::{Priorities, Priority, StreamDependency, StreamId};
+
+        let dependency = StreamDependency::new(StreamId::from(1), 50, false);
+        let priority_zero = Priority::new(StreamId::zero(), dependency);
+
+        let dependency2 = StreamDependency::new(StreamId::from(2), 100, false);
+        let priority_valid = Priority::new(StreamId::from(3), dependency2);
+
+        let priorities = Priorities::builder()
+            .extend([priority_zero, priority_valid])
+            .build();
+
+        assert_eq!(priorities.priorities.len(), 1);
+        assert_eq!(priorities.priorities[0].stream_id(), StreamId::from(3));
     }
 }

@@ -1,4 +1,4 @@
-use crate::{frame::StreamIdOverflow, proto::Error};
+use crate::proto::Error;
 
 use std::{error, fmt, io};
 
@@ -73,12 +73,6 @@ impl From<io::Error> for SendError {
 impl From<UserError> for SendError {
     fn from(src: UserError) -> Self {
         SendError::User(src)
-    }
-}
-
-impl From<StreamIdOverflow> for SendError {
-    fn from(_: StreamIdOverflow) -> Self {
-        UserError::OverflowedStreamId.into()
     }
 }
 

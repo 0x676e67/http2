@@ -3,14 +3,13 @@ use super::{
     StreamIdOverflow, WindowSize,
 };
 use crate::codec::UserError;
-use crate::frame::{self, Reason};
+use crate::frame::{self, Priorities, Reason};
 use crate::proto::{self, Error, Initiator};
 use crate::tracing;
 
 use bytes::Buf;
 use tokio::io::AsyncWrite;
 
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::io;
 use std::task::{Context, Poll, Waker};
@@ -137,7 +136,7 @@ impl Send {
 
     pub fn send_priority_and_headers<B>(
         &mut self,
-        priority_frame: Option<Cow<'static, [frame::Priority]>>,
+        priority_frame: Option<Priorities>,
         headers_frame: frame::Headers,
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
@@ -159,7 +158,7 @@ impl Send {
 
         // Queue the priority frame if it exists
         if let Some(priority_frames) = priority_frame {
-            for priority_frame in priority_frames.into_owned() {
+            for priority_frame in priority_frames {
                 tracing::trace!(
                     "send_priority; frame={:?}; init_window={:?}",
                     priority_frame,

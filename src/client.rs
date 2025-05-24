@@ -138,7 +138,7 @@
 use crate::codec::{Codec, SendError, UserError};
 use crate::ext::Protocol;
 use crate::frame::{
-    Headers, Priority, Pseudo, PseudoOrder, Reason, Setting, Settings, SettingsOrder,
+    Headers, Priorities, Pseudo, PseudoOrder, Reason, Setting, Settings, SettingsOrder,
     StreamDependency, StreamId,
 };
 use crate::proto::{self, Error};
@@ -148,7 +148,6 @@ use crate::{tracing, FlowControl, PingPong, RecvStream, SendStream};
 use ::tracing::Instrument;
 use bytes::{Buf, Bytes};
 use http::{uri, HeaderMap, Method, Request, Response, Version};
-use std::borrow::Cow;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -356,7 +355,7 @@ pub struct Builder {
     headers_priority: Option<StreamDependency>,
 
     /// Priority stream list
-    priority: Option<Cow<'static, [Priority]>>,
+    priorities: Option<Priorities>,
 }
 
 #[derive(Debug)]
@@ -679,7 +678,7 @@ impl Builder {
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             headers_pseudo_order: None,
             headers_priority: None,
-            priority: None,
+            priorities: None,
         }
     }
 
@@ -1197,6 +1196,15 @@ impl Builder {
         self
     }
 
+    /// Sets the order of settings parameters in the initial SETTINGS frame.
+    ///
+    /// This determines the order in which settings are sent during the HTTP/2 handshake.
+    /// Customizing the order may be useful for testing or protocol compliance.
+    pub fn settings_order(&mut self, order: SettingsOrder) -> &mut Self {
+        self.settings.set_settings_order(order);
+        self
+    }
+
     /// Sets the HTTP/2 pseudo-header field order for outgoing HEADERS frames.
     ///
     /// This determines the order in which pseudo-header fields (such as `:method`, `:scheme`, etc.)
@@ -1217,21 +1225,17 @@ impl Builder {
         self
     }
 
-    /// Sets the order of settings parameters in the initial SETTINGS frame.
+    /// Sets the list of PRIORITY frames to be sent immediately after the connection is established,
+    /// but before the first request is sent.
     ///
-    /// This determines the order in which settings are sent during the HTTP/2 handshake.
-    /// Customizing the order may be useful for testing or protocol compliance.
-    pub fn settings_order(&mut self, order: SettingsOrder) -> &mut Self {
-        self.settings.set_settings_order(order);
-        self
-    }
-
-    /// Sets the list of priority frames to be sent before the first request.
+    /// This allows you to pre-configure the HTTP/2 stream dependency tree by specifying a set of
+    /// PRIORITY frames that will be sent as part of the connection preface. This can be useful for
+    /// optimizing resource allocation or testing custom stream prioritization strategies.
     ///
-    /// This allows you to specify a list of PRIORITY frames that will be sent on connection
-    /// establishment, which can be used to pre-configure the stream dependency tree.
-    pub fn priority(&mut self, priority: Cow<'static, [Priority]>) -> &mut Self {
-        self.priority = Some(priority);
+    /// Each `Priority` in the list must have a valid (non-zero) stream ID. Any priority with a
+    /// stream ID of zero will be ignored.
+    pub fn priorities(&mut self, priorities: Priorities) -> &mut Self {
+        self.priorities = Some(priorities);
         self
     }
 
@@ -1421,7 +1425,7 @@ where
                 settings: builder.settings.clone(),
                 headers_pseudo_order: builder.headers_pseudo_order,
                 headers_priority: builder.headers_priority,
-                priority: builder.priority,
+                priorities: builder.priorities,
             },
         );
         let send_request = SendRequest {
@@ -1679,8 +1683,7 @@ impl Peer {
         end_of_stream: bool,
         pseudo_order: Option<PseudoOrder>,
         headers_priority: Option<StreamDependency>,
-        priority: Option<Cow<'static, [Priority]>>,
-    ) -> Result<(Option<Cow<'static, [Priority]>>, Headers), SendError> {
+    ) -> Result<Headers, SendError> {
         use http::request::Parts;
 
         let (
@@ -1733,16 +1736,6 @@ impl Peer {
             }
         }
 
-        // Check the priority list for overflowed stream IDs
-        if let Some(ref priority) = priority {
-            if let Some(last_priority) = priority.last() {
-                // Ensure the next stream ID does not overflow
-                if last_priority.stream_id().next_id()? > id {
-                    return Err(UserError::OverflowedStreamId.into());
-                }
-            }
-        }
-
         // Create the HEADERS frame
         let mut headers_frame = Headers::new(id, pseudo, headers);
         if let Some(stream_dep) = headers_priority {
@@ -1753,7 +1746,7 @@ impl Peer {
             headers_frame.set_end_stream()
         }
 
-        Ok((priority, headers_frame))
+        Ok(headers_frame)
     }
 }
 

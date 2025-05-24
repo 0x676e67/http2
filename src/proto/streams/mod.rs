@@ -25,12 +25,10 @@ use self::state::State;
 use self::store::Store;
 use self::stream::Stream;
 
-use crate::frame::{StreamId, StreamIdOverflow};
+use crate::frame::{Priorities, PseudoOrder, StreamDependency, StreamId, StreamIdOverflow};
 use crate::proto::*;
 
 use bytes::Bytes;
-use frame::{Priority, PseudoOrder, StreamDependency};
-use std::borrow::Cow;
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -81,6 +79,6 @@ pub struct Config {
     /// Pseudo order of the headers stream
     pub headers_pseudo_order: Option<PseudoOrder>,
 
-    /// Priority stream list
-    pub priority: Option<Cow<'static, [Priority]>>,
+    /// Priorities stream
+    pub priorities: Option<Priorities>,
 }

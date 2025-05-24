@@ -1,14 +1,12 @@
 use crate::codec::UserError;
-use crate::frame::{Reason, StreamId};
+use crate::frame::{Priorities, PseudoOrder, Reason, StreamDependency, StreamId};
 use crate::{client, server, tracing};
 
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
 use crate::proto::*;
 
 use bytes::Bytes;
-use frame::{Priority, PseudoOrder, StreamDependency};
 use futures_core::Stream;
-use std::borrow::Cow;
 use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -88,7 +86,7 @@ pub(crate) struct Config {
     pub settings: frame::Settings,
     pub headers_pseudo_order: Option<PseudoOrder>,
     pub headers_priority: Option<StreamDependency>,
-    pub priority: Option<Cow<'static, [Priority]>>,
+    pub priorities: Option<Priorities>,
 }
 
 #[derive(Debug)]
@@ -131,7 +129,7 @@ where
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
                 headers_priority: config.headers_priority,
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
-                priority: config.priority.clone(),
+                priorities: config.priorities.clone(),
             }
         }
         let streams = Streams::new(streams_config(&config));
