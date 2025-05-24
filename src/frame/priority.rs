@@ -312,4 +312,22 @@ mod tests {
         assert_eq!(priorities.priorities.len(), 1);
         assert_eq!(priorities.priorities[0].stream_id(), StreamId::from(3));
     }
+
+    #[test]
+    fn test_priorities_builder_ignores_duplicate_priorities() {
+        use crate::frame::{Priorities, Priority, StreamDependency, StreamId};
+
+        let dependency = StreamDependency::new(StreamId::from(1), 50, false);
+        let priority1 = Priority::new(StreamId::from(4), dependency);
+
+        let dependency2 = StreamDependency::new(StreamId::from(2), 100, false);
+        let priority2 = Priority::new(StreamId::from(4), dependency2); // Duplicate stream ID
+
+        let priorities = Priorities::builder()
+            .extend([priority1, priority2])
+            .build();
+
+        assert_eq!(priorities.priorities.len(), 1);
+        assert_eq!(priorities.priorities[0].stream_id(), StreamId::from(4));
+    }
 }
