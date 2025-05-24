@@ -157,6 +157,8 @@ impl StreamDependency {
     }
 }
 
+const DEFAULT_STACK_SIZE: usize = 8;
+
 /// A collection of HTTP/2 PRIORITY frames.
 ///
 /// The `Priorities` struct maintains an ordered list of `Priority` frames,
@@ -166,7 +168,7 @@ impl StreamDependency {
 /// stream reprioritization.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Priorities {
-    priorities: SmallVec<[Priority; 8]>,
+    priorities: SmallVec<[Priority; DEFAULT_STACK_SIZE]>,
     max_stream_id: StreamId,
 }
 
@@ -179,7 +181,7 @@ pub struct Priorities {
 /// instance for use in the HTTP/2 connection or frame layer.
 #[derive(Debug)]
 pub struct PrioritiesBuilder {
-    priorities: SmallVec<[Priority; 8]>,
+    priorities: SmallVec<[Priority; DEFAULT_STACK_SIZE]>,
     max_stream_id: StreamId,
     inserted_bitmap: u32,
 }
