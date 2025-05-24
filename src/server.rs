@@ -1410,7 +1410,7 @@ where
                                 .builder
                                 .local_max_error_reset_streams,
                             settings: self.builder.settings.clone(),
-                            headers_priority: None,
+                            headers_stream_dependency: None,
                             headers_pseudo_order: None,
                             priorities: None,
                         },

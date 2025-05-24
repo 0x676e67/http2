@@ -80,8 +80,8 @@ struct Inner {
     /// The number of stream refs to this shared state.
     refs: usize,
 
-    /// Priority of the headers stream
-    headers_priority: Option<StreamDependency>,
+    /// Headers stream dependency
+    headers_stream_dependency: Option<StreamDependency>,
 
     /// Pseudo order of the headers stream
     headers_pseudo_order: Option<PseudoOrder>,
@@ -302,7 +302,7 @@ where
             protocol,
             end_of_stream,
             me.headers_pseudo_order.clone(),
-            me.headers_priority,
+            me.headers_stream_dependency,
         )?;
 
         let mut stream = me.store.insert(stream.id, stream);
@@ -441,7 +441,7 @@ impl Inner {
             },
             store: Store::new(),
             refs: 1,
-            headers_priority: config.headers_priority,
+            headers_stream_dependency: config.headers_stream_dependency,
             headers_pseudo_order: config.headers_pseudo_order,
             priorities: config.priorities,
         }))

@@ -74,7 +74,7 @@ pub struct Config {
     pub local_max_error_reset_streams: Option<usize>,
 
     /// Priority of the headers stream
-    pub headers_priority: Option<StreamDependency>,
+    pub headers_stream_dependency: Option<StreamDependency>,
 
     /// Pseudo order of the headers stream
     pub headers_pseudo_order: Option<PseudoOrder>,

@@ -85,7 +85,7 @@ pub(crate) struct Config {
     pub local_error_reset_streams_max: Option<usize>,
     pub settings: frame::Settings,
     pub headers_pseudo_order: Option<PseudoOrder>,
-    pub headers_priority: Option<StreamDependency>,
+    pub headers_stream_dependency: Option<StreamDependency>,
     pub priorities: Option<Priorities>,
 }
 
@@ -127,7 +127,7 @@ where
                     .max_concurrent_streams()
                     .map(|max| max as usize),
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
-                headers_priority: config.headers_priority,
+                headers_stream_dependency: config.headers_stream_dependency,
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
                 priorities: config.priorities.clone(),
             }

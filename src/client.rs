@@ -351,8 +351,8 @@ pub struct Builder {
     /// The headers frame pseudo order
     headers_pseudo_order: Option<PseudoOrder>,
 
-    /// The headers frame priority
-    headers_priority: Option<StreamDependency>,
+    /// The headers frame stream dependency
+    headers_stream_dependency: Option<StreamDependency>,
 
     /// Priority stream list
     priorities: Option<Priorities>,
@@ -677,7 +677,7 @@ impl Builder {
             stream_id: 1.into(),
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             headers_pseudo_order: None,
-            headers_priority: None,
+            headers_stream_dependency: None,
             priorities: None,
         }
     }
@@ -1220,8 +1220,8 @@ impl Builder {
     /// This configures the priority of the stream by specifying its dependency and weight,
     /// as defined by the HTTP/2 priority mechanism. This can be used to influence how the
     /// server allocates resources to this stream relative to others.
-    pub fn headers_priority(&mut self, headers_priority: StreamDependency) -> &mut Self {
-        self.headers_priority = Some(headers_priority);
+    pub fn headers_stream_dependency(&mut self, dep: StreamDependency) -> &mut Self {
+        self.headers_stream_dependency = Some(dep);
         self
     }
 
@@ -1424,7 +1424,7 @@ where
                 local_error_reset_streams_max: builder.local_max_error_reset_streams,
                 settings: builder.settings.clone(),
                 headers_pseudo_order: builder.headers_pseudo_order,
-                headers_priority: builder.headers_priority,
+                headers_stream_dependency: builder.headers_stream_dependency,
                 priorities: builder.priorities,
             },
         );
@@ -1682,7 +1682,7 @@ impl Peer {
         protocol: Option<Protocol>,
         end_of_stream: bool,
         pseudo_order: Option<PseudoOrder>,
-        headers_priority: Option<StreamDependency>,
+        headers_stream_dependency: Option<StreamDependency>,
     ) -> Result<Headers, SendError> {
         use http::request::Parts;
 
@@ -1738,7 +1738,7 @@ impl Peer {
 
         // Create the HEADERS frame
         let mut headers_frame = Headers::new(id, pseudo, headers);
-        if let Some(stream_dep) = headers_priority {
+        if let Some(stream_dep) = headers_stream_dependency {
             headers_frame.set_stream_dependency(stream_dep);
         }
 
