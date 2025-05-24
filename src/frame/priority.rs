@@ -326,15 +326,16 @@ mod tests {
         let priority2 = Priority::new(StreamId::from(4), dependency2); // Duplicate stream ID
 
         let priorities = Priorities::builder().extend([priority1, priority2]).build();
-
         assert_eq!(priorities.priorities.len(), 1);
         assert_eq!(priorities.priorities[0].stream_id(), StreamId::from(4));
 
         // stream id > 31
         let dependency3 = StreamDependency::new(StreamId::from(32), 150, false);
         let priority3 = Priority::new(StreamId::from(32), dependency3);
+
         let dependency4 = StreamDependency::new(StreamId::from(32), 200, false); // Duplicate stream ID
         let priority4 = Priority::new(StreamId::from(32), dependency4);
+
         let priorities = Priorities::builder().extend([priority3, priority4]).build();
         assert_eq!(priorities.priorities.len(), 1);
         assert_eq!(priorities.priorities[0].stream_id(), StreamId::from(32));
