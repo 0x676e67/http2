@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 /// The PRIORITY frame (type=0x2) specifies the sender-advised priority
 /// of a stream [Section 5.3].  It can be sent in any stream state,
 /// including idle or closed streams.
-/// [Section 5.3]: https://tools.ietf.org/html/rfc7540#section-5.3
+/// [Section 5.3]: <https://tools.ietf.org/html/rfc7540#section-5.3>
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Priority {
     /// The stream ID of the stream that this priority frame is for

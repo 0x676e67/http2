@@ -1169,7 +1169,7 @@ impl Builder {
     }
 
     /// Disable RFC 7540 Stream Priorities (set to `true` to disable).
-    /// [RFC 9218]: https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1
+    /// [RFC 9218]: <https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1>
     pub fn no_rfc7540_priorities(&mut self, enabled: bool) -> &mut Self {
         self.settings.set_no_rfc7540_priorities(enabled);
         self

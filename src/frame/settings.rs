@@ -11,7 +11,7 @@ define_enum_with_values! {
     ///
     /// Each setting has a value that is a 32 bit unsigned integer (6.5.1.).
     ///
-    /// See <https://datatracker.ietf.org/doc/html/rfc9113#name-defined-settings.
+    /// See <https://datatracker.ietf.org/doc/html/rfc9113#name-defined-settings>.
     @U16
     pub enum SettingId {
         /// This setting allows the sender to inform the remote endpoint
@@ -20,7 +20,7 @@ define_enum_with_values! {
         /// this value by using signaling specific to the compression format inside
         /// a field block (see [COMPRESSION]). The initial value is 4,096 octets.
         ///
-        /// [COMPRESSION]: https://datatracker.ietf.org/doc/html/rfc7541
+        /// [COMPRESSION]: <https://datatracker.ietf.org/doc/html/rfc7541>
         HeaderTableSize => 0x0001,
 
         /// Enables or disables server push.
@@ -42,7 +42,7 @@ define_enum_with_values! {
         EnableConnectProtocol => 0x0008,
 
         /// Disable RFC 7540 Stream Priorities.
-        /// [RFC 9218]: https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1
+        /// [RFC 9218]: <https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1>
         NoRfc7540Priorities => 0x0009,
     }
 }
