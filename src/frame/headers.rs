@@ -79,9 +79,6 @@ pub struct Pseudo {
     pub order: PseudoOrder,
 }
 
-/// The size of the pseudo header stack
-const DEFAULT_PSEUDO_STACK_SIZE: usize = 6;
-
 define_enum_with_values! {
     /// Represents the order of HTTP/2 pseudo-header fields in the header block.
     ///
@@ -99,28 +96,6 @@ define_enum_with_values! {
     }
 }
 
-impl PseudoId {
-    const DEFAULT_IDS: [PseudoId; DEFAULT_PSEUDO_STACK_SIZE] = [
-        PseudoId::Method,
-        PseudoId::Scheme,
-        PseudoId::Authority,
-        PseudoId::Path,
-        PseudoId::Protocol,
-        PseudoId::Status,
-    ];
-
-    fn mask_id(self) -> u8 {
-        const MAX_ID: u8 = 7;
-
-        let value = u8::from(self);
-        if value == 0 || value > MAX_ID {
-            return 0;
-        }
-
-        1 << (value - 1)
-    }
-}
-
 /// Represents the order of HTTP/2 pseudo-header fields in a header block.
 ///
 /// This structure maintains an ordered list of pseudo-header fields (such as `:method`, `:scheme`, etc.)
@@ -132,7 +107,7 @@ impl PseudoId {
 /// and protocol-compliant ordering.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PseudoOrder {
-    ids: SmallVec<[PseudoId; DEFAULT_PSEUDO_STACK_SIZE]>,
+    ids: SmallVec<[PseudoId; PseudoId::DEFAULT_STACK_SIZE]>,
 }
 
 /// A builder for constructing a `PseudoOrder`.
@@ -143,7 +118,7 @@ pub struct PseudoOrder {
 /// obtain a `PseudoOrder` instance.
 #[derive(Debug)]
 pub struct PseudoOrderBuilder {
-    ids: SmallVec<[PseudoId; DEFAULT_PSEUDO_STACK_SIZE]>,
+    ids: SmallVec<[PseudoId; PseudoId::DEFAULT_STACK_SIZE]>,
     mask: u8,
 }
 
@@ -1380,7 +1355,7 @@ mod test {
     fn test_pseudo_order() {
         let order = PseudoOrder::builder().build();
         assert!(!order.ids.is_empty());
-        assert_eq!(order.ids.len(), DEFAULT_PSEUDO_STACK_SIZE);
+        assert_eq!(order.ids.len(), PseudoId::DEFAULT_STACK_SIZE);
         assert_eq!(order.ids.as_slice(), PseudoId::DEFAULT_IDS);
     }
 

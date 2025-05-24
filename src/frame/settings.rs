@@ -5,9 +5,6 @@ use crate::tracing;
 use bytes::{BufMut, BytesMut};
 use smallvec::SmallVec;
 
-/// The maximum number of settings that can be sent in a SETTINGS frame.
-const DEFAULT_SETTING_STACK_SIZE: usize = 8;
-
 define_enum_with_values! {
     /// An enum that lists all valid settings that can be sent in a SETTINGS
     /// frame.
@@ -50,29 +47,6 @@ define_enum_with_values! {
     }
 }
 
-impl SettingId {
-    const MAX_ID: u16 = 15;
-    const DEFAULT_IDS: [SettingId; DEFAULT_SETTING_STACK_SIZE] = [
-        SettingId::HeaderTableSize,
-        SettingId::EnablePush,
-        SettingId::InitialWindowSize,
-        SettingId::MaxConcurrentStreams,
-        SettingId::MaxFrameSize,
-        SettingId::MaxHeaderListSize,
-        SettingId::EnableConnectProtocol,
-        SettingId::NoRfc7540Priorities,
-    ];
-
-    fn mask_id(self) -> u16 {
-        let value = u16::from(self);
-        if value == 0 || value > Self::MAX_ID {
-            return 0;
-        }
-
-        1 << (value - 1)
-    }
-}
-
 /// Represents the order of settings in a SETTINGS frame.
 ///
 /// This structure maintains an ordered list of `SettingId` values for use when encoding or decoding
@@ -84,7 +58,7 @@ impl SettingId {
 /// and protocol-compliant ordering.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SettingsOrder {
-    ids: SmallVec<[SettingId; DEFAULT_SETTING_STACK_SIZE]>,
+    ids: SmallVec<[SettingId; SettingId::DEFAULT_STACK_SIZE]>,
 }
 
 /// A builder for constructing a `SettingsOrder`.
@@ -95,7 +69,7 @@ pub struct SettingsOrder {
 /// instance.
 #[derive(Debug)]
 pub struct SettingsOrderBuilder {
-    ids: SmallVec<[SettingId; DEFAULT_SETTING_STACK_SIZE]>,
+    ids: SmallVec<[SettingId; SettingId::DEFAULT_STACK_SIZE]>,
     mask: u16,
 }
 
@@ -169,7 +143,7 @@ pub struct Settings {
     max_header_list_size: Option<u32>,
     enable_connect_protocol: Option<u32>,
     no_rfc7540_priorities: Option<u32>,
-    unknown_settings: Option<SmallVec<[Setting; DEFAULT_SETTING_STACK_SIZE]>>,
+    unknown_settings: Option<SmallVec<[Setting; SettingId::DEFAULT_STACK_SIZE]>>,
     // Settings order
     settings_order: SettingsOrder,
 }
