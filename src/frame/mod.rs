@@ -53,15 +53,15 @@ pub use self::go_away::GoAway;
 pub use self::head::{Head, Kind};
 #[allow(unused_imports)]
 pub use self::headers::{
-    parse_u64, Continuation, Headers, Pseudo, PseudoId, PseudoOrder, PushPromise,
-    PushPromiseHeaderError,
+    parse_u64, Continuation, Headers, Pseudo, PseudoId, PseudoOrder, PseudoOrderBuilder,
+    PushPromise, PushPromiseHeaderError,
 };
 pub use self::ping::Ping;
 pub use self::priority::{Priority, StreamDependency};
 pub use self::reason::Reason;
 pub use self::reset::Reset;
 #[allow(unused_imports)]
-pub use self::settings::{Setting, SettingId, Settings, SettingsOrder};
+pub use self::settings::{Setting, SettingId, Settings, SettingsOrder, SettingsOrderBuilder};
 pub use self::stream_id::{StreamId, StreamIdOverflow};
 pub use self::window_update::WindowUpdate;
 

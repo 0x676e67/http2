@@ -75,7 +75,7 @@ pub struct Pseudo {
     // Response
     pub status: Option<StatusCode>,
 
-    // Pseudo header order
+    // Pseudo order
     pub order: Option<PseudoOrder>,
 }
 
@@ -100,7 +100,6 @@ define_enum_with_values! {
 }
 
 impl PseudoId {
-    const MAX_ID: u8 = 7;
     const DEFAULT_IDS: [PseudoId; DEFAULT_PSEUDO_STACK_SIZE] = [
         PseudoId::Method,
         PseudoId::Scheme,
@@ -111,8 +110,10 @@ impl PseudoId {
     ];
 
     fn mask_id(self) -> u8 {
+        const MAX_ID: u8 = 7;
+
         let value = u8::from(self);
-        if value == 0 || value > Self::MAX_ID {
+        if value == 0 || value > MAX_ID {
             return 0;
         }
 
@@ -120,35 +121,65 @@ impl PseudoId {
     }
 }
 
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+/// Represents the order of HTTP/2 pseudo-header fields in a header block.
+///
+/// This structure maintains an ordered list of pseudo-header fields (such as `:method`, `:scheme`, etc.)
+/// for use when encoding or decoding HTTP/2 header blocks. The order of pseudo-headers is significant
+/// according to the HTTP/2 specification, and this type ensures that the correct order is preserved
+/// and that no duplicates are present.
+///
+/// Typically, a `PseudoOrder` is constructed using the [`PseudoOrderBuilder`] to enforce uniqueness
+/// and protocol-compliant ordering.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PseudoOrder {
+    ids: SmallVec<[PseudoId; DEFAULT_PSEUDO_STACK_SIZE]>,
+}
+
+/// A builder for constructing a `PseudoOrder`.
+///
+/// This builder allows you to incrementally specify the order of pseudo-header fields for an HTTP/2
+/// header block. It ensures that each pseudo-header is only included once, and provides methods to
+/// push individual pseudo-headers or extend from an iterator. When finished, call `.build()` to
+/// obtain a `PseudoOrder` instance.
+#[derive(Debug)]
+pub struct PseudoOrderBuilder {
     ids: SmallVec<[PseudoId; DEFAULT_PSEUDO_STACK_SIZE]>,
     mask: u8,
 }
 
 impl PseudoOrder {
-    /// Push a pseudo header into the order.
-    pub fn push(&mut self, id: PseudoId) {
-        let mask_id = id.mask_id();
-
-        // If the ID is 0 or greater than the max setting ID, ignore it.
-        if mask_id == 0 {
-            return;
-        }
-
-        if self.mask & mask_id == 0 {
-            self.mask |= mask_id;
-            self.ids.push(id);
-        } else {
-            tracing::trace!("dulicate pseudo header: {:?}", id);
+    pub fn builder() -> PseudoOrderBuilder {
+        PseudoOrderBuilder {
+            ids: SmallVec::new(),
+            mask: 0,
         }
     }
+}
 
-    /// Push a pseudo header ID into the order.
-    pub fn extend(&mut self, iter: impl IntoIterator<Item = PseudoId>) {
-        for id in iter {
-            self.push(id);
+impl PseudoOrderBuilder {
+    pub fn push(mut self, id: PseudoId) -> Self {
+        let mask_id = id.mask_id();
+        if mask_id != 0 {
+            if self.mask & mask_id == 0 {
+                self.mask |= mask_id;
+                self.ids.push(id);
+            } else {
+                tracing::trace!("dulicate pseudo header: {:?}", id);
+            }
         }
+        self
+    }
+
+    pub fn extend(mut self, iter: impl IntoIterator<Item = PseudoId>) -> Self {
+        for id in iter {
+            self = self.push(id);
+        }
+        self
+    }
+
+    pub fn build(mut self) -> PseudoOrder {
+        self = self.extend(PseudoId::DEFAULT_IDS);
+        PseudoOrder { ids: self.ids }
     }
 }
 
@@ -1329,31 +1360,22 @@ mod test {
     }
 
     #[test]
-    fn test_pseudo_order_push_and_mask() {
-        let mut order = PseudoOrder::default();
+    fn test_pseudo_order() {
+        let order = PseudoOrder::builder().build();
+        assert!(!order.ids.is_empty());
+        assert_eq!(order.ids.len(), DEFAULT_PSEUDO_STACK_SIZE);
+        assert_eq!(order.ids.as_slice(), PseudoId::DEFAULT_IDS);
+    }
 
-        for id in PseudoId::DEFAULT_IDS.iter().copied() {
-            order.push(id);
-        }
+    #[test]
+    fn test_pseudo_order_duplicate() {
+        let order = PseudoOrder::builder()
+            .push(PseudoId::Scheme)
+            .push(PseudoId::Scheme)
+            .build();
 
-        let expected: SmallVec<[PseudoId; DEFAULT_PSEUDO_STACK_SIZE]> =
-            SmallVec::from_slice(&PseudoId::DEFAULT_IDS);
-        assert_eq!(order.ids, expected);
-
-        let mut expected_mask = 0u8;
-        for id in PseudoId::DEFAULT_IDS.iter().copied() {
-            expected_mask |= id.mask_id();
-        }
-        assert_eq!(order.mask, expected_mask);
-
-        let len_before = order.ids.len();
-        for id in PseudoId::DEFAULT_IDS.iter().copied() {
-            order.push(id);
-        }
-        assert_eq!(
-            order.ids.len(),
-            len_before,
-            "Duplicate ids should not be added"
-        );
+        assert_eq!(order.ids.len(), PseudoId::DEFAULT_IDS.len());
+        assert_eq!(order.ids[0], PseudoId::Scheme);
+        assert_ne!(order.ids[1], PseudoId::Scheme);
     }
 }

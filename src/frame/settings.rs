@@ -73,35 +73,66 @@ impl SettingId {
     }
 }
 
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+/// Represents the order of settings in a SETTINGS frame.
+///
+/// This structure maintains an ordered list of `SettingId` values for use when encoding or decoding
+/// HTTP/2 SETTINGS frames. The order of settings can be important for protocol compliance, testing,
+/// or interoperability. `SettingsOrder` ensures that the specified order is preserved and that no
+/// duplicate settings are present.
+///
+/// Typically, a `SettingsOrder` is constructed using the [`SettingsOrderBuilder`] to enforce uniqueness
+/// and protocol-compliant ordering.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SettingsOrder {
+    ids: SmallVec<[SettingId; DEFAULT_SETTING_STACK_SIZE]>,
+}
+
+/// A builder for constructing a `SettingsOrder`.
+///
+/// This builder allows you to incrementally specify the order of settings for a SETTINGS frame.
+/// It ensures that each setting is only included once, and provides methods to push individual
+/// settings or extend from an iterator. When finished, call `.build()` to obtain a `SettingsOrder`
+/// instance.
+#[derive(Debug)]
+pub struct SettingsOrderBuilder {
     ids: SmallVec<[SettingId; DEFAULT_SETTING_STACK_SIZE]>,
     mask: u16,
 }
 
 impl SettingsOrder {
-    /// Push a setting ID into the order.
-    pub fn push(&mut self, id: SettingId) {
-        let mask_id = id.mask_id();
-
-        // If the ID is 0 or greater than the max setting ID, ignore it.
-        if mask_id == 0 {
-            return;
-        }
-
-        if self.mask & mask_id == 0 {
-            self.mask |= mask_id;
-            self.ids.push(id);
-        } else {
-            tracing::trace!("duplicate setting ID ignored: {id:?}");
+    /// Creates a new `SettingsOrderBuilder`.
+    pub fn builder() -> SettingsOrderBuilder {
+        SettingsOrderBuilder {
+            ids: SmallVec::new(),
+            mask: 0,
         }
     }
+}
 
-    /// Push a setting ID into the order, and extend the order with default IDs.
-    pub fn extend(&mut self, iter: impl IntoIterator<Item = SettingId>) {
-        for id in iter {
-            self.push(id);
+impl SettingsOrderBuilder {
+    pub fn push(mut self, id: SettingId) -> Self {
+        let mask_id = id.mask_id();
+        if mask_id != 0 {
+            if self.mask & mask_id == 0 {
+                self.mask |= mask_id;
+                self.ids.push(id);
+            } else {
+                tracing::trace!("duplicate setting ID ignored: {id:?}");
+            }
         }
+        self
+    }
+
+    pub fn extend(mut self, iter: impl IntoIterator<Item = SettingId>) -> Self {
+        for id in iter {
+            self = self.push(id);
+        }
+        self
+    }
+
+    pub fn build(mut self) -> SettingsOrder {
+        self = self.extend(SettingId::DEFAULT_IDS);
+        SettingsOrder { ids: self.ids }
     }
 }
 
@@ -562,51 +593,38 @@ impl fmt::Debug for SettingsFlags {
 mod tests {
     use super::*;
 
-    fn extend_with_default(order: &mut SettingsOrder) {
-        const MASK: u16 = 1 << SettingId::MAX_ID;
-        if order.mask & MASK == MASK {
-            return;
-        }
-        order.extend(SettingId::DEFAULT_IDS);
+    #[test]
+    fn test_settings_order() {
+        let order = SettingsOrder::builder().build();
+        assert!(!order.ids.is_empty());
+        assert_eq!(order.ids.len(), SettingId::DEFAULT_IDS.len());
+        assert_eq!(order.ids.as_slice(), SettingId::DEFAULT_IDS);
+
+        let expected_order = [
+            SettingId::HeaderTableSize,
+            SettingId::EnablePush,
+            SettingId::MaxConcurrentStreams,
+            SettingId::InitialWindowSize,
+            SettingId::MaxFrameSize,
+            SettingId::MaxHeaderListSize,
+            SettingId::NoRfc7540Priorities,
+            SettingId::EnableConnectProtocol,
+        ];
+
+        let order = SettingsOrder::builder().extend(expected_order).build();
+        assert_eq!(order.ids.len(), expected_order.len());
+        assert_eq!(order.ids.as_slice(), expected_order);
     }
 
     #[test]
-    fn test_extend_with_default_only_adds_once() {
-        let mut order = SettingsOrder::default();
-        assert!(order.ids.is_empty());
-        assert_eq!(order.mask, 0);
+    fn test_settings_order_duplicate() {
+        let order = SettingsOrder::builder()
+            .push(SettingId::HeaderTableSize)
+            .push(SettingId::HeaderTableSize)
+            .build();
 
-        extend_with_default(&mut order);
-        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE);
-
-        let orig_order = order.clone();
-        let n = order.ids.len();
-        extend_with_default(&mut order);
-        assert_eq!(order.ids.len(), n);
-        assert_eq!(order, orig_order);
-    }
-
-    #[test]
-    fn test_extend_with_default_and_unknown_ids() {
-        let mut order = SettingsOrder::default();
-        extend_with_default(&mut order);
-        order.extend([SettingId::Unknown(10)]);
-        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 1);
-
-        extend_with_default(&mut order);
-        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 1);
-
-        order.extend([SettingId::Unknown(10)]);
-        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 1);
-
-        order.extend([SettingId::Unknown(11)]);
-        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 2);
-
-        order.extend([SettingId::Unknown(15)]);
-        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 3);
-
-        // ID > MAX_SETTING_ID
-        order.extend([SettingId::Unknown(16)]);
-        assert_eq!(order.ids.len(), DEFAULT_SETTING_STACK_SIZE + 3);
+        assert_eq!(order.ids.len(), SettingId::DEFAULT_IDS.len());
+        assert_eq!(order.ids[0], SettingId::HeaderTableSize);
+        assert_ne!(order.ids[1], SettingId::HeaderTableSize);
     }
 }
