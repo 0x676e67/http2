@@ -6,7 +6,7 @@ use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
 use crate::proto::*;
 
 use bytes::Bytes;
-use frame::{Priority, PseudoOrders, StreamDependency};
+use frame::{Priority, PseudoOrder, StreamDependency};
 use futures_core::Stream;
 use std::borrow::Cow;
 use std::io;
@@ -86,7 +86,7 @@ pub(crate) struct Config {
     pub remote_reset_stream_max: usize,
     pub local_error_reset_streams_max: Option<usize>,
     pub settings: frame::Settings,
-    pub headers_pseudo_order: Option<PseudoOrders>,
+    pub headers_pseudo_order: Option<PseudoOrder>,
     pub headers_priority: Option<StreamDependency>,
     pub priority: Option<Cow<'static, [Priority]>>,
 }
@@ -130,7 +130,7 @@ where
                     .map(|max| max as usize),
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
                 headers_priority: config.headers_priority,
-                headers_pseudo_order: config.headers_pseudo_order,
+                headers_pseudo_order: config.headers_pseudo_order.clone(),
                 priority: config.priority.clone(),
             }
         }

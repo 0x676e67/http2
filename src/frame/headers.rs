@@ -8,6 +8,7 @@ use http::header::{self, HeaderName, HeaderValue};
 use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use smallvec::SmallVec;
 
 use std::fmt;
 use std::io::Cursor;
@@ -74,59 +75,80 @@ pub struct Pseudo {
     // Response
     pub status: Option<StatusCode>,
 
-    // order of pseudo headers
-    pub order: PseudoOrders,
+    // Pseudo header order
+    pub order: Option<PseudoOrder>,
 }
 
-/// Represents the order of HTTP/2 pseudo-header fields in the header block.
-///
-/// HTTP/2 pseudo-header fields are a set of predefined header fields that start with ':'.
-/// The order of these fields in a header block is significant. This enum defines the
-/// possible pseudo-header fields and their standard order according to RFC 7540.
-///
-/// # Fields
-/// - `Method`: The `:method` pseudo-header field
-/// - `Scheme`: The `:scheme` pseudo-header field
-/// - `Authority`: The `:authority` pseudo-header field
-/// - `Path`: The `:path` pseudo-header field
-///
-/// # Ordering Rules
-/// According to RFC 7540, pseudo-header fields:
-/// - Must appear before regular header fields
-/// - Must not appear after regular header fields
-/// - Must not be repeated
-/// - Must be in the correct order as defined by the protocol
-///
-/// # Protocol Requirements
-/// - All HTTP/2 requests must include exactly one `:method`, `:scheme`, and `:path`
-///   pseudo-header field, unless it is a CONNECT request
-/// - The `:authority` pseudo-header field is optional but recommended
-/// - CONNECT requests have special rules for pseudo-headers
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PseudoOrder {
-    Method,
-    Scheme,
-    Authority,
-    Path,
-}
+/// The size of the pseudo header stack
+const DEFAULT_PSEUDO_STACK_SIZE: usize = 6;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PseudoOrders([PseudoOrder; 4]);
-
-impl From<[PseudoOrder; 4]> for PseudoOrders {
-    fn from(src: [PseudoOrder; 4]) -> Self {
-        PseudoOrders(src)
+define_enum_with_values! {
+    /// Represents the order of HTTP/2 pseudo-header fields in the header block.
+    ///
+    /// HTTP/2 pseudo-header fields are a set of predefined header fields that start with ':'.
+    /// The order of these fields in a header block is significant. This enum defines the
+    /// possible pseudo-header fields and their standard order according to RFC 7540.
+    @U8
+    pub enum PseudoId {
+        Method => 0x0001,
+        Scheme => 0x0002,
+        Authority => 0x0003,
+        Path => 0x0004,
+        Protocol => 0x0005,
+        Status => 0x0006,
     }
 }
 
-impl Default for PseudoOrders {
-    fn default() -> Self {
-        PseudoOrders([
-            PseudoOrder::Method,
-            PseudoOrder::Scheme,
-            PseudoOrder::Authority,
-            PseudoOrder::Path,
-        ])
+impl PseudoId {
+    const MAX_ID: u8 = 7;
+    const DEFAULT_IDS: [PseudoId; DEFAULT_PSEUDO_STACK_SIZE] = [
+        PseudoId::Method,
+        PseudoId::Scheme,
+        PseudoId::Authority,
+        PseudoId::Path,
+        PseudoId::Protocol,
+        PseudoId::Status,
+    ];
+
+    fn mask_id(self) -> u8 {
+        let value = u8::from(self);
+        if value == 0 || value > Self::MAX_ID {
+            return 0;
+        }
+
+        1 << (value - 1)
+    }
+}
+
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct PseudoOrder {
+    ids: SmallVec<[PseudoId; DEFAULT_PSEUDO_STACK_SIZE]>,
+    mask: u8,
+}
+
+impl PseudoOrder {
+    /// Push a pseudo header into the order.
+    pub fn push(&mut self, id: PseudoId) {
+        let mask_id = id.mask_id();
+
+        // If the ID is 0 or greater than the max setting ID, ignore it.
+        if mask_id == 0 {
+            return;
+        }
+
+        if self.mask & mask_id == 0 {
+            self.mask |= mask_id;
+            self.ids.push(id);
+        } else {
+            tracing::trace!("duplicate pseudo header: {:?}", id);
+        }
+    }
+
+    /// Push a pseudo header ID into the order.
+    pub fn extend(&mut self, iter: impl IntoIterator<Item = PseudoId>) {
+        for id in iter {
+            self.push(id);
+        }
     }
 }
 
@@ -703,8 +725,8 @@ impl Pseudo {
         self.authority = Some(authority);
     }
 
-    pub fn set_pseudo_order(&mut self, order: PseudoOrders) {
-        self.order = order;
+    pub fn set_pseudo_order(&mut self, order: PseudoOrder) {
+        self.order = Some(order);
     }
 
     /// Whether it has status 1xx
@@ -775,37 +797,45 @@ impl Iterator for Iter {
         use crate::hpack::Header::*;
 
         if let Some(ref mut pseudo) = self.pseudo {
-            for pseudo_type in pseudo.order.0.iter() {
+            let order = pseudo
+                .order
+                .as_ref()
+                .map(|order| order.ids.as_slice())
+                .unwrap_or(&PseudoId::DEFAULT_IDS);
+
+            for pseudo_type in order {
                 match pseudo_type {
-                    PseudoOrder::Method => {
+                    PseudoId::Method => {
                         if let Some(method) = pseudo.method.take() {
                             return Some(Method(method));
                         }
                     }
-                    PseudoOrder::Scheme => {
+                    PseudoId::Scheme => {
                         if let Some(scheme) = pseudo.scheme.take() {
                             return Some(Scheme(scheme));
                         }
                     }
-                    PseudoOrder::Authority => {
+                    PseudoId::Authority => {
                         if let Some(authority) = pseudo.authority.take() {
                             return Some(Authority(authority));
                         }
                     }
-                    PseudoOrder::Path => {
+                    PseudoId::Path => {
                         if let Some(path) = pseudo.path.take() {
                             return Some(Path(path));
                         }
                     }
+                    PseudoId::Protocol => {
+                        if let Some(protocol) = pseudo.protocol.take() {
+                            return Some(Protocol(protocol));
+                        }
+                    }
+                    PseudoId::Status => {
+                        if let Some(status) = pseudo.status.take() {
+                            return Some(Status(status));
+                        }
+                    }
                 }
-            }
-
-            if let Some(protocol) = pseudo.protocol.take() {
-                return Some(Protocol(protocol));
-            }
-
-            if let Some(status) = pseudo.status.take() {
-                return Some(Status(status));
             }
         }
 
@@ -1296,5 +1326,29 @@ mod test {
                 }
             );
         }
+    }
+
+ #[test]
+    fn test_pseudo_order_push_and_mask() {
+        let mut order = PseudoOrder::default();
+
+        for id in PseudoId::DEFAULT_IDS.iter().copied() {
+            order.push(id);
+        }
+
+        let expected: SmallVec<[PseudoId; DEFAULT_PSEUDO_STACK_SIZE]> = SmallVec::from_slice(&PseudoId::DEFAULT_IDS);
+        assert_eq!(order.ids, expected);
+
+        let mut expected_mask = 0u8;
+        for id in PseudoId::DEFAULT_IDS.iter().copied() {
+            expected_mask |= id.mask_id();
+        }
+        assert_eq!(order.mask, expected_mask);
+
+        let len_before = order.ids.len();
+        for id in PseudoId::DEFAULT_IDS.iter().copied() {
+            order.push(id);
+        }
+        assert_eq!(order.ids.len(), len_before, "Duplicate ids should not be added");
     }
 }

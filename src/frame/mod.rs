@@ -51,8 +51,9 @@ mod window_update;
 pub use self::data::Data;
 pub use self::go_away::GoAway;
 pub use self::head::{Head, Kind};
+#[allow(unused_imports)]
 pub use self::headers::{
-    parse_u64, Continuation, Headers, Pseudo, PseudoOrder, PseudoOrders, PushPromise,
+    parse_u64, Continuation, Headers, Pseudo, PseudoId, PseudoOrder, PushPromise,
     PushPromiseHeaderError,
 };
 pub use self::ping::Ping;

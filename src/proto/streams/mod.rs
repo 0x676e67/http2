@@ -29,7 +29,7 @@ use crate::frame::{StreamId, StreamIdOverflow};
 use crate::proto::*;
 
 use bytes::Bytes;
-use frame::{Priority, PseudoOrders, StreamDependency};
+use frame::{Priority, PseudoOrder, StreamDependency};
 use std::borrow::Cow;
 use std::time::Duration;
 
@@ -79,7 +79,7 @@ pub struct Config {
     pub headers_priority: Option<StreamDependency>,
 
     /// Pseudo order of the headers stream
-    pub headers_pseudo_order: Option<PseudoOrders>,
+    pub headers_pseudo_order: Option<PseudoOrder>,
 
     /// Priority stream list
     pub priority: Option<Cow<'static, [Priority]>>,

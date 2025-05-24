@@ -15,6 +15,7 @@ define_enum_with_values! {
     /// Each setting has a value that is a 32 bit unsigned integer (6.5.1.).
     ///
     /// See <https://datatracker.ietf.org/doc/html/rfc9113#name-defined-settings.
+    @U16
     pub enum SettingId {
         /// This setting allows the sender to inform the remote endpoint
         /// of the maximum size of the compression table used to decode field blocks,
@@ -50,11 +51,7 @@ define_enum_with_values! {
 }
 
 impl SettingId {
-    /// The maximum allowed SettingId value for bitmask operations.
-    /// This should not exceed the number of bits in the mask type (u16: 16, u32: 32, etc.)
-    const MAX_SETTING_ID: u16 = 15;
-
-    /// The default setting IDs that are used when no specific order is provided.
+    const MAX_ID: u16 = 15;
     const DEFAULT_IDS: [SettingId; DEFAULT_SETTING_STACK_SIZE] = [
         SettingId::HeaderTableSize,
         SettingId::EnablePush,
@@ -68,7 +65,7 @@ impl SettingId {
 
     fn mask_id(self) -> u16 {
         let value = u16::from(self);
-        if value == 0 || value > Self::MAX_SETTING_ID {
+        if value == 0 || value > Self::MAX_ID {
             return 0;
         }
 
@@ -492,7 +489,7 @@ impl Setting {
     pub fn from_id(id: impl Into<SettingId>, value: u32) -> Option<Setting> {
         let id = id.into();
         if let SettingId::Unknown(id) = id {
-            if id == 0 || id > SettingId::MAX_SETTING_ID {
+            if id == 0 || id > SettingId::MAX_ID {
                 tracing::debug!("limiting unknown setting id to 0x0..0xF");
                 return None;
             }
@@ -566,7 +563,7 @@ mod tests {
     use super::*;
 
     fn extend_with_default(order: &mut SettingsOrder) {
-        const MASK: u16 = 1 << SettingId::MAX_SETTING_ID;
+        const MASK: u16 = 1 << SettingId::MAX_ID;
         if order.mask & MASK == MASK {
             return;
         }

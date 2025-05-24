@@ -138,7 +138,7 @@
 use crate::codec::{Codec, SendError, UserError};
 use crate::ext::Protocol;
 use crate::frame::{
-    Headers, Priority, Pseudo, PseudoOrder, PseudoOrders, Reason, Setting, Settings, SettingsOrder,
+    Headers, Priority, Pseudo, PseudoOrder, Reason, Setting, Settings, SettingsOrder,
     StreamDependency, StreamId,
 };
 use crate::proto::{self, Error};
@@ -350,7 +350,7 @@ pub struct Builder {
     local_max_error_reset_streams: Option<usize>,
 
     /// The headers frame pseudo order
-    headers_pseudo_order: Option<PseudoOrders>,
+    headers_pseudo_order: Option<PseudoOrder>,
 
     /// The headers frame priority
     headers_priority: Option<StreamDependency>,
@@ -684,7 +684,7 @@ impl Builder {
     }
 
     /// Set http2 header pseudo order
-    pub fn headers_psuedo(&mut self, order: [PseudoOrder; 4]) -> &mut Self {
+    pub fn headers_psuedo(&mut self, order: PseudoOrder) -> &mut Self {
         self.headers_pseudo_order = Some(order.into());
         self
     }
@@ -1663,7 +1663,7 @@ impl Peer {
         request: Request<()>,
         protocol: Option<Protocol>,
         end_of_stream: bool,
-        pseudo_order: Option<PseudoOrders>,
+        pseudo_order: Option<PseudoOrder>,
         headers_priority: Option<StreamDependency>,
         priority: Option<Cow<'static, [Priority]>>,
     ) -> Result<(Option<Cow<'static, [Priority]>>, Headers), SendError> {

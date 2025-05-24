@@ -1,4 +1,4 @@
-use super::frame::{Priority, PseudoOrders, StreamDependency};
+use super::frame::{Priority, PseudoOrder, StreamDependency};
 use super::recv::RecvHeaderBlockError;
 use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
@@ -85,7 +85,7 @@ struct Inner {
     headers_priority: Option<StreamDependency>,
 
     /// Pseudo order of the headers stream
-    headers_pseudo_order: Option<PseudoOrders>,
+    headers_pseudo_order: Option<PseudoOrder>,
 
     /// Priority of the headers stream
     priority: Option<Cow<'static, [Priority]>>,
@@ -290,7 +290,7 @@ where
             request,
             protocol,
             end_of_stream,
-            me.headers_pseudo_order,
+            me.headers_pseudo_order.clone(),
             me.headers_priority,
             me.priority.clone(),
         )?;
