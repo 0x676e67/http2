@@ -140,7 +140,7 @@ impl PseudoOrder {
             self.mask |= mask_id;
             self.ids.push(id);
         } else {
-            tracing::trace!("duplicate pseudo header: {:?}", id);
+            tracing::trace!("dulicate pseudo header: {:?}", id);
         }
     }
 
@@ -1328,7 +1328,7 @@ mod test {
         }
     }
 
- #[test]
+    #[test]
     fn test_pseudo_order_push_and_mask() {
         let mut order = PseudoOrder::default();
 
@@ -1336,7 +1336,8 @@ mod test {
             order.push(id);
         }
 
-        let expected: SmallVec<[PseudoId; DEFAULT_PSEUDO_STACK_SIZE]> = SmallVec::from_slice(&PseudoId::DEFAULT_IDS);
+        let expected: SmallVec<[PseudoId; DEFAULT_PSEUDO_STACK_SIZE]> =
+            SmallVec::from_slice(&PseudoId::DEFAULT_IDS);
         assert_eq!(order.ids, expected);
 
         let mut expected_mask = 0u8;
@@ -1349,6 +1350,10 @@ mod test {
         for id in PseudoId::DEFAULT_IDS.iter().copied() {
             order.push(id);
         }
-        assert_eq!(order.ids.len(), len_before, "Duplicate ids should not be added");
+        assert_eq!(
+            order.ids.len(),
+            len_before,
+            "Duplicate ids should not be added"
+        );
     }
 }

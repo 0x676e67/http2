@@ -684,7 +684,7 @@ impl Builder {
     }
 
     /// Set http2 header pseudo order
-    pub fn headers_psuedo(&mut self, order: PseudoOrder) -> &mut Self {
+    pub fn headers_psuedo_order(&mut self, order: PseudoOrder) -> &mut Self {
         self.headers_pseudo_order = Some(order.into());
         self
     }
