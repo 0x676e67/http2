@@ -1220,8 +1220,8 @@ impl Builder {
     /// This configures the priority of the stream by specifying its dependency and weight,
     /// as defined by the HTTP/2 priority mechanism. This can be used to influence how the
     /// server allocates resources to this stream relative to others.
-    pub fn headers_stream_dependency(&mut self, dep: StreamDependency) -> &mut Self {
-        self.headers_stream_dependency = Some(dep);
+    pub fn headers_stream_dependency(&mut self, stream_dependency: StreamDependency) -> &mut Self {
+        self.headers_stream_dependency = Some(stream_dependency);
         self
     }
 
