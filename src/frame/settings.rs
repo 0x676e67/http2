@@ -190,11 +190,13 @@ impl ExperimentalSettingsBuilder {
         if let SettingId::Unknown(id) = setting.id {
             if matches!(SettingId::from(id), SettingId::Unknown(_)) {
                 let mask_id = setting.id.mask_id();
-                if mask_id != 0 && self.mask & mask_id == 0 {
-                    self.mask |= mask_id;
-                    self.settings.push(setting);
-                } else if mask_id != 0 {
-                    tracing::trace!("duplicate unknown setting ID ignored: {id:?}");
+                if mask_id != 0 {
+                    if self.mask & mask_id == 0 {
+                        self.mask |= mask_id;
+                        self.settings.push(setting);
+                    } else {
+                        tracing::trace!("duplicate unknown setting ID ignored: {id:?}");
+                    }
                 }
             }
         }
