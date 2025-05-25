@@ -132,6 +132,11 @@ impl SettingsOrderBuilder {
 }
 
 /// Extends the `Settings` struct to include experimental settings.
+///
+/// `ExperimentalSettings` is used to represent a collection of non-standard or extension HTTP/2 settings,
+/// specifically those with unknown setting IDs (i.e., not defined in the RFC).
+/// Any setting with a standard (known) ID will be ignored and not included in this collection.
+/// This allows for safe experimentation and extension without interfering with standard settings.
 #[cfg(feature = "unstable")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExperimentalSettings {
@@ -176,19 +181,19 @@ impl ExperimentalSettingsBuilder {
     where
         S: Into<Option<Setting>>,
     {
-        let setting: Option<Setting> = setting.into();
-        if let Some(setting) = setting {
-            if !matches!(setting.id, SettingId::Unknown(_)) {
-                tracing::debug!("ignoring non-unknown setting ID: {id:?}");
-                return self;
-            }
+        let setting = setting.into();
+        let Some(setting) = setting else {
+            return self;
+        };
 
-            let mask_id = setting.id.mask_id();
-            if mask_id != 0 {
-                if self.mask & mask_id == 0 {
+        // Only insert if this unknown setting ID has not been seen before (deduplication)
+        if let SettingId::Unknown(id) = setting.id {
+            if matches!(SettingId::from(id), SettingId::Unknown(_)) {
+                let mask_id = setting.id.mask_id();
+                if mask_id != 0 && self.mask & mask_id == 0 {
                     self.mask |= mask_id;
                     self.settings.push(setting);
-                } else {
+                } else if mask_id != 0 {
                     tracing::trace!("duplicate unknown setting ID ignored: {id:?}");
                 }
             }
@@ -723,5 +728,12 @@ mod tests {
             .build();
 
         assert_eq!(unknown.settings.len(), 2);
+
+        // ignore non-unknown settings
+        let unknown = ExperimentalSettings::builder()
+            .push(Setting::from_id(SettingId::HeaderTableSize, 42))
+            .push(Setting::from_id(SettingId::Unknown(15), 84))
+            .build();
+        assert_eq!(unknown.settings.len(), 1);
     }
 }
