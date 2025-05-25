@@ -24,8 +24,9 @@ More information about this crate can be found in the [crate documentation][dox]
 This package focuses solely on implementing the HTTP/2 specification. It supports client-side processing based on the original [h2](https://github.com/hyperium/h2) branch, including:
 
 * Optional [tracing](https://github.com/hyperium/h2/issues/713)
-* Headers frame priority and pseudo-header permutation
-* Priority frame (client-side only)
+* Pseudo-header permutation for headers frame
+* Experimental and permuted settings frame support
+* Priority frame support (client-side only)
 
 ## Accolades
 
