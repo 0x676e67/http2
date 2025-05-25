@@ -172,28 +172,38 @@ impl<'a> IntoIterator for &'a ExperimentalSettings {
 
 #[cfg(feature = "unstable")]
 impl ExperimentalSettingsBuilder {
-    pub fn push(mut self, id: impl Into<SettingId>, value: u32) -> Self {
-        let id = id.into();
-        if !matches!(id, SettingId::Unknown(_)) {
-            tracing::debug!("ignoring non-unknown setting ID: {id:?}");
-            return self;
-        }
+    pub fn push<S>(mut self, setting: S) -> Self
+    where
+        S: Into<Option<Setting>>,
+    {
+        let setting: Option<Setting> = setting.into();
+        if let Some(setting) = setting {
+            if !matches!(setting.id, SettingId::Unknown(_)) {
+                tracing::debug!("ignoring non-unknown setting ID: {id:?}");
+                return self;
+            }
 
-        let mask_id = id.mask_id();
-        if mask_id != 0 {
-            if self.mask & mask_id == 0 {
-                self.mask |= mask_id;
-                self.settings.push(Setting { id, value });
-            } else {
-                tracing::trace!("duplicate unknown setting ID ignored: {id:?}");
+            let mask_id = setting.id.mask_id();
+            if mask_id != 0 {
+                if self.mask & mask_id == 0 {
+                    self.mask |= mask_id;
+                    self.settings.push(setting);
+                } else {
+                    tracing::trace!("duplicate unknown setting ID ignored: {id:?}");
+                }
             }
         }
+
         self
     }
 
-    pub fn extend(mut self, iter: impl IntoIterator<Item = (SettingId, u32)>) -> Self {
-        for (id, value) in iter {
-            self = self.push(id, value);
+    pub fn extend<I>(mut self, iter: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<Option<Setting>>,
+    {
+        for setting in iter.into_iter() {
+            self = self.push(setting);
         }
         self
     }
@@ -698,18 +708,18 @@ mod tests {
 
         let unknown = ExperimentalSettings::builder()
             .extend(vec![
-                (SettingId::Unknown(16), 42),
-                (SettingId::Unknown(16), 84),
+                Setting::from_id(SettingId::Unknown(16), 42),
+                Setting::from_id(SettingId::Unknown(16), 84),
             ])
             .build();
 
         assert_eq!(unknown.settings.len(), 0);
 
         let unknown = ExperimentalSettings::builder()
-            .push(SettingId::Unknown(15), 42)
-            .push(SettingId::Unknown(14), 84)
+            .push(Setting::from_id(SettingId::Unknown(15), 42))
+            .push(Setting::from_id(SettingId::Unknown(14), 84))
             // will ignore the duplicate
-            .push(SettingId::Unknown(14), 84)
+            .push(Setting::from_id(SettingId::Unknown(14), 84))
             .build();
 
         assert_eq!(unknown.settings.len(), 2);
