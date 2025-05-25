@@ -131,6 +131,80 @@ impl SettingsOrderBuilder {
     }
 }
 
+/// Extends the `Settings` struct to include experimental settings.
+#[cfg(feature = "unstable")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExperimentalSettings {
+    settings: SmallVec<[Setting; SettingId::DEFAULT_STACK_SIZE]>,
+}
+
+/// A builder for constructing `ExperimentalSettings`.
+#[cfg(feature = "unstable")]
+#[derive(Debug)]
+pub struct ExperimentalSettingsBuilder {
+    settings: SmallVec<[Setting; SettingId::DEFAULT_STACK_SIZE]>,
+    mask: u16,
+}
+
+// ===== impl ExperimentalSettings =====
+
+#[cfg(feature = "unstable")]
+impl ExperimentalSettings {
+    pub fn builder() -> ExperimentalSettingsBuilder {
+        ExperimentalSettingsBuilder {
+            settings: SmallVec::new(),
+            mask: 0,
+        }
+    }
+}
+
+#[cfg(feature = "unstable")]
+impl<'a> IntoIterator for &'a ExperimentalSettings {
+    type Item = &'a Setting;
+    type IntoIter = std::slice::Iter<'a, Setting>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.settings.iter()
+    }
+}
+
+// ===== impl ExperimentalSettingsBuilder =====
+
+#[cfg(feature = "unstable")]
+impl ExperimentalSettingsBuilder {
+    pub fn push(mut self, id: impl Into<SettingId>, value: u32) -> Self {
+        let id = id.into();
+        if !matches!(id, SettingId::Unknown(_)) {
+            tracing::debug!("ignoring non-unknown setting ID: {id:?}");
+            return self;
+        }
+
+        let mask_id = id.mask_id();
+        if mask_id != 0 {
+            if self.mask & mask_id == 0 {
+                self.mask |= mask_id;
+                self.settings.push(Setting { id, value });
+            } else {
+                tracing::trace!("duplicate unknown setting ID ignored: {id:?}");
+            }
+        }
+        self
+    }
+
+    pub fn extend(mut self, iter: impl IntoIterator<Item = (SettingId, u32)>) -> Self {
+        for (id, value) in iter {
+            self = self.push(id, value);
+        }
+        self
+    }
+
+    pub fn build(self) -> ExperimentalSettings {
+        ExperimentalSettings {
+            settings: self.settings,
+        }
+    }
+}
+
 #[derive(Clone, Default, Eq, PartialEq)]
 pub struct Settings {
     flags: SettingsFlags,
@@ -143,7 +217,8 @@ pub struct Settings {
     max_header_list_size: Option<u32>,
     enable_connect_protocol: Option<u32>,
     no_rfc7540_priorities: Option<u32>,
-    unknown_settings: Option<SmallVec<[Setting; SettingId::DEFAULT_STACK_SIZE]>>,
+    #[cfg(feature = "unstable")]
+    experimental_settings: Option<ExperimentalSettings>,
     // Settings order
     settings_order: SettingsOrder,
 }
@@ -256,9 +331,9 @@ impl Settings {
         self.no_rfc7540_priorities = Some(enable as u32);
     }
 
-    pub fn set_unknown_settings(&mut self, settings: impl IntoIterator<Item = Setting>) {
-        let unknown_settings = self.unknown_settings.get_or_insert_with(SmallVec::new);
-        unknown_settings.extend(settings);
+    #[cfg(feature = "unstable")]
+    pub fn set_experimental_settings(&mut self, experimental_settings: ExperimentalSettings) {
+        self.experimental_settings = Some(experimental_settings)
     }
 
     pub fn set_settings_order(&mut self, settings_order: SettingsOrder) {
@@ -347,10 +422,7 @@ impl Settings {
                         }
                     },
                     SettingId::Unknown(_) => {
-                        settings
-                            .unknown_settings
-                            .get_or_insert_with(SmallVec::new)
-                            .push(setting);
+                        // ignore unknown settings
                     }
                 }
             }
@@ -440,11 +512,12 @@ impl Settings {
                         }
                     }
                 }
-                SettingId::Unknown(id) => {
-                    if let Some(ref unknown_settings) = self.unknown_settings {
+                SettingId::Unknown(_id) => {
+                    #[cfg(feature = "unstable")]
+                    if let Some(ref unknown_settings) = self.experimental_settings {
                         if let Some(setting) = unknown_settings
-                            .iter()
-                            .find(|setting| setting.id == SettingId::Unknown(*id))
+                            .into_iter()
+                            .find(|setting| setting.id == SettingId::Unknown(*_id))
                         {
                             f(setting.clone());
                         }
@@ -510,7 +583,7 @@ impl Setting {
         let id = id.into();
         if let SettingId::Unknown(id) = id {
             if id == 0 || id > SettingId::MAX_ID {
-                tracing::debug!("limiting unknown setting id to 0x0..0xF");
+                tracing::debug!("limiting unknown setting id to 0..{}", SettingId::MAX_ID);
                 return None;
             }
         }
@@ -615,5 +688,30 @@ mod tests {
         assert_eq!(order.ids.len(), SettingId::DEFAULT_IDS.len());
         assert_eq!(order.ids[0], SettingId::HeaderTableSize);
         assert_ne!(order.ids[1], SettingId::HeaderTableSize);
+    }
+
+    #[cfg(feature = "unstable")]
+    #[test]
+    fn test_experimental_settings_builder() {
+        // ignore id > SettingId::MAX_ID
+        assert!(SettingId::MAX_ID < 16);
+
+        let unknown = ExperimentalSettings::builder()
+            .extend(vec![
+                (SettingId::Unknown(16), 42),
+                (SettingId::Unknown(16), 84),
+            ])
+            .build();
+
+        assert_eq!(unknown.settings.len(), 0);
+
+        let unknown = ExperimentalSettings::builder()
+            .push(SettingId::Unknown(15), 42)
+            .push(SettingId::Unknown(14), 84)
+            // will ignore the duplicate
+            .push(SettingId::Unknown(14), 84)
+            .build();
+
+        assert_eq!(unknown.settings.len(), 2);
     }
 }

@@ -61,6 +61,8 @@ pub use self::ping::Ping;
 pub use self::priority::{Priorities, PrioritiesBuilder, Priority, StreamDependency};
 pub use self::reason::Reason;
 pub use self::reset::Reset;
+#[cfg(feature = "unstable")]
+pub use self::settings::{ExperimentalSettings, ExperimentalSettingsBuilder};
 #[allow(unused_imports)]
 pub use self::settings::{Setting, SettingId, Settings, SettingsOrder, SettingsOrderBuilder};
 pub use self::stream_id::{StreamId, StreamIdOverflow};

@@ -137,9 +137,11 @@
 
 use crate::codec::{Codec, SendError, UserError};
 use crate::ext::Protocol;
+#[cfg(feature = "unstable")]
+use crate::frame::ExperimentalSettings;
 use crate::frame::{
-    Headers, Priorities, Pseudo, PseudoOrder, Reason, Setting, Settings, SettingsOrder,
-    StreamDependency, StreamId,
+    Headers, Priorities, Pseudo, PseudoOrder, Reason, Settings, SettingsOrder, StreamDependency,
+    StreamId,
 };
 use crate::proto::{self, Error};
 use crate::{tracing, FlowControl, PingPong, RecvStream, SendStream};
@@ -1175,13 +1177,20 @@ impl Builder {
         self
     }
 
-    /// Configures custom HTTP/2 setting.
+    /// Configures custom experimental HTTP/2 setting.
     ///
     /// This setting is reserved for future use or experimental purposes.
     /// Enabling or disabling it may have no effect unless explicitly supported
     /// by the server or client implementation.
-    pub fn unknown_settings(&mut self, iter: impl IntoIterator<Item = Setting>) -> &mut Self {
-        self.settings.set_unknown_settings(iter);
+    //
+    // - Experimental feature – subject to removal without notice
+    #[cfg(feature = "unstable")]
+    pub fn experimental_settings(
+        &mut self,
+        experimental_settings: ExperimentalSettings,
+    ) -> &mut Self {
+        self.settings
+            .set_experimental_settings(experimental_settings);
         self
     }
 
