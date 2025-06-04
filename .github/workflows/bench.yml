@@ -31,7 +31,6 @@ jobs:
       - name: Store benchmark result
         uses: benchmark-action/github-action-benchmark@v1
         with:
-          name: ${{ matrix.bench }}
           # What benchmark tool the output.txt came from
           tool: 'cargo'
           # Where the output from the benchmark tool is stored
