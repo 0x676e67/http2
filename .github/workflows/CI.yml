@@ -109,7 +109,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run benchmark
-        run: cd benches && cargo bench | tee output.txt
+        run: cd benches && cargo bench | grep -v 'ignored' | grep -v 'tests' | grep -v '^[[:space:]]*$' | tee output.txt
 
       - name: Store benchmark result
         uses: benchmark-action/github-action-benchmark@v1
