@@ -3,7 +3,7 @@ name = "http2"
 # When releasing to crates.io:
 # - Update CHANGELOG.md.
 # - Create git tag
-version = "0.5.1"
+version = "0.5.2"
 license = "MIT"
 authors = ["0x676e67 <gngppz@gmail.com>"]
 description = "An HTTP/2 client and server"
@@ -29,6 +29,7 @@ tracing = ["dep:tracing"]
 # depends on this feature.
 unstable = []
 
+# Enables the `parking_lot` crate for synchronization primitives.
 parking_lot = ["dep:parking_lot"]
 
 [workspace]
