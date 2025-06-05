@@ -7,14 +7,13 @@ use h2::{
 use http::Request;
 use http2 as h2;
 
-use std::{
-    error::Error,
-    time::{Duration, Instant},
-};
+use std::{error::Error, time::Duration};
 
 use tokio::net::{TcpListener, TcpStream};
 
-const NUM_REQUESTS_TO_SEND: usize = 100_000;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+
+const NUM_REQUESTS_TO_SEND: usize = 100;
 
 // The actual server.
 async fn server(addr: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -82,57 +81,50 @@ async fn send_requests(addr: &str) -> Result<(), Box<dyn Error>> {
         let task = tokio::spawn(async move {
             let request = Request::builder().body(()).unwrap();
 
-            let instant = Instant::now();
             let (response, _) = client.send_request(request, true).unwrap();
             let response = response.await.unwrap();
             let mut body = response.into_body();
             while let Some(_chunk) = body.data().await {}
-            instant.elapsed()
         });
         handles.push(task);
     }
 
-    let instant = Instant::now();
-    let mut result = Vec::with_capacity(NUM_REQUESTS_TO_SEND);
     for handle in handles {
-        result.push(handle.await.unwrap());
-    }
-    let mut sum = Duration::new(0, 0);
-    for r in result.iter() {
-        sum = sum.checked_add(*r).unwrap();
+        handle.await.unwrap();
     }
 
-    println!("Overall: {}ms.", instant.elapsed().as_millis());
-    println!("Fastest: {}ms", result.iter().min().unwrap().as_millis());
-    println!("Slowest: {}ms", result.iter().max().unwrap().as_millis());
-    println!(
-        "Avg    : {}ms",
-        sum.div_f64(NUM_REQUESTS_TO_SEND as f64).as_millis()
-    );
     Ok(())
 }
 
-fn main() {
-    let _ = env_logger::try_init();
+fn bench_single_thread(c: &mut Criterion) {
     let addr = "127.0.0.1:5928";
-    println!("H2 running in current-thread runtime at {addr}:");
-    std::thread::spawn(|| {
+    std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(server(addr)).unwrap();
     });
+    std::thread::sleep(Duration::from_millis(500));
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(send_requests(addr)).unwrap();
+    c.bench_with_input(
+        BenchmarkId::new("single_thread", addr),
+        &addr,
+        |b, &addr| {
+            b.to_async(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            )
+            .iter(|| send_requests(addr));
+        },
+    );
+}
 
+fn bench_multi_thread(c: &mut Criterion) {
     let addr = "127.0.0.1:5929";
-    println!("H2 running in multi-thread runtime at {addr}:");
-    std::thread::spawn(|| {
+    std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -141,9 +133,22 @@ fn main() {
         rt.block_on(server(addr)).unwrap();
     });
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(send_requests(addr)).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    c.bench_with_input(
+        BenchmarkId::new("single_thread", addr),
+        &addr,
+        |b, &addr| {
+            b.to_async(
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            )
+            .iter(|| send_requests(addr));
+        },
+    );
 }
+
+criterion_group!(benches, bench_single_thread, bench_multi_thread);
+criterion_main!(benches);

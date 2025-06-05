@@ -69,6 +69,9 @@ serde_json = "1.0.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
 env_logger = { version = "0.10", default-features = false }
 
+# Benchmarks
+criterion = { version = "0.6.0", features = ["async_tokio"] }
+
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
 
