@@ -136,7 +136,7 @@ fn bench_multi_thread(c: &mut Criterion) {
     std::thread::sleep(Duration::from_millis(500));
 
     c.bench_with_input(
-        BenchmarkId::new("single_thread", addr),
+        BenchmarkId::new("multi_thread", addr),
         &addr,
         |b, &addr| {
             b.to_async(
