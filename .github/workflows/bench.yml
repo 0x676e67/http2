@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+  packages: write
+
 jobs:
   benchmark:
     name: Benchmark
@@ -33,17 +37,12 @@ jobs:
         with:
           # What benchmark tool the output.txt came from
           tool: 'cargo'
-          # Where the output from the benchmark tool is stored
           output-file-path: output.txt
-          # # Where the previous data file is stored
-          # external-data-json-path: ./cache/benchmark-data.json
-          # Workflow will fail when an alert happens
+          external-data-json-path: ./cache/benchmark-data.json
           fail-on-alert: true
           # GitHub API token to make a commit comment
           github-token: ${{ secrets.GITHUB_TOKEN }}
           # Enable alert commit comment
           comment-on-alert: true
-          #alert-comment-cc-users: '@seanmonstar'
-          auto-push: true
 
       # Upload the updated cache file for the next job by actions/cache
