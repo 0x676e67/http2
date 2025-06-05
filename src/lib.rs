@@ -11,7 +11,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! http2 = "0.4"
+//! http2 = "0.5"
 //! ```
 //!
 //! # Layout
