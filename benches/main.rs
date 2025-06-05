@@ -135,19 +135,15 @@ fn bench_multi_thread(c: &mut Criterion) {
 
     std::thread::sleep(Duration::from_millis(500));
 
-    c.bench_with_input(
-        BenchmarkId::new("multi_thread", addr),
-        &addr,
-        |b, &addr| {
-            b.to_async(
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap(),
-            )
-            .iter(|| send_requests(addr));
-        },
-    );
+    c.bench_with_input(BenchmarkId::new("multi_thread", addr), &addr, |b, &addr| {
+        b.to_async(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        )
+        .iter(|| send_requests(addr));
+    });
 }
 
 criterion_group!(benches, bench_single_thread, bench_multi_thread);
