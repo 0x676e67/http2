@@ -7,8 +7,13 @@ mod send;
 mod state;
 mod store;
 mod stream;
+#[cfg(not(feature = "parking_lot"))]
 #[allow(clippy::module_inception)]
 mod streams;
+#[cfg(feature = "parking_lot")]
+mod streams2;
+#[cfg(feature = "parking_lot")]
+use streams2 as streams;
 
 pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
