@@ -138,7 +138,7 @@ impl SettingsOrderBuilder {
 /// Any setting with a standard (known) ID will be ignored and not included in this collection.
 /// This allows for safe experimentation and extension without interfering with standard settings.
 #[cfg(feature = "unstable")]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ExperimentalSettings {
     settings: SmallVec<[Setting; SettingId::DEFAULT_STACK_SIZE]>,
 }
@@ -244,7 +244,7 @@ pub struct Settings {
 /// frame.
 ///
 /// Each setting has a value that is a 32 bit unsigned integer (6.5.1.).
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Setting {
     id: SettingId,
     value: u32,

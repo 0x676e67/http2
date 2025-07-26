@@ -105,7 +105,7 @@ define_enum_with_values! {
 ///
 /// Typically, a `PseudoOrder` is constructed using the [`PseudoOrderBuilder`] to enforce uniqueness
 /// and protocol-compliant ordering.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PseudoOrder {
     ids: SmallVec<[PseudoId; PseudoId::DEFAULT_STACK_SIZE]>,
 }

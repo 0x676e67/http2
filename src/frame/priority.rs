@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use crate::frame::*;
 use crate::tracing;
 use bytes::BufMut;
@@ -7,7 +9,7 @@ use smallvec::SmallVec;
 /// of a stream [Section 5.3].  It can be sent in any stream state,
 /// including idle or closed streams.
 /// [Section 5.3]: <https://tools.ietf.org/html/rfc7540#section-5.3>
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Priority {
     /// The stream ID of the stream that this priority frame is for
     stream_id: StreamId,
@@ -28,7 +30,7 @@ pub struct Priority {
 /// In HTTP/2, stream dependencies form a dependency tree where each stream
 /// can depend on another stream. This creates a priority hierarchy that helps
 /// determine the relative order in which streams should be processed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub struct StreamDependency {
     /// The ID of the stream dependency target
     dependency_id: StreamId,
