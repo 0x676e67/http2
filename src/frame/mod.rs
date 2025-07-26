@@ -35,6 +35,8 @@ mod tests {
     }
 }
 
+#[macro_use]
+mod macros;
 mod data;
 mod go_away;
 mod head;

@@ -87,9 +87,6 @@
 #![allow(clippy::type_complexity, clippy::manual_range_contains)]
 #![cfg_attr(test, deny(warnings))]
 
-#[macro_use]
-mod macros;
-
 mod tracing;
 
 macro_rules! proto_err {
