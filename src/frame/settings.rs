@@ -56,7 +56,7 @@ define_enum_with_values! {
 ///
 /// Typically, a `SettingsOrder` is constructed using the [`SettingsOrderBuilder`] to enforce uniqueness
 /// and protocol-compliant ordering.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct SettingsOrder {
     ids: SmallVec<[SettingId; SettingId::DEFAULT_STACK_SIZE]>,
 }

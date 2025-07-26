@@ -168,7 +168,7 @@ const DEFAULT_STACK_SIZE: usize = 8;
 /// in HTTP/2. This is useful for pre-configuring stream priorities or
 /// sending multiple PRIORITY frames at once during connection setup or
 /// stream reprioritization.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Priorities {
     priorities: SmallVec<[Priority; DEFAULT_STACK_SIZE]>,
     max_stream_id: StreamId,
