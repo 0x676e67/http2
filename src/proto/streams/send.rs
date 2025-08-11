@@ -3,8 +3,9 @@ use super::{
     StreamIdOverflow, WindowSize,
 };
 use crate::codec::UserError;
-use crate::frame::{self, Reason};
+use crate::frame::{self, Priorities, Reason};
 use crate::proto::{self, Error, Initiator};
+use crate::tracing;
 
 use bytes::Buf;
 use tokio::io::AsyncWrite;
@@ -130,31 +131,57 @@ impl Send {
         counts: &mut Counts,
         task: &mut Option<Waker>,
     ) -> Result<(), UserError> {
-        tracing::trace!(
-            "send_headers; frame={:?}; init_window={:?}",
-            frame,
-            self.init_window_sz
-        );
+        self.send_priority_and_headers(None, frame, buffer, stream, counts, task)
+    }
 
-        Self::check_headers(frame.fields())?;
+    pub fn send_priority_and_headers<B>(
+        &mut self,
+        priority_frame: Option<Priorities>,
+        headers_frame: frame::Headers,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        Self::check_headers(headers_frame.fields())?;
 
-        let end_stream = frame.is_end_stream();
+        let end_stream = headers_frame.is_end_stream();
 
         // Update the state
         stream.state.send_open(end_stream)?;
 
         let mut pending_open = false;
-        if counts.peer().is_local_init(frame.stream_id()) && !stream.is_pending_push {
+        if counts.peer().is_local_init(headers_frame.stream_id()) && !stream.is_pending_push {
             self.prioritize.queue_open(stream);
             pending_open = true;
         }
+
+        // Queue the priority frame if it exists
+        if let Some(priority_frames) = priority_frame {
+            for priority_frame in priority_frames {
+                tracing::trace!(
+                    "send_priority; frame={:?}; init_window={:?}",
+                    priority_frame,
+                    self.init_window_sz
+                );
+
+                self.prioritize
+                    .queue_frame(priority_frame.into(), buffer, stream, task);
+            }
+        }
+
+        tracing::trace!(
+            "send_headers; frame={:?}; init_window={:?}",
+            headers_frame,
+            self.init_window_sz
+        );
 
         // Queue the frame for sending
         //
         // This call expects that, since new streams are in the open queue, new
         // streams won't be pushed on pending_send.
         self.prioritize
-            .queue_frame(frame.into(), buffer, stream, task);
+            .queue_frame(headers_frame.into(), buffer, stream, task);
 
         // Need to notify the connection when pushing onto pending_open since
         // queue_frame only notifies for pending_send.
@@ -180,6 +207,7 @@ impl Send {
         let is_reset = stream.state.is_reset();
         let is_closed = stream.state.is_closed();
         let is_empty = stream.pending_send.is_empty();
+        #[cfg(feature = "tracing")]
         let stream_id = stream.id;
 
         tracing::trace!(
@@ -497,7 +525,7 @@ impl Send {
                         // and reassign it to other streams.
                         let window_size = stream.send_flow.window_size();
                         let available = stream.send_flow.available().as_size();
-                        let reclaimed = if available > window_size {
+                        let _reclaimed = if available > window_size {
                             // Drop down to `window_size`.
                             let reclaim = available - window_size;
                             stream
@@ -514,7 +542,7 @@ impl Send {
                             "decremented stream window; id={:?}; decr={}; reclaimed={}; flow={:?}",
                             stream.id,
                             dec,
-                            reclaimed,
+                            _reclaimed,
                             stream.send_flow
                         );
 

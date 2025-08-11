@@ -55,7 +55,7 @@
 //! # Shutting down the server
 //!
 //! Graceful shutdown of the server is [not yet
-//! implemented](https://github.com/hyperium/h2/issues/69).
+//! implemented](https://github.com/hyperium/http2/issues/69).
 //!
 //! # Example
 //!
@@ -64,7 +64,7 @@
 //! will use the HTTP/2 protocol without prior negotiation.
 //!
 //! ```no_run
-//! use h2::server;
+//! use http2::server;
 //! use http::{Response, StatusCode};
 //! use tokio::net::TcpListener;
 //!
@@ -78,10 +78,10 @@
 //!             // Spawn a new task to process each connection.
 //!             tokio::spawn(async {
 //!                 // Start the HTTP/2 connection handshake
-//!                 let mut h2 = server::handshake(socket).await.unwrap();
+//!                 let mut http2 = server::handshake(socket).await.unwrap();
 //!                 // Accept all inbound HTTP/2 streams sent over the
 //!                 // connection.
-//!                 while let Some(request) = h2.accept().await {
+//!                 while let Some(request) = http2.accept().await {
 //!                     let (request, mut respond) = request.unwrap();
 //!                     println!("Received request: {:?}", request);
 //!
@@ -118,8 +118,10 @@
 use crate::codec::{Codec, UserError};
 use crate::frame::{self, Pseudo, PushPromiseHeaderError, Reason, Settings, StreamId};
 use crate::proto::{self, Config, Error, Prioritized};
-use crate::{FlowControl, PingPong, RecvStream, SendStream};
+use crate::{tracing, FlowControl, PingPong, RecvStream, SendStream};
 
+#[cfg(feature = "tracing")]
+use ::tracing::instrument::{Instrument, Instrumented};
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Method, Request, Response};
 use std::future::Future;
@@ -128,7 +130,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::instrument::{Instrument, Instrumented};
 
 /// In progress HTTP/2 connection handshake future.
 ///
@@ -151,7 +152,8 @@ pub struct Handshake<T, B: Buf = Bytes> {
     /// The current state of the handshake.
     state: Handshaking<T, B>,
     /// Span tracking the handshake
-    span: tracing::Span,
+    #[cfg(feature = "tracing")]
+    span: ::tracing::Span,
 }
 
 /// Accepts inbound HTTP/2 streams on a connection.
@@ -176,8 +178,8 @@ pub struct Handshake<T, B: Buf = Bytes> {
 ///
 /// ```
 /// # use tokio::io::{AsyncRead, AsyncWrite};
-/// # use h2::server;
-/// # use h2::server::*;
+/// # use http2::server;
+/// # use http2::server::*;
 /// #
 /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T) {
 /// let mut server = server::handshake(my_io).await.unwrap();
@@ -216,7 +218,7 @@ pub struct Connection<T, B: Buf> {
 ///
 /// ```
 /// # use tokio::io::{AsyncRead, AsyncWrite};
-/// # use h2::server::*;
+/// # use http2::server::*;
 /// #
 /// # fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
 /// # -> Handshake<T>
@@ -308,9 +310,17 @@ impl<B: Buf + fmt::Debug> fmt::Debug for SendPushedResponse<B> {
 /// Stages of an in-progress handshake.
 enum Handshaking<T, B: Buf> {
     /// State 1. Connection is flushing pending SETTINGS frame.
+    #[cfg(feature = "tracing")]
     Flushing(Instrumented<Flush<T, Prioritized<B>>>),
+    #[cfg(not(feature = "tracing"))]
+    Flushing(Flush<T, Prioritized<B>>),
+
     /// State 2. Connection is waiting for the client preface.
+    #[cfg(feature = "tracing")]
     ReadingPreface(Instrumented<ReadPreface<T, Prioritized<B>>>),
+    #[cfg(not(feature = "tracing"))]
+    ReadingPreface(ReadPreface<T, Prioritized<B>>),
+
     /// State 3. Handshake is done, polling again would panic.
     Done,
 }
@@ -350,8 +360,8 @@ const PREFACE: [u8; 24] = *b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 ///
 /// ```
 /// # use tokio::io::{AsyncRead, AsyncWrite};
-/// # use h2::server;
-/// # use h2::server::*;
+/// # use http2::server;
+/// # use http2::server::*;
 /// #
 /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
 /// # {
@@ -377,7 +387,9 @@ where
     B: Buf,
 {
     fn handshake2(io: T, builder: Builder) -> Handshake<T, B> {
-        let span = tracing::trace_span!("server_handshake");
+        #[cfg(feature = "tracing")]
+        let span = ::tracing::trace_span!("server_handshake");
+        #[cfg(feature = "tracing")]
         let entered = span.enter();
 
         // Create the codec.
@@ -397,14 +409,19 @@ where
             .expect("invalid SETTINGS frame");
 
         // Create the handshake future.
+        #[cfg(feature = "tracing")]
         let state =
-            Handshaking::Flushing(Flush::new(codec).instrument(tracing::trace_span!("flush")));
+            Handshaking::Flushing(Flush::new(codec).instrument(::tracing::trace_span!("flush")));
+        #[cfg(not(feature = "tracing"))]
+        let state = Handshaking::Flushing(Flush::new(codec));
 
+        #[cfg(feature = "tracing")]
         drop(entered);
 
         Handshake {
             builder,
             state,
+            #[cfg(feature = "tracing")]
             span,
         }
     }
@@ -522,7 +539,7 @@ where
     /// After flushing the GOAWAY frame, the connection is closed. Any
     /// outstanding streams do not prevent the connection from closing. This
     /// should usually be reserved for shutting down when something bad
-    /// external to `h2` has happened, and open streams cannot be properly
+    /// external to `http2` has happened, and open streams cannot be properly
     /// handled.
     ///
     /// For graceful shutdowns, see [`graceful_shutdown`](Connection::graceful_shutdown).
@@ -631,7 +648,7 @@ impl Builder {
     ///
     /// ```
     /// # use tokio::io::{AsyncRead, AsyncWrite};
-    /// # use h2::server::*;
+    /// # use http2::server::*;
     /// #
     /// # fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Handshake<T>
@@ -674,7 +691,7 @@ impl Builder {
     ///
     /// ```
     /// # use tokio::io::{AsyncRead, AsyncWrite};
-    /// # use h2::server::*;
+    /// # use http2::server::*;
     /// #
     /// # fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Handshake<T>
@@ -708,7 +725,7 @@ impl Builder {
     ///
     /// ```
     /// # use tokio::io::{AsyncRead, AsyncWrite};
-    /// # use h2::server::*;
+    /// # use http2::server::*;
     /// #
     /// # fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Handshake<T>
@@ -741,7 +758,7 @@ impl Builder {
     ///
     /// ```
     /// # use tokio::io::{AsyncRead, AsyncWrite};
-    /// # use h2::server::*;
+    /// # use http2::server::*;
     /// #
     /// # fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Handshake<T>
@@ -780,7 +797,7 @@ impl Builder {
     ///
     /// ```
     /// # use tokio::io::{AsyncRead, AsyncWrite};
-    /// # use h2::server::*;
+    /// # use http2::server::*;
     /// #
     /// # fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Handshake<T>
@@ -817,7 +834,7 @@ impl Builder {
     /// setting.
     ///
     /// Also note that if the remote *does* exceed the value set here, it is not
-    /// a protocol level error. Instead, the `h2` library will immediately reset
+    /// a protocol level error. Instead, the `http2` library will immediately reset
     /// the stream.
     ///
     /// See [Section 5.1.2] in the HTTP/2 spec for more details.
@@ -828,7 +845,7 @@ impl Builder {
     ///
     /// ```
     /// # use tokio::io::{AsyncRead, AsyncWrite};
-    /// # use h2::server::*;
+    /// # use http2::server::*;
     /// #
     /// # fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Handshake<T>
@@ -874,7 +891,7 @@ impl Builder {
     ///
     /// ```
     /// # use tokio::io::{AsyncRead, AsyncWrite};
-    /// # use h2::server::*;
+    /// # use http2::server::*;
     /// #
     /// # fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Handshake<T>
@@ -935,7 +952,7 @@ impl Builder {
     ///
     /// ```
     /// # use tokio::io::{AsyncRead, AsyncWrite};
-    /// # use h2::server::*;
+    /// # use http2::server::*;
     /// #
     /// # fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Handshake<T>
@@ -999,7 +1016,7 @@ impl Builder {
     ///
     /// ```
     /// # use tokio::io::{AsyncRead, AsyncWrite};
-    /// # use h2::server::*;
+    /// # use http2::server::*;
     /// # use std::time::Duration;
     /// #
     /// # fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
@@ -1050,7 +1067,7 @@ impl Builder {
     ///
     /// ```
     /// # use tokio::io::{AsyncRead, AsyncWrite};
-    /// # use h2::server::*;
+    /// # use http2::server::*;
     /// #
     /// # fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Handshake<T>
@@ -1070,7 +1087,7 @@ impl Builder {
     ///
     /// ```
     /// # use tokio::io::{AsyncRead, AsyncWrite};
-    /// # use h2::server::*;
+    /// # use http2::server::*;
     /// #
     /// # fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Handshake<T, &'static [u8]>
@@ -1347,8 +1364,8 @@ where
     type Output = Result<Connection<T, B>, crate::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let span = self.span.clone(); // XXX(eliza): T_T
-        let _e = span.enter();
+        #[cfg(feature = "tracing")]
+        let _span = self.span.clone().entered(); // XXX(eliza): T_T
         tracing::trace!(state = ?self.state);
 
         loop {
@@ -1368,7 +1385,10 @@ where
                         }
                     };
                     self.state = Handshaking::ReadingPreface(
-                        ReadPreface::new(codec).instrument(tracing::trace_span!("read_preface")),
+                        #[cfg(feature = "tracing")]
+                        ReadPreface::new(codec).instrument(::tracing::trace_span!("read_preface")),
+                        #[cfg(not(feature = "tracing"))]
+                        ReadPreface::new(codec),
                     );
                 }
                 Handshaking::ReadingPreface(read) => {
@@ -1390,6 +1410,9 @@ where
                                 .builder
                                 .local_max_error_reset_streams,
                             settings: self.builder.settings.clone(),
+                            headers_stream_dependency: None,
+                            headers_pseudo_order: None,
+                            priorities: None,
                         },
                     );
 
@@ -1464,10 +1487,10 @@ impl Peer {
                     "convert_push_message: method {} is not safe and cacheable",
                     request.method(),
                 ),
-                InvalidContentLength(e) => tracing::debug!(
+                InvalidContentLength(_e) => tracing::debug!(
                     ?promised_id,
                     "convert_push_message; promised request has invalid content-length {:?}",
-                    e,
+                    _e,
                 ),
             }
             return Err(UserError::MalformedHeaders);
@@ -1498,6 +1521,7 @@ impl Peer {
 impl proto::Peer for Peer {
     type Poll = Request<()>;
 
+    #[cfg(feature = "tracing")]
     const NAME: &'static str = "Server";
 
     /*
@@ -1557,11 +1581,11 @@ impl proto::Peer for Peer {
         // header
         if let Some(authority) = pseudo.authority {
             let maybe_authority = uri::Authority::from_maybe_shared(authority.clone().into_inner());
-            parts.authority = Some(maybe_authority.or_else(|why| {
+            parts.authority = Some(maybe_authority.or_else(|_why| {
                 malformed!(
                     "malformed headers: malformed authority ({:?}): {}",
                     authority,
-                    why,
+                    _why,
                 )
             })?);
         }
@@ -1572,11 +1596,11 @@ impl proto::Peer for Peer {
                 malformed!("malformed headers: :scheme in CONNECT");
             }
             let maybe_scheme = scheme.parse();
-            let scheme = maybe_scheme.or_else(|why| {
+            let scheme = maybe_scheme.or_else(|_why| {
                 malformed!(
                     "malformed headers: malformed scheme ({:?}): {}",
                     scheme,
-                    why,
+                    _why,
                 )
             })?;
 
@@ -1601,8 +1625,8 @@ impl proto::Peer for Peer {
             }
 
             let maybe_path = uri::PathAndQuery::from_maybe_shared(path.clone().into_inner());
-            parts.path_and_query = Some(maybe_path.or_else(|why| {
-                malformed!("malformed headers: malformed path ({:?}): {}", path, why,)
+            parts.path_and_query = Some(maybe_path.or_else(|_why| {
+                malformed!("malformed headers: malformed path ({:?}): {}", path, _why,)
             })?);
         } else if is_connect && has_protocol {
             malformed!("malformed headers: missing path in extended CONNECT");
@@ -1612,10 +1636,10 @@ impl proto::Peer for Peer {
 
         let mut request = match b.body(()) {
             Ok(request) => request,
-            Err(e) => {
+            Err(_e) => {
                 // TODO: Should there be more specialized handling for different
                 // kinds of errors
-                proto_err!(stream: "error building request: {}; stream={:?}", e, stream_id);
+                proto_err!(stream: "error building request: {}; stream={:?}", _e, stream_id);
                 return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
             }
         };

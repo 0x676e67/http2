@@ -5,6 +5,7 @@ use h2::{
     RecvStream,
 };
 use http::Request;
+use http2 as h2;
 
 use std::{
     error::Error,

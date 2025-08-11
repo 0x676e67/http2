@@ -1,3 +1,4 @@
+use super::frame::{Priorities, PseudoOrder, StreamDependency};
 use super::recv::RecvHeaderBlockError;
 use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
@@ -5,7 +6,7 @@ use crate::codec::{Codec, SendError, UserError};
 use crate::ext::Protocol;
 use crate::frame::{self, Frame, Reason};
 use crate::proto::{peer, Error, Initiator, Open, Peer, WindowSize};
-use crate::{client, proto, server};
+use crate::{client, proto, server, tracing};
 
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Request, Response};
@@ -78,6 +79,15 @@ struct Inner {
 
     /// The number of stream refs to this shared state.
     refs: usize,
+
+    /// Headers stream dependency
+    headers_stream_dependency: Option<StreamDependency>,
+
+    /// Pseudo order of the headers stream
+    headers_pseudo_order: Option<PseudoOrder>,
+
+    /// Priority of the headers stream
+    priorities: Option<Priorities>,
 }
 
 #[derive(Debug)]
@@ -114,6 +124,7 @@ where
         Streams {
             inner: Inner::new(peer, config),
             send_buffer: Arc::new(SendBuffer::new()),
+
             _p: ::std::marker::PhantomData,
         }
     }
@@ -272,13 +283,32 @@ where
             stream.content_length = ContentLength::Head;
         }
 
+        // Priorities frame check before sending the request.
+        if let Some(priorities) = &me.priorities {
+            let next_id = priorities
+                .max_stream_id()
+                .next_id()
+                .map_err(|_| SendError::User(UserError::OverflowedStreamId))?;
+
+            if next_id > stream_id {
+                return Err(SendError::User(UserError::OverflowedStreamId));
+            }
+        }
+
         // Convert the message
-        let headers =
-            client::Peer::convert_send_message(stream_id, request, protocol, end_of_stream)?;
+        let headers = client::Peer::convert_send_message(
+            stream_id,
+            request,
+            protocol,
+            end_of_stream,
+            me.headers_pseudo_order.clone(),
+            me.headers_stream_dependency,
+        )?;
 
         let mut stream = me.store.insert(stream.id, stream);
 
-        let sent = me.actions.send.send_headers(
+        let sent = me.actions.send.send_priority_and_headers(
+            me.priorities.clone(),
             headers,
             send_buffer,
             &mut stream,
@@ -415,6 +445,9 @@ impl Inner {
             },
             store: Store::new(),
             refs: 1,
+            headers_stream_dependency: config.headers_stream_dependency,
+            headers_pseudo_order: config.headers_pseudo_order,
+            priorities: config.priorities,
         }))
     }
 
@@ -491,7 +524,7 @@ impl Inner {
         let send_buffer = &mut *send_buffer;
 
         self.counts.transition(stream, |counts, stream| {
-            tracing::trace!(
+           tracing::trace!(
                 "recv_headers; stream={:?}; state={:?}",
                 stream.id,
                 stream.state
@@ -1002,6 +1035,7 @@ where
             inner,
             send_buffer,
             _p,
+            ..
         } = self;
         DynStreams {
             inner,
