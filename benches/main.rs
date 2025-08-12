@@ -161,8 +161,9 @@ async fn parking_lot_h2_send_requests(addr: &str) -> Result<(), Box<dyn Error>> 
 }
 
 fn spawn_single_thread_server(addr: &'static str) {
-    println!("===============================");
+    println!("\n\n===============================");
     println!("Starting single-threaded server at {addr}");
+    println!("===============================");
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -174,8 +175,9 @@ fn spawn_single_thread_server(addr: &'static str) {
 }
 
 fn spawn_multi_thread_server(addr: &'static str) {
-    println!("===============================");
+    println!("\n\n===============================");
     println!("Starting multi-threaded server at {addr}");
+    println!("===============================");
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -210,6 +212,10 @@ fn run_multi_thread_client<F: Future>(desc: &str, addr: &str, future: F) {
 
 fn main() {
     let _ = env_logger::try_init();
+
+    println!("===============================");
+    println!("Benchmarking with concurrency = {}", NUM_REQUESTS_TO_SEND);
+    println!("===============================");
 
     let addr = "127.0.0.1:5928";
     spawn_single_thread_server(addr);
