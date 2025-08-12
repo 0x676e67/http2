@@ -11,7 +11,7 @@ use std::{
 
 use tokio::net::{TcpListener, TcpStream};
 
-const NUM_REQUESTS_TO_SEND: usize = 100_000_0;
+const NUM_REQUESTS_TO_SEND: usize = 100_000;
 
 // The actual server.
 async fn server(addr: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
