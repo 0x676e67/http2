@@ -57,6 +57,7 @@ parking_lot = "0.12.4"
 
 [dev-dependencies]
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+h2 = { version = "0.4" }
 
 # Fuzzing
 quickcheck = { version = "1.0.3", default-features = false }
