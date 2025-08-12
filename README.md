@@ -26,6 +26,7 @@ This package focuses solely on implementing the HTTP/2 specification. It support
 - Pseudo-header permutation for headers frame
 - Experimental and permuted settings frame support
 - Priority frame support (client-side only)
+- Major multi-core concurrency boost for client and server
 
 This crate is now used by [wreq](https://github.com/0x676e67/wreq), which will provide all of these features.
 
