@@ -1468,7 +1468,11 @@ impl OpaqueStreamRef {
 impl fmt::Debug for OpaqueStreamRef {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         #[cfg(feature = "parking_lot")]
-        match self.inner.try_lock() {
+        let lock_result = self.inner.try_lock();
+        #[cfg(not(feature = "parking_lot"))]
+        let lock_result = self.inner.try_lock().ok();
+
+        match lock_result {
             Some(me) => {
                 let stream = &me.store[self.key];
                 fmt.debug_struct("OpaqueStreamRef")
@@ -1477,21 +1481,6 @@ impl fmt::Debug for OpaqueStreamRef {
                     .finish()
             }
             None => fmt
-                .debug_struct("OpaqueStreamRef")
-                .field("inner", &"<Locked>")
-                .finish(),
-        }
-
-        #[cfg(not(feature = "parking_lot"))]
-        match self.inner.try_lock() {
-            Ok(me) => {
-                let stream = &me.store[self.key];
-                fmt.debug_struct("OpaqueStreamRef")
-                    .field("stream_id", &stream.id)
-                    .field("ref_count", &stream.ref_count)
-                    .finish()
-            }
-            Err(_) => fmt
                 .debug_struct("OpaqueStreamRef")
                 .field("inner", &"<Locked>")
                 .finish(),
