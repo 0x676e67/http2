@@ -9,6 +9,7 @@ mod store;
 mod stream;
 #[allow(clippy::module_inception)]
 mod streams;
+mod sync;
 
 pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
