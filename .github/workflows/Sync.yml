@@ -1,0 +1,57 @@
+name: Sync
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout your repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CR_PAT }}
+
+      - name: Set up git user
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Add sync-upstream remote
+        run: git remote add sync-upstream https://github.com/hyperium/h2.git
+
+      - name: Fetch sync-upstream
+        run: git fetch sync-upstream
+
+      - name: Create sync branch
+        run: |
+          git branch sync-upstream sync-upstream/master
+          git checkout sync-upstream
+          git reset --hard sync-upstream/master
+          git push -f origin sync-upstream
+
+      - name: Create PR from sync-upstream to master
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CR_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const { data: pulls } = await github.rest.pulls.list({
+              owner, repo, head: `${owner}:sync-upstream`, base: 'master', state: 'open'
+            });
+            if (pulls.length === 0) {
+              await github.rest.pulls.create({
+                owner,
+                repo,
+                head: 'sync-upstream',
+                base: 'master',
+                title: 'Sync with upstream',
+                body: 'Auto sync hyperium/h2 master'
+              });
+              core.info("PR created!");
+            } else {
+              core.info("PR already exists. Nothing to do.");
+            }

@@ -105,7 +105,7 @@ impl Error {
         )
     }
 
-    /// Returns true if the error was created by `h2`.
+    /// Returns true if the error was created by `http2`.
     ///
     /// Such as noticing some protocol error and sending a GOAWAY or RST_STREAM.
     pub fn is_library(&self) -> bool {

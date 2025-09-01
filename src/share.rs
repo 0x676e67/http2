@@ -165,7 +165,7 @@ pub struct RecvStream {
 ///
 /// `WINDOW_UPDATE` frames will not be sent out for **every** call to
 /// `release_capacity`, as this would end up slowing down the protocol. Instead,
-/// `h2` waits until the window size is increased to a certain threshold and
+/// `http2` waits until the window size is increased to a certain threshold and
 /// then sends out a single `WINDOW_UPDATE` frame representing all the calls to
 /// `release_capacity` since the last `WINDOW_UPDATE` frame.
 ///
@@ -235,7 +235,7 @@ impl<B: Buf> SendStream<B> {
     /// `reserve_capacity` are *not* additive. Given the following:
     ///
     /// ```rust
-    /// # use h2::*;
+    /// # use http2::*;
     /// # fn doc(mut send_stream: SendStream<&'static [u8]>) {
     /// send_stream.reserve_capacity(100);
     /// send_stream.reserve_capacity(200);
@@ -249,7 +249,7 @@ impl<B: Buf> SendStream<B> {
     /// Given the following:
     ///
     /// ```rust
-    /// # use h2::*;
+    /// # use http2::*;
     /// # fn doc(mut send_stream: SendStream<&'static [u8]>) {
     /// send_stream.reserve_capacity(100);
     /// send_stream.reserve_capacity(0);
@@ -267,7 +267,7 @@ impl<B: Buf> SendStream<B> {
     /// is sent. For example:
     ///
     /// ```rust
-    /// # use h2::*;
+    /// # use http2::*;
     /// # async fn doc(mut send_stream: SendStream<&'static [u8]>) {
     /// send_stream.reserve_capacity(100);
     ///

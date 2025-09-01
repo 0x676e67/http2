@@ -9,6 +9,7 @@ mod store;
 mod stream;
 #[allow(clippy::module_inception)]
 mod streams;
+mod sync;
 
 pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
@@ -25,7 +26,7 @@ use self::state::State;
 use self::store::Store;
 use self::stream::Stream;
 
-use crate::frame::{StreamId, StreamIdOverflow};
+use crate::frame::{Priorities, PseudoOrder, StreamDependency, StreamId, StreamIdOverflow};
 use crate::proto::*;
 
 use bytes::Bytes;
@@ -72,6 +73,15 @@ pub struct Config {
     ///
     /// When this gets exceeded, we issue GOAWAYs.
     pub local_max_error_reset_streams: Option<usize>,
+
+    /// Priority of the headers stream
+    pub headers_stream_dependency: Option<StreamDependency>,
+
+    /// Pseudo order of the headers stream
+    pub headers_pseudo_order: Option<PseudoOrder>,
+
+    /// Priorities stream
+    pub priorities: Option<Priorities>,
 }
 
 trait DebugStructExt<'a, 'b> {

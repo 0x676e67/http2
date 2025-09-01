@@ -1,33 +1,36 @@
 [package]
-name = "h2"
+name = "http2"
 # When releasing to crates.io:
 # - Update CHANGELOG.md.
 # - Create git tag
-version = "0.4.12"
+version = "0.5.8"
 license = "MIT"
-authors = [
-  "Carl Lerche <me@carllerche.com>",
-  "Sean McArthur <sean@seanmonstar.com>",
-]
+authors = ["0x676e67 <gngppz@gmail.com>"]
 description = "An HTTP/2 client and server"
-documentation = "https://docs.rs/h2"
-repository = "https://github.com/hyperium/h2"
+documentation = "https://docs.rs/http2"
+repository = "https://github.com/0x676e67/http2"
 readme = "README.md"
-keywords = ["http", "async", "non-blocking"]
+keywords = ["http", "http2", "async", "non-blocking"]
 categories = ["asynchronous", "web-programming", "network-programming"]
 exclude = ["fixtures/**", "ci/**"]
 edition = "2021"
-rust-version = "1.63"
+rust-version = "1.66"
 
 [features]
 # Enables `futures::Stream` implementations for various types.
 stream = []
+
+# Enables tracing.
+tracing = ["dep:tracing"]
 
 # Enables **unstable** APIs. Any API exposed by this feature has no backwards
 # compatibility guarantees. In other words, you should not use this feature for
 # anything besides experimentation. Definitely **do not** publish a crate that
 # depends on this feature.
 unstable = []
+
+# Enables `parking_lot` for synchronization primitives.
+parking_lot = ["dep:parking_lot"]
 
 [workspace]
 members = [
@@ -46,12 +49,18 @@ tokio-util = { version = "0.7.1", features = ["codec", "io"] }
 tokio = { version = "1", features = ["io-util"] }
 bytes = "1"
 http = "1"
-tracing = { version = "0.1.35", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = [
+    "std",
+], optional = true }
 fnv = "1.0.5"
 slab = "0.4.2"
 indexmap = { version = "2", features = ["std"] }
+smallvec = "1.15.0"
+parking_lot = { version = "0.12.4", optional = true }
 
 [dev-dependencies]
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+h2 = { version = "0.4" }
 
 # Fuzzing
 quickcheck = { version = "1.0.3", default-features = false }
@@ -64,8 +73,14 @@ serde = "1.0.0"
 serde_json = "1.0.0"
 
 # Examples
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "net",
+] }
 env_logger = { version = "0.10", default-features = false }
+
 tokio-rustls = "0.26"
 webpki-roots = "1"
 
