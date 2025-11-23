@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -40,7 +40,7 @@ jobs:
           - stable
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust (${{ matrix.rust }})
         uses: dtolnay/rust-toolchain@master
@@ -68,7 +68,7 @@ jobs:
   #clippy_check:
   #  runs-on: ubuntu-latest
   #  steps:
-  #    - uses: actions/checkout@v4
+  #    - uses: actions/checkout@v6
   #    - name: Run Clippy
   #      run: cargo clippy --all-targets --all-features
 
@@ -80,7 +80,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Get MSRV from package metadata
         id: msrv
@@ -109,7 +109,7 @@ jobs:
     environment: Linux
     needs: [style, msrv, test]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
 
       - name: Get tag
         if: startsWith(github.ref, 'refs/tags/')
