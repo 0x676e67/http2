@@ -33,7 +33,7 @@ jobs:
           git push -f origin sync-upstream
 
       - name: Create PR from sync-upstream to master
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.CR_PAT }}
           script: |
