@@ -35,6 +35,8 @@ mod tests {
     }
 }
 
+#[macro_use]
+mod macros;
 mod data;
 mod go_away;
 mod head;
@@ -51,14 +53,20 @@ mod window_update;
 pub use self::data::Data;
 pub use self::go_away::GoAway;
 pub use self::head::{Head, Kind};
+#[allow(unused_imports)]
 pub use self::headers::{
-    parse_u64, Continuation, Headers, Pseudo, PushPromise, PushPromiseHeaderError,
+    parse_u64, Continuation, Headers, Pseudo, PseudoId, PseudoOrder, PseudoOrderBuilder,
+    PushPromise, PushPromiseHeaderError,
 };
 pub use self::ping::Ping;
-pub use self::priority::{Priority, StreamDependency};
+#[allow(unused_imports)]
+pub use self::priority::{Priorities, PrioritiesBuilder, Priority, StreamDependency};
 pub use self::reason::Reason;
 pub use self::reset::Reset;
-pub use self::settings::Settings;
+#[cfg(feature = "unstable")]
+pub use self::settings::{ExperimentalSettings, ExperimentalSettingsBuilder};
+#[allow(unused_imports)]
+pub use self::settings::{Setting, SettingId, Settings, SettingsOrder, SettingsOrderBuilder};
 pub use self::stream_id::{StreamId, StreamIdOverflow};
 pub use self::window_update::WindowUpdate;
 

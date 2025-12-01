@@ -1,7 +1,7 @@
 use crate::codec::UserError;
 use crate::codec::UserError::*;
 use crate::frame::{self, Frame, FrameSize};
-use crate::hpack;
+use crate::{hpack, tracing};
 
 use bytes::{Buf, BufMut, BytesMut};
 use std::pin::Pin;
@@ -130,12 +130,11 @@ where
 
     /// Flush buffered data to the wire
     pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        let span = tracing::trace_span!("FramedWrite::flush");
-        let _e = span.enter();
+        let _span = tracing::trace_span!("FramedWrite::flush");
 
         loop {
             while !self.encoder.is_empty() {
-                match self.encoder.next {
+                let n = match self.encoder.next {
                     Some(Next::Data(ref mut frame)) => {
                         tracing::trace!(queued_data_frame = true);
                         let mut buf = (&mut self.encoder.buf).chain(frame.payload_mut());
@@ -150,6 +149,12 @@ where
                         ))?
                     }
                 };
+                if n == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write frame to socket",
+                    )));
+                }
             }
 
             match self.encoder.unset_frame() {
@@ -212,8 +217,7 @@ where
     fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
         // Ensure that we have enough capacity to accept the write.
         assert!(self.has_capacity());
-        let span = tracing::trace_span!("FramedWrite::buffer", frame = ?item);
-        let _e = span.enter();
+        let _span = tracing::trace_span!("FramedWrite::buffer", frame = ?item);
 
         tracing::debug!(frame = ?item, "send");
 
@@ -279,12 +283,9 @@ where
                 tracing::trace!(rem = self.buf.remaining(), "encoded window_update");
             }
 
-            Frame::Priority(_) => {
-                /*
+            Frame::Priority(v) => {
                 v.encode(self.buf.get_mut());
                 tracing::trace!("encoded priority; rem={:?}", self.buf.remaining());
-                */
-                unimplemented!();
             }
             Frame::Reset(v) => {
                 v.encode(self.buf.get_mut());

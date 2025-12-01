@@ -1,5 +1,6 @@
 //! Utilities to support tests.
 
+use http2 as h2;
 #[macro_use]
 pub mod assert;
 
