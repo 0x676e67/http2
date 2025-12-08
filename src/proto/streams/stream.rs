@@ -1,4 +1,4 @@
-use crate::Reason;
+use crate::{tracing, Reason};
 
 use super::*;
 
@@ -18,7 +18,7 @@ use std::time::Instant;
 /// (such as an accept queue), this is **not** tracked by a reference count.
 /// Thus, `ref_count` can be zero and the stream still has to be kept around.
 pub(super) struct Stream {
-    /// The h2 stream identifier
+    /// The http2 stream identifier
     pub id: StreamId,
 
     /// Current state of the stream

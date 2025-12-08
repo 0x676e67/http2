@@ -2,6 +2,7 @@ use futures::future;
 use futures::stream::FuturesUnordered;
 use futures::Stream;
 use http::{Method, Request};
+use http2 as h2;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;

@@ -7,6 +7,8 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ops;
 
+use crate::tracing;
+
 /// Storage for streams
 #[derive(Debug)]
 pub(super) struct Store {
@@ -217,7 +219,7 @@ impl Store {
     }
 }
 
-// While running h2 unit/integration tests, enable this debug assertion.
+// While running http2 unit/integration tests, enable this debug assertion.
 //
 // In practice, we don't need to ensure this. But the integration tests
 // help to make sure we've cleaned up in cases where we could (like, the

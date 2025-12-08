@@ -43,25 +43,17 @@
 
 * Limit number of CONTINUATION frames for misbehaving connections.
 
-# 0.4.3 (March 15, 2024)
+# 0.3.25 (March 15, 2024)
 
-* Fix flow control limits to not apply until receiving SETTINGS ack.
-* Fix not returning an error if IO ended without `close_notify`.
-* Improve performance of decoding many headers.
+* Improve performance decoding many headers.
 
-# 0.4.2 (January 17th, 2024)
+# 0.3.24 (January 17, 2024)
 
 * Limit error resets for misbehaving connections.
-* Fix selecting MAX_CONCURRENT_STREAMS value if no value is advertised initially.
 
-# 0.4.1 (January 8, 2024)
+# 0.3.23 (January 10, 2024)
 
-* Fix assigning connection capacity which could starve streams in some instances.
-
-# 0.4.0 (November 15, 2023)
-
-* Update to `http` 1.0.
-* Remove deprecated `Server::poll_close()`.
+* Backport fix from 0.4.1 for stream capacity assignment.
 
 # 0.3.22 (November 15, 2023)
 
