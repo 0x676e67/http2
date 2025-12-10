@@ -52,6 +52,9 @@ struct Encoder<B> {
 
     /// Min buffer required to attempt to write a frame
     min_buffer_capacity: usize,
+
+    /// Flag to force flush on next opportunity
+    force_flush: bool,
 }
 
 #[derive(Debug)]
@@ -99,6 +102,7 @@ where
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
                 chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
+                force_flush: false,
             },
         }
     }
@@ -115,6 +119,12 @@ where
             if !self.encoder.has_capacity() {
                 return Poll::Pending;
             }
+        }
+
+        if self.encoder.force_flush && self.encoder.is_empty() {
+            // Try flushing
+            ready!(self.flush(cx))?;
+            self.encoder.force_flush = false;
         }
 
         Poll::Ready(Ok(()))
@@ -255,6 +265,7 @@ where
                 }
             }
             Frame::Headers(v) => {
+                self.force_flush = true;
                 let mut buf = limited_write_buf!(self);
                 if let Some(continuation) = v.encode(&mut self.hpack, &mut buf) {
                     self.next = Some(Next::Continuation(continuation));
@@ -267,6 +278,7 @@ where
                 }
             }
             Frame::Settings(v) => {
+                self.force_flush = true;
                 v.encode(self.buf.get_mut());
                 tracing::trace!(rem = self.buf.remaining(), "encoded settings");
             }
@@ -279,11 +291,13 @@ where
                 tracing::trace!(rem = self.buf.remaining(), "encoded ping");
             }
             Frame::WindowUpdate(v) => {
+                self.force_flush = true;
                 v.encode(self.buf.get_mut());
                 tracing::trace!(rem = self.buf.remaining(), "encoded window_update");
             }
 
             Frame::Priority(v) => {
+                self.force_flush = true;
                 v.encode(self.buf.get_mut());
                 tracing::trace!("encoded priority; rem={:?}", self.buf.remaining());
             }
