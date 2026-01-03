@@ -1138,10 +1138,10 @@ impl<B: Buf> SendResponse<B> {
     ///
     /// # Examples
     /// ```rust
-    /// use h2::server;
+    /// use http2::server;
     /// use http::{Response, StatusCode};
     ///
-    /// # async fn example(mut send_response: h2::server::SendResponse<bytes::Bytes>) -> Result<(), h2::Error> {
+    /// # async fn example(mut send_response: http2::server::SendResponse<bytes::Bytes>) -> Result<(), http2::Error> {
     /// // Send 100 Continue before processing request body
     /// let continue_response = Response::builder()
     ///     .status(StatusCode::CONTINUE)
