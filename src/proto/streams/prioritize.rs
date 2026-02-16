@@ -339,17 +339,13 @@ impl Prioritize {
     /// Reclaim just reserved capacity, not buffered capacity, and re-assign
     /// it to the connection
     pub fn reclaim_reserved_capacity(&mut self, stream: &mut store::Ptr, counts: &mut Counts) {
-        // only reclaim reserved capacity that isn't already buffered
-        if stream.send_flow.available().as_size() as usize > stream.buffered_send_data {
+        // only reclaim requested capacity that isn't already buffered
+        if stream.requested_send_capacity as usize > stream.buffered_send_data {
             let reserved =
-                stream.send_flow.available().as_size() - stream.buffered_send_data as WindowSize;
+                stream.requested_send_capacity - stream.buffered_send_data as WindowSize;
 
-            // Panic safety: due to how `reserved` is computed it can't be greater
-            // than what's available.
-            stream
-                .send_flow
-                .claim_capacity(reserved)
-                .expect("window size should be greater than reserved");
+            let _res = stream.send_flow.claim_capacity(reserved);
+            debug_assert!(_res.is_ok());
 
             self.assign_connection_capacity(reserved, stream, counts);
         }

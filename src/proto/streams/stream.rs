@@ -383,11 +383,8 @@ impl Stream {
     }
 
     /// Set the stream's state to `Closed` with the given reason and initiator.
-    /// Notify the send and receive tasks, if they exist.
     pub(super) fn set_reset(&mut self, reason: Reason, initiator: Initiator) {
         self.state.set_reset(self.id, reason, initiator);
-        self.notify_push();
-        self.notify_recv();
     }
 }
 
