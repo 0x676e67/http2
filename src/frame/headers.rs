@@ -76,7 +76,7 @@ pub struct Pseudo {
     pub status: Option<StatusCode>,
 
     // Pseudo order
-    pub order: PseudoOrder,
+    order: PseudoOrder,
 }
 
 define_enum_with_values! {
@@ -103,19 +103,14 @@ define_enum_with_values! {
 /// according to the HTTP/2 specification, and this type ensures that the correct order is preserved
 /// and that no duplicates are present.
 ///
-/// Typically, a `PseudoOrder` is constructed using the [`PseudoOrderBuilder`] to enforce uniqueness
+/// Typically, a `PseudoOrder` is costructed using the [`PseudoOrderBuilder`] to enforce uniqueness
 /// and protocol-compliant ordering.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PseudoOrder {
     ids: SmallVec<[PseudoId; PseudoId::DEFAULT_STACK_SIZE]>,
 }
 
-/// A builder for constructing a `PseudoOrder`.
-///
-/// This builder allows you to incrementally specify the order of pseudo-header fields for an HTTP/2
-/// header block. It ensures that each pseudo-header is only included once, and provides methods to
-/// push individual pseudo-headers or extend from an iterator. When finished, call `.build()` to
-/// obtain a `PseudoOrder` instance.
+/// A builder for constructing a [`PseudoOrder`].
 #[derive(Debug)]
 pub struct PseudoOrderBuilder {
     ids: SmallVec<[PseudoId; PseudoId::DEFAULT_STACK_SIZE]>,
@@ -125,6 +120,7 @@ pub struct PseudoOrderBuilder {
 // ===== impl PseudoOrder =====
 
 impl PseudoOrder {
+    #[inline]
     pub fn builder() -> PseudoOrderBuilder {
         PseudoOrderBuilder {
             ids: SmallVec::new(),
@@ -134,6 +130,7 @@ impl PseudoOrder {
 }
 
 impl Default for PseudoOrder {
+    #[inline]
     fn default() -> Self {
         PseudoOrder {
             ids: SmallVec::from(PseudoId::DEFAULT_IDS),
@@ -145,6 +142,7 @@ impl<'a> IntoIterator for &'a PseudoOrder {
     type Item = &'a PseudoId;
     type IntoIter = std::slice::Iter<'a, PseudoId>;
 
+    #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.ids.iter()
     }

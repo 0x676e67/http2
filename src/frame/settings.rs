@@ -62,11 +62,6 @@ pub struct SettingsOrder {
 }
 
 /// A builder for constructing a `SettingsOrder`.
-///
-/// This builder allows you to incrementally specify the order of settings for a SETTINGS frame.
-/// It ensures that each setting is only included once, and provides methods to push individual
-/// settings or extend from an iterator. When finished, call `.build()` to obtain a `SettingsOrder`
-/// instance.
 #[derive(Debug)]
 pub struct SettingsOrderBuilder {
     ids: SmallVec<[SettingId; SettingId::DEFAULT_STACK_SIZE]>,
@@ -76,7 +71,8 @@ pub struct SettingsOrderBuilder {
 // ===== impl SettingsOrder =====
 
 impl SettingsOrder {
-    /// Creates a new `SettingsOrderBuilder`.
+    /// Creates a new [`SettingsOrderBuilder`].
+    #[inline]
     pub fn builder() -> SettingsOrderBuilder {
         SettingsOrderBuilder {
             ids: SmallVec::new(),
@@ -86,6 +82,7 @@ impl SettingsOrder {
 }
 
 impl Default for SettingsOrder {
+    #[inline]
     fn default() -> Self {
         SettingsOrder {
             ids: SmallVec::from(SettingId::DEFAULT_IDS),
@@ -97,6 +94,7 @@ impl<'a> IntoIterator for &'a SettingsOrder {
     type Item = &'a SettingId;
     type IntoIter = std::slice::Iter<'a, SettingId>;
 
+    #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.ids.iter()
     }
@@ -240,10 +238,10 @@ pub struct Settings {
     settings_order: SettingsOrder,
 }
 
-/// An enum that lists all valid settings that can be sent in a SETTINGS
+/// A struct representing a single HTTP/2 setting that can be sent in a SETTINGS
 /// frame.
 ///
-/// Each setting has a value that is a 32 bit unsigned integer (6.5.1.).
+/// Each setting consists of an identifier and a value, where the value is a 32-bit unsigned integer (see RFC 7540, section 6.5.1).
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Setting {
     id: SettingId,

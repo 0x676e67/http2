@@ -47,14 +47,7 @@ pub struct StreamDependency {
 // ===== impl Priority =====
 
 impl Priority {
-    /// Create a new priority frame.
-    ///
-    /// # Parameters
-    /// - `stream_id`: The ID of the stream. This can be any valid stream ID, including 0.
-    /// - `dependency`: The stream dependency information.
-    ///
-    /// # Returns
-    /// A new `Priority` frame.
+    /// Create a new [`Priority`].
     pub fn new(stream_id: StreamId, dependency: StreamDependency) -> Self {
         Priority {
             stream_id,
@@ -110,7 +103,7 @@ impl<B> From<Priority> for Frame<B> {
 // ===== impl StreamDependency =====
 
 impl StreamDependency {
-    /// Create a new stream dependency
+    /// Create a new [`StreamDependency`]
     pub fn new(dependency_id: StreamId, weight: u8, is_exclusive: bool) -> Self {
         StreamDependency {
             dependency_id,
