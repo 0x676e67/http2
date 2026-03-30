@@ -616,214 +616,277 @@ impl From<DecoderError> for frame::Error {
 }
 
 /// Get an entry from the static table
+#[inline]
 pub fn get_static(idx: usize) -> Header {
-    use http::header::HeaderValue;
+    use http::HeaderValue;
 
-    match idx {
-        1 => Header::Authority(BytesStr::from_static("")),
-        2 => Header::Method(Method::GET),
-        3 => Header::Method(Method::POST),
-        4 => Header::Path(BytesStr::from_static("/")),
-        5 => Header::Path(BytesStr::from_static("/index.html")),
-        6 => Header::Scheme(BytesStr::from_static("http")),
-        7 => Header::Scheme(BytesStr::from_static("https")),
-        8 => Header::Status(StatusCode::OK),
-        9 => Header::Status(StatusCode::NO_CONTENT),
-        10 => Header::Status(StatusCode::PARTIAL_CONTENT),
-        11 => Header::Status(StatusCode::NOT_MODIFIED),
-        12 => Header::Status(StatusCode::BAD_REQUEST),
-        13 => Header::Status(StatusCode::NOT_FOUND),
-        14 => Header::Status(StatusCode::INTERNAL_SERVER_ERROR),
-        15 => Header::Field {
+    static TABLE: [Header; 61] = [
+        // Index 1
+        Header::Authority(BytesStr::from_static("")),
+        // Index 2
+        Header::Method(Method::GET),
+        // Index 3
+        Header::Method(Method::POST),
+        // Index 4
+        Header::Path(BytesStr::from_static("/")),
+        // Index 5
+        Header::Path(BytesStr::from_static("/index.html")),
+        // Index 6
+        Header::Scheme(BytesStr::from_static("http")),
+        // Index 7
+        Header::Scheme(BytesStr::from_static("https")),
+        // Index 8
+        Header::Status(StatusCode::OK),
+        // Index 9
+        Header::Status(StatusCode::NO_CONTENT),
+        // Index 10
+        Header::Status(StatusCode::PARTIAL_CONTENT),
+        // Index 11
+        Header::Status(StatusCode::NOT_MODIFIED),
+        // Index 12
+        Header::Status(StatusCode::BAD_REQUEST),
+        // Index 13
+        Header::Status(StatusCode::NOT_FOUND),
+        // Index 14
+        Header::Status(StatusCode::INTERNAL_SERVER_ERROR),
+        // Index 15
+        Header::Field {
             name: header::ACCEPT_CHARSET,
             value: HeaderValue::from_static(""),
         },
-        16 => Header::Field {
+        // Index 16
+        Header::Field {
             name: header::ACCEPT_ENCODING,
             value: HeaderValue::from_static("gzip, deflate"),
         },
-        17 => Header::Field {
+        // Index 17
+        Header::Field {
             name: header::ACCEPT_LANGUAGE,
             value: HeaderValue::from_static(""),
         },
-        18 => Header::Field {
+        // Index 18
+        Header::Field {
             name: header::ACCEPT_RANGES,
             value: HeaderValue::from_static(""),
         },
-        19 => Header::Field {
+        // Index 19
+        Header::Field {
             name: header::ACCEPT,
             value: HeaderValue::from_static(""),
         },
-        20 => Header::Field {
+        // Index 20
+        Header::Field {
             name: header::ACCESS_CONTROL_ALLOW_ORIGIN,
             value: HeaderValue::from_static(""),
         },
-        21 => Header::Field {
+        // Index 21
+        Header::Field {
             name: header::AGE,
             value: HeaderValue::from_static(""),
         },
-        22 => Header::Field {
+        // Index 22
+        Header::Field {
             name: header::ALLOW,
             value: HeaderValue::from_static(""),
         },
-        23 => Header::Field {
+        // Index 23
+        Header::Field {
             name: header::AUTHORIZATION,
             value: HeaderValue::from_static(""),
         },
-        24 => Header::Field {
+        // Index 24
+        Header::Field {
             name: header::CACHE_CONTROL,
             value: HeaderValue::from_static(""),
         },
-        25 => Header::Field {
+        // Index 25
+        Header::Field {
             name: header::CONTENT_DISPOSITION,
             value: HeaderValue::from_static(""),
         },
-        26 => Header::Field {
+        // Index 26
+        Header::Field {
             name: header::CONTENT_ENCODING,
             value: HeaderValue::from_static(""),
         },
-        27 => Header::Field {
+        // Index 27
+        Header::Field {
             name: header::CONTENT_LANGUAGE,
             value: HeaderValue::from_static(""),
         },
-        28 => Header::Field {
+        // Index 28
+        Header::Field {
             name: header::CONTENT_LENGTH,
             value: HeaderValue::from_static(""),
         },
-        29 => Header::Field {
+        // Index 29
+        Header::Field {
             name: header::CONTENT_LOCATION,
             value: HeaderValue::from_static(""),
         },
-        30 => Header::Field {
+        // Index 30
+        Header::Field {
             name: header::CONTENT_RANGE,
             value: HeaderValue::from_static(""),
         },
-        31 => Header::Field {
+        // Index 31
+        Header::Field {
             name: header::CONTENT_TYPE,
             value: HeaderValue::from_static(""),
         },
-        32 => Header::Field {
+        // Index 32
+        Header::Field {
             name: header::COOKIE,
             value: HeaderValue::from_static(""),
         },
-        33 => Header::Field {
+        // Index 33
+        Header::Field {
             name: header::DATE,
             value: HeaderValue::from_static(""),
         },
-        34 => Header::Field {
+        // Index 34
+        Header::Field {
             name: header::ETAG,
             value: HeaderValue::from_static(""),
         },
-        35 => Header::Field {
+        // Index 35
+        Header::Field {
             name: header::EXPECT,
             value: HeaderValue::from_static(""),
         },
-        36 => Header::Field {
+        // Index 36
+        Header::Field {
             name: header::EXPIRES,
             value: HeaderValue::from_static(""),
         },
-        37 => Header::Field {
+        // Index 37
+        Header::Field {
             name: header::FROM,
             value: HeaderValue::from_static(""),
         },
-        38 => Header::Field {
+        // Index 38
+        Header::Field {
             name: header::HOST,
             value: HeaderValue::from_static(""),
         },
-        39 => Header::Field {
+        // Index 39
+        Header::Field {
             name: header::IF_MATCH,
             value: HeaderValue::from_static(""),
         },
-        40 => Header::Field {
+        // Index 40
+        Header::Field {
             name: header::IF_MODIFIED_SINCE,
             value: HeaderValue::from_static(""),
         },
-        41 => Header::Field {
+        // Index 41
+        Header::Field {
             name: header::IF_NONE_MATCH,
             value: HeaderValue::from_static(""),
         },
-        42 => Header::Field {
+        // Index 42
+        Header::Field {
             name: header::IF_RANGE,
             value: HeaderValue::from_static(""),
         },
-        43 => Header::Field {
+        // Index 43
+        Header::Field {
             name: header::IF_UNMODIFIED_SINCE,
             value: HeaderValue::from_static(""),
         },
-        44 => Header::Field {
+        // Index 44
+        Header::Field {
             name: header::LAST_MODIFIED,
             value: HeaderValue::from_static(""),
         },
-        45 => Header::Field {
+        // Index 45
+        Header::Field {
             name: header::LINK,
             value: HeaderValue::from_static(""),
         },
-        46 => Header::Field {
+        // Index 46
+        Header::Field {
             name: header::LOCATION,
             value: HeaderValue::from_static(""),
         },
-        47 => Header::Field {
+        // Index 47
+        Header::Field {
             name: header::MAX_FORWARDS,
             value: HeaderValue::from_static(""),
         },
-        48 => Header::Field {
+        // Index 48
+        Header::Field {
             name: header::PROXY_AUTHENTICATE,
             value: HeaderValue::from_static(""),
         },
-        49 => Header::Field {
+        // Index 49
+        Header::Field {
             name: header::PROXY_AUTHORIZATION,
             value: HeaderValue::from_static(""),
         },
-        50 => Header::Field {
+        // Index 50
+        Header::Field {
             name: header::RANGE,
             value: HeaderValue::from_static(""),
         },
-        51 => Header::Field {
+        // Index 51
+        Header::Field {
             name: header::REFERER,
             value: HeaderValue::from_static(""),
         },
-        52 => Header::Field {
+        // Index 52
+        Header::Field {
             name: header::REFRESH,
             value: HeaderValue::from_static(""),
         },
-        53 => Header::Field {
+        // Index 53
+        Header::Field {
             name: header::RETRY_AFTER,
             value: HeaderValue::from_static(""),
         },
-        54 => Header::Field {
+        // Index 54
+        Header::Field {
             name: header::SERVER,
             value: HeaderValue::from_static(""),
         },
-        55 => Header::Field {
+        // Index 55
+        Header::Field {
             name: header::SET_COOKIE,
             value: HeaderValue::from_static(""),
         },
-        56 => Header::Field {
+        // Index 56
+        Header::Field {
             name: header::STRICT_TRANSPORT_SECURITY,
             value: HeaderValue::from_static(""),
         },
-        57 => Header::Field {
+        // Index 57
+        Header::Field {
             name: header::TRANSFER_ENCODING,
             value: HeaderValue::from_static(""),
         },
-        58 => Header::Field {
+        // Index 58
+        Header::Field {
             name: header::USER_AGENT,
             value: HeaderValue::from_static(""),
         },
-        59 => Header::Field {
+        // Index 59
+        Header::Field {
             name: header::VARY,
             value: HeaderValue::from_static(""),
         },
-        60 => Header::Field {
+        // Index 60
+        Header::Field {
             name: header::VIA,
             value: HeaderValue::from_static(""),
         },
-        61 => Header::Field {
+        // Index 61
+        Header::Field {
             name: header::WWW_AUTHENTICATE,
             value: HeaderValue::from_static(""),
         },
-        _ => unreachable!(),
-    }
+    ];
+
+    TABLE[idx - 1].clone()
 }
 
 #[cfg(test)]
