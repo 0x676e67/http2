@@ -71,16 +71,8 @@ impl Priority {
         })
     }
 
-    pub fn head(&self) -> Head {
-        Head::new(Kind::Priority, 0, self.stream_id)
-    }
-
-    pub fn stream_id(&self) -> StreamId {
-        self.stream_id
-    }
-
     pub fn encode<B: BufMut>(&self, dst: &mut B) {
-        let head = self.head();
+        let head = Head::new(Kind::Priority, 0, self.stream_id);
         head.encode(5, dst);
 
         // Priority frame payload is exactly 5 bytes
@@ -129,21 +121,14 @@ impl StreamDependency {
         Ok(StreamDependency::new(dependency_id, weight, is_exclusive))
     }
 
+    #[inline]
     pub fn dependency_id(&self) -> StreamId {
         self.dependency_id
     }
 
-    pub fn weight(&self) -> u8 {
-        self.weight
-    }
-
-    pub fn is_exclusive(&self) -> bool {
-        self.is_exclusive
-    }
-
     pub fn encode<T: BufMut>(&self, dst: &mut T) {
         const STREAM_ID_MASK: u32 = 1 << 31;
-        let mut dependency_id = self.dependency_id().into();
+        let mut dependency_id = self.dependency_id.into();
         if self.is_exclusive {
             dependency_id |= STREAM_ID_MASK;
         }
@@ -192,6 +177,7 @@ impl Priorities {
         }
     }
 
+    #[inline]
     pub(crate) fn max_stream_id(&self) -> StreamId {
         self.max_stream_id
     }
@@ -201,6 +187,7 @@ impl IntoIterator for Priorities {
     type Item = Priority;
     type IntoIter = std::vec::IntoIter<Priority>;
 
+    #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.priorities.into_vec().into_iter()
     }
@@ -278,18 +265,22 @@ mod tests {
         let dependency = StreamDependency::new(StreamId::zero(), 201, false);
         dependency.encode(&mut dependency_buf);
         let dependency = StreamDependency::load(&dependency_buf).unwrap();
-        assert_eq!(dependency.dependency_id(), StreamId::zero());
-        assert_eq!(dependency.weight(), 201);
-        assert!(!dependency.is_exclusive());
+        assert_eq!(dependency.dependency_id, StreamId::zero());
+        assert_eq!(dependency.weight, 201);
+        assert!(!dependency.is_exclusive);
 
         let priority = Priority::new(StreamId::from(3), dependency);
         let mut priority_buf = Vec::new();
         priority.encode(&mut priority_buf);
-        let priority = Priority::load(priority.head(), &priority_buf[frame::HEADER_LEN..]).unwrap();
-        assert_eq!(priority.stream_id(), StreamId::from(3));
-        assert_eq!(priority.dependency.dependency_id(), StreamId::zero());
-        assert_eq!(priority.dependency.weight(), 201);
-        assert!(!priority.dependency.is_exclusive());
+        let priority = Priority::load(
+            frame::Head::new(frame::Kind::Priority, 0, priority.stream_id),
+            &priority_buf[frame::HEADER_LEN..],
+        )
+        .unwrap();
+        assert_eq!(priority.stream_id, StreamId::from(3));
+        assert_eq!(priority.dependency.dependency_id, StreamId::zero());
+        assert_eq!(priority.dependency.weight, 201);
+        assert!(!priority.dependency.is_exclusive);
     }
 
     #[test]
@@ -307,7 +298,7 @@ mod tests {
             .build();
 
         assert_eq!(priorities.priorities.len(), 1);
-        assert_eq!(priorities.priorities[0].stream_id(), StreamId::from(3));
+        assert_eq!(priorities.priorities[0].stream_id, StreamId::from(3));
     }
 
     #[test]
@@ -322,7 +313,7 @@ mod tests {
 
         let priorities = Priorities::builder().extend([priority1, priority2]).build();
         assert_eq!(priorities.priorities.len(), 1);
-        assert_eq!(priorities.priorities[0].stream_id(), StreamId::from(4));
+        assert_eq!(priorities.priorities[0].stream_id, StreamId::from(4));
 
         // stream id > 31
         let dependency3 = StreamDependency::new(StreamId::from(32), 150, false);
@@ -333,6 +324,6 @@ mod tests {
 
         let priorities = Priorities::builder().extend([priority3, priority4]).build();
         assert_eq!(priorities.priorities.len(), 1);
-        assert_eq!(priorities.priorities[0].stream_id(), StreamId::from(32));
+        assert_eq!(priorities.priorities[0].stream_id, StreamId::from(32));
     }
 }
