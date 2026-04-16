@@ -378,6 +378,13 @@ impl Recv {
         // If it's not, we put it back
         if let Some(event) = stream.pending_recv.pop_front(&mut self.buffer) {
             match event {
+                Event::Headers(Client(response)) => {
+                    // Final response
+                    stream
+                        .pending_recv
+                        .push_front(&mut self.buffer, Event::Headers(Client(response)));
+                    return Poll::Ready(None);
+                }
                 Event::InformationalHeaders(Client(response)) => {
                     // Found an informational response, return it
                     return Poll::Ready(Some(Ok(response)));
