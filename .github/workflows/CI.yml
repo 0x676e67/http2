@@ -60,7 +60,7 @@ jobs:
 
       - name: Check with parking_lot flag
         run: cargo check --features parking_lot
-      
+
       - name: Run lib tests and doc tests
         run: cargo test
 
@@ -70,7 +70,7 @@ jobs:
       - name: Run h2spec
         run: ./ci/h2spec.sh
         if: matrix.rust == 'stable'
-  
+
   #clippy_check:
   #  runs-on: ubuntu-latest
   #  steps:
@@ -109,7 +109,6 @@ jobs:
           cargo update --package tracing-subscriber --precise 0.3.19
           cargo update --package tracing-core --precise 0.1.33
           cargo update --package itoa --precise 1.0.15
-
 
       - run: cargo check -p http2
 

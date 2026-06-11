@@ -1431,10 +1431,10 @@ where
                 reset_stream_max: builder.reset_stream_max,
                 remote_reset_stream_max: builder.pending_accept_reset_stream_max,
                 local_error_reset_streams_max: builder.local_max_error_reset_streams,
-                settings: builder.settings.clone(),
                 headers_pseudo_order: builder.headers_pseudo_order,
                 headers_stream_dependency: builder.headers_stream_dependency,
                 priorities: builder.priorities,
+                settings: builder.settings,
             },
         );
         let send_request = SendRequest {
