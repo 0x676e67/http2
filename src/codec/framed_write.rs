@@ -150,10 +150,9 @@ where
                     }
                 };
                 if n == 0 {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "failed to write frame to socket",
-                    )));
+                    // No progress is possible; retrying would busy-loop.
+                    tracing::trace!("write returned zero, but non-zero bytes remaining");
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                 }
             }
 
