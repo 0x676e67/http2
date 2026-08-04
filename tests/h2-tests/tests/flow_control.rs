@@ -2604,16 +2604,21 @@ async fn capacity_not_assigned_to_unopened_streams() {
     };
 
     let h2 = async move {
-        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let mut builder = client::Builder::new();
+        builder.initial_max_send_streams(1);
+        let (mut client, mut h2) = builder.handshake(io).await.unwrap();
         let request = Request::builder()
             .method(Method::POST)
             .uri("https://www.example.com/")
             .body(())
             .unwrap();
 
+        let mut client2 = client.clone();
         let (response1, mut stream1) = client.send_request(request.clone(), false).unwrap();
         stream1.send_data("hello".into(), false).unwrap();
-        let (_, mut stream2) = client.send_request(request, false).unwrap();
+        let (_, mut stream2) = client2.send_request(request, false).unwrap();
+        drop(client);
+        drop(client2);
         stream2.reserve_capacity(frame::DEFAULT_INITIAL_WINDOW_SIZE as usize);
         stream1.send_data("world".into(), true).unwrap();
         h2.drive(response1).await.unwrap();
@@ -2663,16 +2668,21 @@ async fn new_initial_window_size_capacity_not_assigned_to_unopened_streams() {
     };
 
     let h2 = async move {
-        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let mut builder = client::Builder::new();
+        builder.initial_max_send_streams(1);
+        let (mut client, mut h2) = builder.handshake(io).await.unwrap();
         let request = Request::builder()
             .method(Method::POST)
             .uri("https://www.example.com/")
             .body(())
             .unwrap();
 
+        let mut client2 = client.clone();
         let (response1, mut stream1) = client.send_request(request.clone(), false).unwrap();
         stream1.send_data("hello".into(), false).unwrap();
-        let (_, mut stream2) = client.send_request(request, false).unwrap();
+        let (_, mut stream2) = client2.send_request(request, false).unwrap();
+        drop(client);
+        drop(client2);
         stream2.reserve_capacity(frame::DEFAULT_INITIAL_WINDOW_SIZE as usize);
         h2.drive(response1).await.unwrap();
         stream1.send_data("world".into(), true).unwrap();

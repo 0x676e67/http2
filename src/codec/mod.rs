@@ -56,6 +56,11 @@ where
 
         Codec { inner }
     }
+
+    /// Adds bytes that must appear before the first encoded frame.
+    pub(crate) fn buffer_write_prefix(&mut self, prefix: &[u8]) {
+        self.inner.get_mut().buffer_prefix(prefix);
+    }
 }
 
 impl<T, B> Codec<T, B> {

@@ -7,6 +7,9 @@ use h2_support::util::yield_once;
 use std::task::Poll;
 use tokio::sync::oneshot;
 
+// Preface + initial SETTINGS + SETTINGS ACK + the request HEADERS.
+const INITIAL_CONTROL_AND_HEADERS_CAPACITY: usize = 82;
+
 #[tokio::test]
 async fn send_recv_headers_only() {
     h2_support::trace_init!();
@@ -994,8 +997,9 @@ async fn rst_with_buffered_data() {
     // buffered up frame is correctly handled.
     h2_support::trace_init!();
 
-    // This allows the settings + headers frame through
-    let (io, mut srv) = mock::new_with_write_capacity(73);
+    // Let the initial control frames and request HEADERS through, then apply
+    // backpressure to the request body.
+    let (io, mut srv) = mock::new_with_write_capacity(INITIAL_CONTROL_AND_HEADERS_CAPACITY);
 
     // Synchronize the client / server on response
     let (tx, rx) = oneshot::channel();
@@ -1017,7 +1021,9 @@ async fn rst_with_buffered_data() {
     let body = vec![0u8; 2 * frame::DEFAULT_INITIAL_WINDOW_SIZE as usize];
 
     let client = async move {
-        let (mut client, mut conn) = client::handshake(io).await.expect("handshake");
+        let mut builder = client::Builder::new();
+        builder.initial_max_send_streams(0);
+        let (mut client, mut conn) = builder.handshake::<_, Bytes>(io).await.expect("handshake");
         let request = Request::builder()
             .method(Method::POST)
             .uri("https://example.com/")
@@ -1046,8 +1052,9 @@ async fn err_with_buffered_data() {
     // buffered up frame is correctly handled.
     h2_support::trace_init!();
 
-    // This allows the settings + headers frame through
-    let (io, mut srv) = mock::new_with_write_capacity(73);
+    // Let the initial control frames and request HEADERS through, then apply
+    // backpressure to the request body.
+    let (io, mut srv) = mock::new_with_write_capacity(INITIAL_CONTROL_AND_HEADERS_CAPACITY);
 
     // Synchronize the client / server on response
     let (tx, rx) = oneshot::channel();
@@ -1071,7 +1078,9 @@ async fn err_with_buffered_data() {
     let body = vec![0; 2 * frame::DEFAULT_INITIAL_WINDOW_SIZE as usize];
 
     let client = async move {
-        let (mut client, conn) = client::handshake(io).await.unwrap();
+        let mut builder = client::Builder::new();
+        builder.initial_max_send_streams(0);
+        let (mut client, conn) = builder.handshake::<_, Bytes>(io).await.unwrap();
         let request = Request::builder()
             .method(Method::POST)
             .uri("https://example.com/")
@@ -1101,8 +1110,9 @@ async fn send_err_with_buffered_data() {
     // buffered up frame is correctly handled.
     h2_support::trace_init!();
 
-    // This allows the settings + headers frame through
-    let (io, mut srv) = mock::new_with_write_capacity(73);
+    // Let the initial control frames and request HEADERS through, then apply
+    // backpressure to the request body.
+    let (io, mut srv) = mock::new_with_write_capacity(INITIAL_CONTROL_AND_HEADERS_CAPACITY);
 
     // Synchronize the client / server on response
     let (tx, rx) = oneshot::channel();
@@ -1125,7 +1135,9 @@ async fn send_err_with_buffered_data() {
     let body = vec![0; 2 * frame::DEFAULT_INITIAL_WINDOW_SIZE as usize];
 
     let client = async move {
-        let (mut client, mut conn) = client::handshake(io).await.expect("handshake");
+        let mut builder = client::Builder::new();
+        builder.initial_max_send_streams(0);
+        let (mut client, mut conn) = builder.handshake::<_, Bytes>(io).await.expect("handshake");
         let request = Request::builder()
             .method(Method::POST)
             .uri("https://example.com/")

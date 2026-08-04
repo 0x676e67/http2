@@ -1577,7 +1577,9 @@ async fn invalid_connect_protocol_enabled_setting() {
     };
 
     let h2 = async move {
-        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let mut builder = client::Builder::new();
+        builder.initial_max_send_streams(0);
+        let (mut client, mut h2) = builder.handshake::<_, Bytes>(io).await.unwrap();
 
         // we send a simple req here just to drive the connection so we can
         // receive the server settings.

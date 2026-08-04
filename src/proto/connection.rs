@@ -195,20 +195,24 @@ where
     ///
     /// Returns `Error` as this may raise errors that are caused by delayed
     /// processing of received frames.
-    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<PollReady, Error>> {
         #[cfg(feature = "tracing")]
         let _e = self.inner.span.enter();
         let _span = tracing::trace_span!("poll_ready");
         // The order of these calls don't really matter too much
         ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
         ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;
-        ready!(self
+        match self
             .inner
             .settings
-            .poll_send(cx, &mut self.codec, &mut self.inner.streams))?;
+            .poll_send(cx, &mut self.codec, &mut self.inner.streams)
+        {
+            Poll::Ready(result) => result?,
+            Poll::Pending => return Poll::Ready(Ok(PollReady::SettingsBlocked)),
+        }
         ready!(self.inner.streams.send_pending_refusal(cx, &mut self.codec))?;
 
-        Poll::Ready(Ok(()))
+        Poll::Ready(Ok(PollReady::Complete))
     }
 
     /// Send any pending GOAWAY frames.
@@ -286,14 +290,34 @@ where
             match self.inner.state {
                 // When open, continue to poll a frame
                 State::Open => {
-                    let result = match self.poll2(cx) {
-                        Poll::Ready(result) => result,
-                        // The connection is not ready to make progress
-                        Poll::Pending => {
+                    match self.poll2(cx) {
+                        Poll::Ready(Ok(Poll2::Done)) => {
+                            self.inner.as_dyn().handle_poll2_result(Ok(()))?
+                        }
+                        Poll::Ready(Err(err)) => {
+                            self.inner.as_dyn().handle_poll2_result(Err(err))?
+                        }
+                        Poll::Ready(Ok(Poll2::WriteBlocked)) if !P::r#dyn().is_server() => {
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(Poll2::WriteBlocked)) | Poll::Pending => {
                             // Ensure all window updates have been sent.
                             //
                             // This will also handle flushing `self.codec`
-                            ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
+                            if let Err(err) =
+                                ready!(self.inner.streams.poll_complete(cx, &mut self.codec))
+                            {
+                                let err = Error::from(err);
+
+                                if P::r#dyn().is_server() {
+                                    return Poll::Ready(Err(err));
+                                }
+
+                                // Client write errors must notify queued requests. This is
+                                // especially important when an initial write first reports
+                                // backpressure and fails on the retry in this normal poll.
+                                self.inner.as_dyn().handle_poll2_result(Err(err))?;
+                            }
 
                             if (self.inner.error.is_some()
                                 || self.inner.go_away.should_close_on_idle())
@@ -305,9 +329,7 @@ where
 
                             return Poll::Pending;
                         }
-                    };
-
-                    self.inner.as_dyn().handle_poll2_result(result)?
+                    }
                 }
                 State::Closing(reason, initiator) => {
                     tracing::trace!("connection closing after flush");
@@ -324,7 +346,7 @@ where
         }
     }
 
-    fn poll2(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+    fn poll2(&mut self, cx: &mut Context) -> Poll<Result<Poll2, Error>> {
         // This happens outside of the loop to prevent needing to do a clock
         // check and then comparison of the queue possibly multiple times a
         // second (and thus, the clock wouldn't have changed enough to matter).
@@ -336,12 +358,19 @@ where
             // The order here matters:
             // - poll_go_away may buffer a graceful shutdown GOAWAY frame
             // - If it has, we've also added a PING to be sent in poll_ready
-            if let Some(reason) = ready!(self.poll_go_away(cx)?) {
+            let reason = match self.poll_go_away(cx) {
+                Poll::Ready(Some(Ok(reason))) => Some(reason),
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err.into())),
+                Poll::Ready(None) => None,
+                Poll::Pending => return Poll::Ready(Ok(Poll2::WriteBlocked)),
+            };
+
+            if let Some(reason) = reason {
                 if self.inner.go_away.should_close_now() {
                     if self.inner.go_away.is_user_initiated() {
                         // A user initiated abrupt shutdown shouldn't return
                         // the same error back to the user.
-                        return Poll::Ready(Ok(()));
+                        return Poll::Ready(Ok(Poll2::Done));
                     } else {
                         return Poll::Ready(Err(Error::library_go_away(reason)));
                     }
@@ -353,13 +382,27 @@ where
                     "graceful GOAWAY should be NO_ERROR"
                 );
             }
-            ready!(self.poll_ready(cx))?;
 
-            match self
-                .inner
-                .as_dyn()
-                .recv_frame(ready!(Pin::new(&mut self.codec).poll_next(cx)?))?
-            {
+            let settings_blocked = match self.poll_ready(cx) {
+                Poll::Ready(Ok(PollReady::Complete)) => false,
+                Poll::Ready(Ok(PollReady::SettingsBlocked)) if !P::r#dyn().is_server() => true,
+                Poll::Ready(Ok(PollReady::SettingsBlocked)) | Poll::Pending => {
+                    return Poll::Ready(Ok(Poll2::WriteBlocked));
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            };
+
+            let frame = match Pin::new(&mut self.codec).poll_next(cx) {
+                Poll::Ready(Some(Ok(frame))) => Some(frame),
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
+                Poll::Ready(None) => None,
+                Poll::Pending if settings_blocked => {
+                    return Poll::Ready(Ok(Poll2::WriteBlocked));
+                }
+                Poll::Pending => return Poll::Pending,
+            };
+
+            match self.inner.as_dyn().recv_frame(frame)? {
                 ReceivedFrame::Settings(frame) => {
                     self.inner.settings.recv_settings(
                         frame,
@@ -369,7 +412,7 @@ where
                 }
                 ReceivedFrame::Continue => (),
                 ReceivedFrame::Done => {
-                    return Poll::Ready(Ok(()));
+                    return Poll::Ready(Ok(Poll2::Done));
                 }
             }
         }
@@ -593,6 +636,16 @@ enum ReceivedFrame {
     Done,
 }
 
+enum Poll2 {
+    Done,
+    WriteBlocked,
+}
+
+enum PollReady {
+    Complete,
+    SettingsBlocked,
+}
+
 impl<T, B> Connection<T, client::Peer, B>
 where
     T: AsyncRead + AsyncWrite,
@@ -600,6 +653,25 @@ where
 {
     pub(crate) fn streams(&self) -> &Streams<B, client::Peer> {
         &self.inner.streams
+    }
+
+    /// Flushes the frames that were queued before the first receive attempt.
+    pub(crate) fn poll_initial_write(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>>
+    where
+        T: Unpin,
+    {
+        #[cfg(feature = "tracing")]
+        let _span1 = self.inner.span.clone().entered();
+        #[cfg(feature = "tracing")]
+        let _span2 = tracing::trace_span!("poll_initial_write");
+
+        match ready!(self.inner.streams.poll_complete(cx, &mut self.codec)) {
+            Ok(()) => {
+                tracing::debug!("client initial write flushed");
+                Poll::Ready(Ok(()))
+            }
+            Err(err) => Poll::Ready(self.inner.as_dyn().handle_poll2_result(Err(err.into()))),
+        }
     }
 }
 

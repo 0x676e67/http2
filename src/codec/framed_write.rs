@@ -103,6 +103,10 @@ where
         }
     }
 
+    pub(super) fn buffer_prefix(&mut self, prefix: &[u8]) {
+        self.encoder.buf.get_mut().extend_from_slice(prefix);
+    }
+
     /// Returns `Ready` when `send` is able to accept a frame
     ///
     /// Calling this function may result in the current contents of the buffer

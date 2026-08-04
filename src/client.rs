@@ -10,9 +10,9 @@
 //! This could be as basic as using Tokio's [`TcpStream`] to connect to a remote
 //! host, but usually it means using either ALPN or HTTP/1.1 protocol upgrades.
 //!
-//! Once a connection is obtained, it is passed to [`handshake`], which will
-//! begin the [HTTP/2 handshake]. This returns a future that completes once
-//! the handshake process is performed and HTTP/2 streams may be initialized.
+//! Once a connection is obtained, it is passed to [`handshake`], which prepares
+//! the client-side HTTP/2 state. No transport I/O occurs until the returned
+//! [`Connection`] is polled.
 //!
 //! [`handshake`] uses default configuration values. There are a number of
 //! settings that can be changed by using [`Builder`] instead.
@@ -77,10 +77,6 @@
 //!     // Establish TCP connection to the server.
 //!     let tcp = TcpStream::connect("127.0.0.1:5928").await?;
 //!     let (http2, connection) = client::handshake(tcp).await?;
-//!     tokio::spawn(async move {
-//!         connection.await.unwrap();
-//!     });
-//!
 //!     let mut http2 = http2.ready().await?;
 //!     // Prepare the HTTP request to send to the server.
 //!     let request = Request::builder()
@@ -92,6 +88,11 @@
 //!     // Send the request. The second tuple item allows the caller
 //!     // to stream a request body.
 //!     let (response, _) = http2.send_request(request, true).unwrap();
+//!     // Queue the first request before starting the connection task so it can
+//!     // join the initial output batch.
+//!     tokio::spawn(async move {
+//!         connection.await.unwrap();
+//!     });
 //!
 //!     let (head, mut body) = response.await?.into_parts();
 //!
@@ -155,7 +156,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// Initializes new HTTP/2 streams on a connection by sending a request.
 ///
@@ -216,6 +219,7 @@ pub struct ReadySendRequest<B: Buf> {
 ///
 /// ```
 /// # use tokio::io::{AsyncRead, AsyncWrite};
+/// # use http::Request;
 /// # use http2::client;
 /// # use http2::client::*;
 /// #
@@ -223,6 +227,12 @@ pub struct ReadySendRequest<B: Buf> {
 /// # where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 /// # {
 ///     let (send_request, connection) = client::handshake(my_io).await?;
+///     let mut send_request = send_request.ready().await?;
+///     let request = Request::get("https://example.com/").body(()).unwrap();
+///     let (_response, _send_stream) = send_request.send_request(request, true).unwrap();
+///
+///     // Queue the first request before the connection task can be polled if
+///     // it should join the initial output batch.
 ///     // Submit the connection handle to an executor.
 ///     tokio::spawn(async { connection.await.expect("connection failed"); });
 ///
@@ -236,6 +246,7 @@ pub struct ReadySendRequest<B: Buf> {
 #[must_use = "futures do nothing unless polled"]
 pub struct Connection<T, B: Buf = Bytes> {
     inner: proto::Connection<T, Peer, B>,
+    initial_write_pending: bool,
 }
 
 /// A future of an HTTP response.
@@ -300,8 +311,7 @@ pub struct PushPromises {
 /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
 ///     -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
 /// # {
-/// // `client_fut` is a future representing the completion of the HTTP/2
-/// // handshake.
+/// // `client_fut` prepares the client-side HTTP/2 state.
 /// let client_fut = Builder::new()
 ///     .initial_window_size(1_000_000)
 ///     .max_concurrent_streams(1000)
@@ -656,8 +666,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .initial_window_size(1_000_000)
     ///     .max_concurrent_streams(1000)
@@ -704,8 +713,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .initial_window_size(1_000_000)
     ///     .handshake(my_io);
@@ -739,8 +747,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .initial_connection_window_size(1_000_000)
     ///     .handshake(my_io);
@@ -773,8 +780,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .max_frame_size(1_000_000)
     ///     .handshake(my_io);
@@ -813,8 +819,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .max_header_list_size(16 * 1024)
     ///     .handshake(my_io);
@@ -862,8 +867,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .max_concurrent_streams(1000)
     ///     .handshake(my_io);
@@ -888,6 +892,10 @@ impl Builder {
     /// This setting prevents the caller from exceeding this number of
     /// streams that are counted towards the concurrency limit.
     ///
+    /// Setting this to `0` does not reject an otherwise valid request. The
+    /// request remains pending-open, and its HEADERS are not written until the
+    /// peer's SETTINGS permit another locally initiated stream.
+    ///
     /// Sending streams past the limit returned by the peer will be treated
     /// as a stream error of type PROTOCOL_ERROR or REFUSED_STREAM.
     ///
@@ -908,8 +916,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .initial_max_send_streams(1000)
     ///     .handshake(my_io);
@@ -953,8 +960,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .max_concurrent_reset_streams(1000)
     ///     .handshake(my_io);
@@ -999,8 +1005,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .reset_stream_duration(Duration::from_secs(10))
     ///     .handshake(my_io);
@@ -1059,8 +1064,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .max_pending_accept_reset_streams(100)
     ///     .handshake(my_io);
@@ -1115,8 +1119,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .enable_push(false)
     ///     .handshake(my_io);
@@ -1148,8 +1151,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .header_table_size(1_000_000)
     ///     .handshake(my_io);
@@ -1251,14 +1253,32 @@ impl Builder {
     /// Creates a new configured HTTP/2 client backed by `io`.
     ///
     /// It is expected that `io` already be in an appropriate state to commence
-    /// the [HTTP/2 handshake]. The handshake is completed once both the connection
-    /// preface and the initial settings frame is sent by the client.
+    /// the [HTTP/2 handshake]. This future prepares the client connection
+    /// preface and initial settings frame. They are written once the returned
+    /// [`Connection`] is polled.
     ///
     /// The handshake future does not wait for the initial settings frame from the
     /// server.
     ///
+    /// This future performs no transport I/O. Transport errors while writing
+    /// the client preface or initial SETTINGS are reported when the returned
+    /// [`Connection`] is polled.
+    ///
+    /// If the first request can be opened immediately and is queued through
+    /// [`SendRequest`] before polling [`Connection`], the client preface,
+    /// SETTINGS, an optional connection WINDOW_UPDATE, any configured standalone
+    /// PRIORITY frames, and its HEADERS are encoded before the
+    /// first write when they fit in the initial output batch. A partial write
+    /// resumes from that same buffer. A request held by the initial stream
+    /// concurrency limit remains pending and is not included in this batch.
+    /// Polling the connection first sends the available control frames
+    /// immediately and does not wait for a request.
+    /// Other frames that are already ready may follow the first HEADERS in the
+    /// same initial send cycle; the normal scheduler is not artificially cut
+    /// off after one request.
+    ///
     /// Returns a future which resolves to the [`Connection`] / [`SendRequest`]
-    /// tuple once the HTTP/2 handshake has been completed.
+    /// tuple once the HTTP/2 handshake state has been prepared.
     ///
     /// This function also allows the caller to configure the send payload data
     /// type. See [Outbound data type] for more details.
@@ -1280,8 +1300,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     ///     -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .handshake(my_io);
     /// # client_fut.await
@@ -1300,8 +1319,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<&'static [u8]>, Connection<T, &'static [u8]>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .handshake::<_, &'static [u8]>(my_io);
     /// # client_fut.await
@@ -1334,7 +1352,7 @@ impl Default for Builder {
 /// the [HTTP/2 handshake]. See [Handshake] for more details.
 ///
 /// Returns a future which resolves to the [`Connection`] / [`SendRequest`]
-/// tuple once the HTTP/2 handshake has been completed. The returned
+/// tuple once the HTTP/2 handshake state has been prepared. The returned
 /// [`Connection`] instance will be using default configuration values. Use
 /// [`Builder`] to customize the configuration values used by a [`Connection`]
 /// instance.
@@ -1354,9 +1372,9 @@ impl Default for Builder {
 /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T) -> Result<(), http2::Error>
 /// # {
 /// let (send_request, connection) = client::handshake(my_io).await?;
-/// // The HTTP/2 handshake has completed, now start polling
-/// // `connection` and use `send_request` to send requests to the
-/// // server.
+/// // Queueing a request before polling `connection` lets the initial HTTP/2
+/// // frames and the first request be prepared in the same write buffer when
+/// // they fit.
 /// # Ok(())
 /// # }
 /// #
@@ -1380,33 +1398,23 @@ where
 
 // ===== impl Connection =====
 
-async fn bind_connection<T>(io: &mut T) -> Result<(), crate::Error>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    tracing::debug!("binding client connection");
-
-    let msg: &'static [u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    io.write_all(msg).await.map_err(crate::Error::from_io)?;
-
-    tracing::debug!("client connection bound");
-
-    Ok(())
-}
-
 impl<T, B> Connection<T, B>
 where
     T: AsyncRead + AsyncWrite + Unpin,
     B: Buf,
 {
     async fn handshake2(
-        mut io: T,
+        io: T,
         builder: Builder,
     ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
-        bind_connection(&mut io).await?;
+        tracing::debug!("preparing client connection preface");
 
-        // Create the codec
+        // RFC 9113 section 3.4 requires the client preface to be followed by
+        // SETTINGS. Keeping both in the codec also lets a request queued before
+        // the first connection poll join the same initial write.
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-3.4
         let mut codec = Codec::new(io);
+        codec.buffer_write_prefix(PREFACE);
 
         if let Some(max) = builder.settings.max_frame_size() {
             codec.set_max_recv_frame_size(max as usize);
@@ -1420,6 +1428,8 @@ where
         codec
             .buffer((builder.settings.clone()).into())
             .expect("invalid SETTINGS frame");
+
+        tracing::debug!("client connection preface and initial settings buffered");
 
         let inner = proto::Connection::new(
             codec,
@@ -1442,7 +1452,10 @@ where
             pending: None,
         };
 
-        let mut connection = Connection { inner };
+        let mut connection = Connection {
+            inner,
+            initial_write_pending: true,
+        };
         if let Some(sz) = builder.initial_target_connection_window_size {
             connection.set_target_window_size(sz);
         }
@@ -1536,6 +1549,27 @@ where
     type Output = Result<(), crate::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.initial_write_pending {
+            match self.inner.poll_initial_write(cx) {
+                Poll::Ready(result) => {
+                    result.map_err(crate::Error::from)?;
+                }
+                Poll::Pending => {
+                    // RFC 9113 section 5.2.2 requires endpoints to process
+                    // available inbound frames promptly. The write cursor
+                    // keeps the initial bytes in order, while the normal
+                    // connection poll keeps both I/O directions moving.
+                    // https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2.2
+                    tracing::debug!("client initial write blocked; entering duplex polling");
+                }
+            }
+
+            // A blocked write is the natural end of this initial send round.
+            // The normal connection state machine resumes the same cursor and
+            // prioritizes any control frames learned from the peer.
+            self.initial_write_pending = false;
+        }
+
         self.inner.maybe_close_connection_if_no_streams();
         let had_streams_or_refs = self.inner.has_streams_or_other_references();
         let result = self.inner.poll(cx).map_err(Into::into);
