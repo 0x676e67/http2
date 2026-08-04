@@ -28,6 +28,7 @@ enum IoCall {
     Read,
     Write(Bytes),
     Flush,
+    Shutdown,
 }
 
 struct RecordingIo {
@@ -159,6 +160,7 @@ impl AsyncWrite for RecordingIo {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.calls.lock().unwrap().push(IoCall::Shutdown);
         Poll::Ready(Ok(()))
     }
 }
@@ -410,7 +412,7 @@ async fn safari_and_chrome_profiles_fit_in_one_initial_transport_write() {
             .iter()
             .filter_map(|call| match call {
                 IoCall::Write(buf) => Some(buf),
-                IoCall::Read | IoCall::Flush => None,
+                IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
             })
             .collect();
         assert_eq!(
@@ -530,7 +532,7 @@ async fn coalesces_initial_frames_and_queued_requests_before_first_write() {
                 .iter()
                 .filter_map(|call| match call {
                     IoCall::Write(buf) => Some(buf),
-                    IoCall::Read | IoCall::Flush => None,
+                    IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
                 })
                 .collect();
             let first = *writes
@@ -575,7 +577,7 @@ async fn coalesces_initial_frames_and_queued_requests_before_first_write() {
             .iter()
             .find_map(|call| match call {
                 IoCall::Write(buf) => Some(buf),
-                IoCall::Read | IoCall::Flush => None,
+                IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
             })
             .expect("partial write was not retried");
         assert_eq!(retried.as_ref(), &first_write[PARTIAL_WRITE_LEN..]);
@@ -643,6 +645,70 @@ async fn initial_write_does_not_wait_for_a_request() {
     }
 }
 
+#[tokio::test]
+async fn idle_client_finishes_initial_write_before_go_away() {
+    h2_support::trace_init!();
+
+    let (io, calls, write_blocked, blocked_waker) =
+        recording_io(WriteMode::PartialThenPending, Bytes::new());
+    let (send_request, mut connection) = client::handshake::<_>(io).await.unwrap();
+    drop(send_request);
+
+    let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    let waker = Waker::from(wake_counter.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+
+    let (first_write, blocked_call_count) = {
+        let calls = calls.lock().unwrap();
+        let writes = calls
+            .iter()
+            .filter_map(|call| match call {
+                IoCall::Write(buf) => Some(buf),
+                IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
+            })
+            .collect::<Vec<_>>();
+        let first = writes
+            .first()
+            .expect("initial client batch was not written");
+        assert!(writes.len() >= 2);
+        for retry in &writes[1..] {
+            assert!(retry.starts_with(&first[PARTIAL_WRITE_LEN..]));
+        }
+        ((*first).clone(), calls.len())
+    };
+
+    write_blocked.store(false, Ordering::SeqCst);
+    let blocked_waker = blocked_waker
+        .lock()
+        .unwrap()
+        .take()
+        .expect("write task was not registered");
+    let wake_count = wake_counter.0.load(Ordering::SeqCst);
+    blocked_waker.wake();
+    assert!(wake_counter.0.load(Ordering::SeqCst) > wake_count);
+    assert!(matches!(
+        Pin::new(&mut connection).poll(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+
+    let calls = calls.lock().unwrap();
+    let mut wire = first_write[..PARTIAL_WRITE_LEN].to_vec();
+    for call in &calls[blocked_call_count..] {
+        if let IoCall::Write(buf) = call {
+            wire.extend_from_slice(buf);
+        }
+    }
+    assert_eq!(frame_layout(&wire), [(4, 0), (7, 0)]);
+    assert_eq!(
+        wire.windows(MAGIC_PREFACE.len())
+            .filter(|window| *window == MAGIC_PREFACE)
+            .count(),
+        1
+    );
+    assert!(matches!(calls.last(), Some(IoCall::Shutdown)));
+}
+
 #[derive(Clone, Copy)]
 enum RequestState {
     None,
@@ -699,7 +765,7 @@ async fn blocked_initial_write_still_processes_peer_frames() {
                     .iter()
                     .filter_map(|call| match call {
                         IoCall::Write(buf) => Some(buf),
-                        IoCall::Read | IoCall::Flush => None,
+                        IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
                     })
                     .skip(1)
                     .collect();
@@ -803,7 +869,7 @@ async fn oversized_initial_headers_keep_reads_live_and_continuations_ordered() {
             .iter()
             .find_map(|call| match call {
                 IoCall::Write(buf) => Some(buf.clone()),
-                IoCall::Read | IoCall::Flush => None,
+                IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
             })
             .expect("initial client batch was not written");
         (first_write, calls.len())

@@ -91,6 +91,9 @@ pub(crate) struct Config {
 
 #[derive(Debug)]
 enum State {
+    /// The client has not yet attempted its initial write-first send round.
+    ClientInitialSend,
+
     /// Currently open in a sane state
     Open,
 
@@ -137,10 +140,16 @@ where
         let span = ::tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         #[cfg(feature = "tracing")]
         span.follows_from(::tracing::Span::current());
+        let state = if P::r#dyn().is_server() {
+            State::Open
+        } else {
+            State::ClientInitialSend
+        };
+
         Connection {
             codec,
             inner: ConnectionInner {
-                state: State::Open,
+                state,
                 error: None,
                 go_away: GoAway::new(),
                 ping_pong: PingPong::new(),
@@ -274,6 +283,40 @@ where
         self.inner.ping_pong.take_user_pings()
     }
 
+    /// Runs the client's one-time write-first send round before normal duplex polling.
+    pub(crate) fn advance_client_initial_send(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Result<(), Error> {
+        if !matches!(&self.inner.state, State::ClientInitialSend) {
+            return Ok(());
+        }
+
+        #[cfg(feature = "tracing")]
+        let _span1 = self.inner.span.clone().entered();
+        #[cfg(feature = "tracing")]
+        let _span2 = tracing::trace_span!("advance_client_initial_send");
+
+        match self.inner.streams.poll_complete(cx, &mut self.codec) {
+            Poll::Ready(Ok(())) => tracing::debug!("client initial send flushed"),
+            Poll::Pending => {
+                // RFC 9113 section 5.2.2 requires endpoints to process
+                // available inbound frames promptly. The write cursor keeps
+                // the initial bytes in order while normal polling takes over.
+                // https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2.2
+                tracing::debug!("client initial send blocked; entering duplex polling");
+            }
+            Poll::Ready(Err(err)) => {
+                return self.inner.as_dyn().handle_poll2_result(Err(err.into()));
+            }
+        }
+
+        // Ready and Pending both consume this one-time scheduling phase. A
+        // partial write resumes from the codec cursor in the normal state.
+        self.inner.state = State::Open;
+        Ok(())
+    }
+
     /// Advances the internal state of the connection.
     pub fn poll(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         // XXX(eliza): cloning the span is unfortunately necessary here in
@@ -288,6 +331,10 @@ where
             tracing::trace!(connection.state = ?self.inner.state);
             // TODO: probably clean up this glob of code
             match self.inner.state {
+                State::ClientInitialSend => {
+                    self.advance_client_initial_send(cx)?;
+                    continue;
+                }
                 // When open, continue to poll a frame
                 State::Open => {
                     match self.poll2(cx) {
@@ -653,25 +700,6 @@ where
 {
     pub(crate) fn streams(&self) -> &Streams<B, client::Peer> {
         &self.inner.streams
-    }
-
-    /// Flushes the frames that were queued before the first receive attempt.
-    pub(crate) fn poll_initial_write(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>>
-    where
-        T: Unpin,
-    {
-        #[cfg(feature = "tracing")]
-        let _span1 = self.inner.span.clone().entered();
-        #[cfg(feature = "tracing")]
-        let _span2 = tracing::trace_span!("poll_initial_write");
-
-        match ready!(self.inner.streams.poll_complete(cx, &mut self.codec)) {
-            Ok(()) => {
-                tracing::debug!("client initial write flushed");
-                Poll::Ready(Ok(()))
-            }
-            Err(err) => Poll::Ready(self.inner.as_dyn().handle_poll2_result(Err(err.into()))),
-        }
     }
 }
 

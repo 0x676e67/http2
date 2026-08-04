@@ -219,7 +219,6 @@ pub struct ReadySendRequest<B: Buf> {
 ///
 /// ```
 /// # use tokio::io::{AsyncRead, AsyncWrite};
-/// # use http::Request;
 /// # use http2::client;
 /// # use http2::client::*;
 /// #
@@ -227,12 +226,6 @@ pub struct ReadySendRequest<B: Buf> {
 /// # where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 /// # {
 ///     let (send_request, connection) = client::handshake(my_io).await?;
-///     let mut send_request = send_request.ready().await?;
-///     let request = Request::get("https://example.com/").body(()).unwrap();
-///     let (_response, _send_stream) = send_request.send_request(request, true).unwrap();
-///
-///     // Queue the first request before the connection task can be polled if
-///     // it should join the initial output batch.
 ///     // Submit the connection handle to an executor.
 ///     tokio::spawn(async { connection.await.expect("connection failed"); });
 ///
@@ -246,7 +239,6 @@ pub struct ReadySendRequest<B: Buf> {
 #[must_use = "futures do nothing unless polled"]
 pub struct Connection<T, B: Buf = Bytes> {
     inner: proto::Connection<T, Peer, B>,
-    initial_write_pending: bool,
 }
 
 /// A future of an HTTP response.
@@ -1452,10 +1444,7 @@ where
             pending: None,
         };
 
-        let mut connection = Connection {
-            inner,
-            initial_write_pending: true,
-        };
+        let mut connection = Connection { inner };
         if let Some(sz) = builder.initial_target_connection_window_size {
             connection.set_target_window_size(sz);
         }
@@ -1549,27 +1538,9 @@ where
     type Output = Result<(), crate::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.initial_write_pending {
-            match self.inner.poll_initial_write(cx) {
-                Poll::Ready(result) => {
-                    result.map_err(crate::Error::from)?;
-                }
-                Poll::Pending => {
-                    // RFC 9113 section 5.2.2 requires endpoints to process
-                    // available inbound frames promptly. The write cursor
-                    // keeps the initial bytes in order, while the normal
-                    // connection poll keeps both I/O directions moving.
-                    // https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2.2
-                    tracing::debug!("client initial write blocked; entering duplex polling");
-                }
-            }
-
-            // A blocked write is the natural end of this initial send round.
-            // The normal connection state machine resumes the same cursor and
-            // prioritizes any control frames learned from the peer.
-            self.initial_write_pending = false;
-        }
-
+        self.inner
+            .advance_client_initial_send(cx)
+            .map_err(crate::Error::from)?;
         self.inner.maybe_close_connection_if_no_streams();
         let had_streams_or_refs = self.inner.has_streams_or_other_references();
         let result = self.inner.poll(cx).map_err(Into::into);
