@@ -103,8 +103,14 @@ where
         }
     }
 
-    pub(super) fn buffer_prefix(&mut self, prefix: &[u8]) {
-        self.encoder.buf.get_mut().extend_from_slice(prefix);
+    pub(super) fn buffer_client_magic(&mut self, client_magic: &[u8]) {
+        debug_assert!(
+            self.encoder.buf.position() == 0
+                && self.encoder.buf.get_ref().is_empty()
+                && self.encoder.next.is_none(),
+            "client magic must be buffered before any frame bytes"
+        );
+        self.encoder.buf.get_mut().extend_from_slice(client_magic);
     }
 
     /// Returns `Ready` when `send` is able to accept a frame

@@ -158,7 +158,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+// The fixed 24-byte sequence that starts the client connection preface. The
+// initial SETTINGS frame completes the preface.
+// https://www.rfc-editor.org/rfc/rfc9113.html#section-3.4
+const CLIENT_MAGIC: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// Initializes new HTTP/2 streams on a connection by sending a request.
 ///
@@ -1401,12 +1404,12 @@ where
     ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
         tracing::debug!("preparing client connection preface");
 
-        // RFC 9113 section 3.4 requires the client preface to be followed by
+        // RFC 9113 section 3.4 requires the client magic to be followed by
         // SETTINGS. Keeping both in the codec also lets a request queued before
         // the first connection poll join the same initial write.
         // https://www.rfc-editor.org/rfc/rfc9113.html#section-3.4
         let mut codec = Codec::new(io);
-        codec.buffer_write_prefix(PREFACE);
+        codec.buffer_client_magic(CLIENT_MAGIC);
 
         if let Some(max) = builder.settings.max_frame_size() {
             codec.set_max_recv_frame_size(max as usize);

@@ -57,9 +57,13 @@ where
         Codec { inner }
     }
 
-    /// Adds bytes that must appear before the first encoded frame.
-    pub(crate) fn buffer_write_prefix(&mut self, prefix: &[u8]) {
-        self.inner.get_mut().buffer_prefix(prefix);
+    /// Buffers the fixed 24-byte client magic before the first encoded frame.
+    ///
+    /// The initial SETTINGS frame that follows completes the client connection
+    /// preface described in RFC 9113 section 3.4.
+    /// https://www.rfc-editor.org/rfc/rfc9113.html#section-3.4
+    pub(crate) fn buffer_client_magic(&mut self, client_magic: &[u8]) {
+        self.inner.get_mut().buffer_client_magic(client_magic);
     }
 }
 
