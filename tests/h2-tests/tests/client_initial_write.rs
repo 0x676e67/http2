@@ -848,11 +848,16 @@ async fn oversized_initial_headers_keep_reads_live_and_continuations_ordered() {
         Bytes::from_static(PEER_TWO_SETTINGS_AND_GOAWAY),
     );
     let (mut send_request, mut connection) = client::handshake::<_>(io).await.unwrap();
+    let mut ping_pong = connection.ping_pong().expect("ping handle unavailable");
+    ping_pong.send_ping(Ping::opaque()).unwrap();
     let request = Request::get("https://example.com/")
         .header("x-large", "a".repeat(40_000))
         .body(())
         .unwrap();
-    let (_response, _send_stream) = send_request.send_request(request, true).unwrap();
+    let (_response, mut send_stream) = send_request.send_request(request, false).unwrap();
+    send_stream
+        .send_data(Bytes::from_static(b"after-headers"), true)
+        .unwrap();
 
     let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
     let waker = Waker::from(wake_counter.clone());
@@ -911,7 +916,13 @@ async fn oversized_initial_headers_keep_reads_live_and_continuations_ordered() {
         Some((4, 0))
     );
     assert_eq!(
-        frames.get(1).map(|frame| (frame.kind, frame.stream_id)),
+        frames
+            .get(1)
+            .map(|frame| (frame.kind, frame.flags, frame.stream_id)),
+        Some((6, 0, 0))
+    );
+    assert_eq!(
+        frames.get(2).map(|frame| (frame.kind, frame.stream_id)),
         Some((1, 1))
     );
     let acks: Vec<_> = frames
@@ -924,14 +935,17 @@ async fn oversized_initial_headers_keep_reads_live_and_continuations_ordered() {
         .collect();
     assert_eq!(acks.len(), 2, "each peer SETTINGS needs exactly one ACK");
     assert!(
-        acks[0] > 2,
+        acks[0] > 3,
         "oversized HEADERS did not produce CONTINUATION"
     );
-    assert!(frames[2..acks[0]]
+    assert!(frames[3..acks[0]]
         .iter()
         .all(|frame| frame.kind == 9 && frame.stream_id == 1));
     assert_eq!(acks[1], acks[0] + 1);
-    assert_eq!(frames.len(), acks[1] + 1);
+    let data = frames.get(acks[1] + 1).expect("DATA was not written");
+    assert_eq!((data.kind, data.stream_id), (0, 1));
+    assert_eq!(data.flags & 1, 1, "DATA must close the request stream");
+    assert_eq!(frames.len(), acks[1] + 2);
 }
 
 #[tokio::test]

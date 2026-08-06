@@ -297,6 +297,22 @@ where
         #[cfg(feature = "tracing")]
         let _span2 = tracing::trace_span!("advance_client_initial_send");
 
+        // Preserve the normal connection-level control-frame priority before
+        // stream frames fill the codec. This also prevents a user PING queued
+        // before the first poll from blocking receive-side progress behind a
+        // large HEADERS field block.
+        match self.poll_ready(cx) {
+            Poll::Ready(Ok(PollReady::Complete)) => {}
+            Poll::Ready(Ok(PollReady::SettingsBlocked)) | Poll::Pending => {
+                tracing::debug!("client initial control send blocked; entering duplex polling");
+                self.inner.state = State::Open;
+                return Ok(());
+            }
+            Poll::Ready(Err(err)) => {
+                return self.inner.as_dyn().handle_poll2_result(Err(err));
+            }
+        }
+
         match self.inner.streams.poll_complete(cx, &mut self.codec) {
             Poll::Ready(Ok(())) => tracing::debug!("client initial send flushed"),
             Poll::Pending => {
