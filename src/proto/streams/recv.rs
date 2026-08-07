@@ -1104,7 +1104,7 @@ impl Recv {
     }
 
     /// Send connection level window update
-    fn send_connection_window_update<T, B>(
+    pub(super) fn send_connection_window_update<T, B>(
         &mut self,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> io::Result<BufferStatus>

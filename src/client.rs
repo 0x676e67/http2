@@ -88,8 +88,8 @@
 //!     // Send the request. The second tuple item allows the caller
 //!     // to stream a request body.
 //!     let (response, _) = http2.send_request(request, true).unwrap();
-//!     // Queue the first request before starting the connection task so it can
-//!     // join the initial output batch.
+//!     // Queue the first request before starting the connection task so the
+//!     // driver can send it immediately after the initial connection write.
 //!     tokio::spawn(async move {
 //!         connection.await.unwrap();
 //!     });
@@ -1231,11 +1231,10 @@ impl Builder {
         self
     }
 
-    /// Sets the list of PRIORITY frames to be sent immediately after the connection is established,
-    /// but before the first request is sent.
+    /// Sets the list of PRIORITY frames to be sent before request HEADERS.
     ///
     /// This allows you to pre-configure the HTTP/2 stream dependency tree by specifying a set of
-    /// PRIORITY frames that will be sent as part of the connection preface. This can be useful for
+    /// PRIORITY frames that will be sent with the request queue. This can be useful for
     /// optimizing resource allocation or testing custom stream prioritization strategies.
     ///
     /// Each `Priority` in the list must have a valid (non-zero) stream ID. Any priority with a
@@ -1259,18 +1258,20 @@ impl Builder {
     /// the client preface or initial SETTINGS are reported when the returned
     /// [`Connection`] is polled.
     ///
-    /// If the first request can be opened immediately and is queued through
-    /// [`SendRequest`] before polling [`Connection`], the client preface,
-    /// SETTINGS, an optional connection WINDOW_UPDATE, any configured standalone
-    /// PRIORITY frames, and its HEADERS are encoded before the
-    /// first write when they fit in the initial output batch. A partial write
-    /// resumes from that same buffer. A request held by the initial stream
-    /// concurrency limit remains pending and is not included in this batch.
-    /// Polling the connection first sends the available control frames
-    /// immediately and does not wait for a request.
-    /// Other frames that are already ready may follow the first HEADERS in the
-    /// same initial send cycle; the normal scheduler is not artificially cut
-    /// off after one request.
+    /// The first application-layer write contains the client magic, SETTINGS,
+    /// and an optional connection WINDOW_UPDATE. Request frames stay in the
+    /// normal stream queue until that write completes. If a request can be
+    /// opened immediately and is queued through [`SendRequest`] before polling
+    /// [`Connection`], the same poll can continue with a separate write for its
+    /// configured PRIORITY frames and HEADERS. No flush is inserted between
+    /// those write items.
+    ///
+    /// A partial write resumes from the same item before the next queue is
+    /// advanced. A request held by the initial stream concurrency limit remains
+    /// pending. Polling the connection without a request still sends the
+    /// available connection frames immediately. Once request scheduling starts,
+    /// other ready frames may follow the first HEADERS; the scheduler is not
+    /// artificially cut off after one request.
     ///
     /// Returns a future which resolves to the [`Connection`] / [`SendRequest`]
     /// tuple once the HTTP/2 handshake state has been prepared.
@@ -1367,9 +1368,8 @@ impl Default for Builder {
 /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T) -> Result<(), http2::Error>
 /// # {
 /// let (send_request, connection) = client::handshake(my_io).await?;
-/// // Queueing a request before polling `connection` lets the initial HTTP/2
-/// // frames and the first request be prepared in the same write buffer when
-/// // they fit.
+/// // Queueing a request before polling `connection` lets the driver continue
+/// // with its HEADERS immediately after the separate initial connection write.
 /// # Ok(())
 /// # }
 /// #
@@ -1405,8 +1405,8 @@ where
         tracing::debug!("preparing client connection preface");
 
         // RFC 9113 section 3.4 requires the client magic to be followed by
-        // SETTINGS. Keeping both in the codec also lets a request queued before
-        // the first connection poll join the same initial write.
+        // SETTINGS. Both are prepared without I/O; the connection driver writes
+        // this item before it advances the separate request frame queue.
         // https://www.rfc-editor.org/rfc/rfc9113.html#section-3.4
         let mut codec = Codec::new(io);
         codec.buffer_client_magic(CLIENT_MAGIC);
@@ -1541,9 +1541,7 @@ where
     type Output = Result<(), crate::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.inner
-            .advance_client_initial_send(cx)
-            .map_err(crate::Error::from)?;
+        ready!(self.inner.advance_client_initial_send(cx)).map_err(crate::Error::from)?;
         self.inner.maybe_close_connection_if_no_streams();
         let had_streams_or_refs = self.inner.has_streams_or_other_references();
         let result = self.inner.poll(cx).map_err(Into::into);

@@ -135,6 +135,11 @@ impl PingPong {
         }
     }
 
+    /// Returns whether a peer PING is still waiting for an acknowledgement.
+    pub(crate) fn has_pending_pong(&self) -> bool {
+        self.pending_pong.is_some()
+    }
+
     /// Send any pending pongs.
     pub(crate) fn send_pending_pong<T, B>(
         &mut self,

@@ -161,6 +161,11 @@ where
         self.framed_write().buffer(item)
     }
 
+    /// Writes encoded bytes without flushing the upstream writer.
+    pub(crate) fn poll_write_buffered(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().poll_write_buffered(cx)
+    }
+
     /// Flush buffered data to the wire
     pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         self.framed_write().flush(cx)

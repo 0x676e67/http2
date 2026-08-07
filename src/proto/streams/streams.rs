@@ -147,6 +147,27 @@ where
             .set_target_connection_window(size, &mut me.actions.task)
     }
 
+    /// Adds the connection-level WINDOW_UPDATE to the client's initial write.
+    ///
+    /// Stream-level updates and request frames stay in their normal queues and
+    /// are not moved into the codec until this write has completed.
+    pub(crate) fn buffer_client_initial_window_update<T>(
+        &mut self,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin,
+    {
+        let mut me = self.inner.lock();
+        match me.actions.recv.send_connection_window_update(dst)? {
+            BufferStatus::Complete => Ok(()),
+            BufferStatus::CodecFull => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "client initial write buffer has insufficient capacity",
+            )),
+        }
+    }
+
     pub fn next_incoming(&mut self) -> Option<StreamRef<B>> {
         let mut me = self.inner.lock();
         let me = &mut *me;
