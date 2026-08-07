@@ -10,33 +10,9 @@ use std::task::{Context, Poll, Wake, Waker};
 use tokio::io::ReadBuf;
 
 const PARTIAL_WRITE_LEN: usize = 7;
-const PEER_EMPTY_SETTINGS: &[u8] = &[0, 0, 0, 4, 0, 0, 0, 0, 0];
-const PEER_SETTINGS_AND_GOAWAY: &[u8] = &[
-    // SETTINGS_MAX_CONCURRENT_STREAMS = 0
-    0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, // GOAWAY, last stream ID 1, NO_ERROR
-    0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-];
-const PEER_SETTINGS_AND_GOAWAY_ZERO: &[u8] = &[
-    // SETTINGS_MAX_CONCURRENT_STREAMS = 0
-    0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, // GOAWAY, last stream ID 0, NO_ERROR
-    0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-];
-const PEER_TWO_SETTINGS_AND_GOAWAY: &[u8] = &[
-    // SETTINGS_MAX_CONCURRENT_STREAMS = 0
-    0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, // A second non-ACK SETTINGS frame.
-    0, 0, 0, 4, 0, 0, 0, 0, 0, // GOAWAY, last stream ID 1, NO_ERROR
-    0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-];
-const PEER_SETTINGS_AND_TWO_PINGS: &[u8] = &[
-    // Empty initial SETTINGS.
-    0, 0, 0, 4, 0, 0, 0, 0, 0, // Two non-ACK PING frames with distinct payloads.
-    0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 8, 6, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2,
-    2, 2,
-];
-const PEER_SETTINGS_AND_TWO_INVALID_SETTINGS: &[u8] = &[
-    // Empty initial SETTINGS.
-    0, 0, 0, 4, 0, 0, 0, 0, 0, // Two SETTINGS frames with an illegal nonzero stream ID.
-    0, 0, 0, 4, 0, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 0, 1,
+const PEER_SETTINGS_AND_PING: &[u8] = &[
+    // Empty initial SETTINGS followed by a non-ACK PING.
+    0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
 ];
 #[derive(Debug)]
 enum IoCall {
@@ -65,9 +41,6 @@ type RecordingIoParts = (
 #[derive(Clone, Copy)]
 enum WriteMode {
     PartialThenPending,
-    SecondWritePartialThenPending,
-    PendingThenComplete,
-    FlushThenPending,
     Complete,
     Fail(io::ErrorKind),
     PendingThenFail(io::ErrorKind),
@@ -145,44 +118,20 @@ impl AsyncWrite for RecordingIo {
                 *self.blocked_waker.lock().unwrap() = Some(cx.waker().clone());
                 Poll::Pending
             }
-            WriteMode::SecondWritePartialThenPending if call == 1 => {
-                Poll::Ready(Ok(PARTIAL_WRITE_LEN.min(buf.len())))
-            }
-            WriteMode::SecondWritePartialThenPending
-                if call > 1 && self.write_blocked.load(Ordering::SeqCst) =>
-            {
-                *self.blocked_waker.lock().unwrap() = Some(cx.waker().clone());
-                Poll::Pending
-            }
-            WriteMode::PendingThenComplete if self.write_blocked.load(Ordering::SeqCst) => {
-                *self.blocked_waker.lock().unwrap() = Some(cx.waker().clone());
-                Poll::Pending
-            }
             WriteMode::PendingThenFail(_) if self.write_blocked.load(Ordering::SeqCst) => {
                 *self.blocked_waker.lock().unwrap() = Some(cx.waker().clone());
                 Poll::Pending
             }
-            WriteMode::PartialThenPending
-            | WriteMode::SecondWritePartialThenPending
-            | WriteMode::PendingThenComplete
-            | WriteMode::FlushThenPending
-            | WriteMode::Complete => Poll::Ready(Ok(buf.len())),
+            WriteMode::PartialThenPending | WriteMode::Complete => Poll::Ready(Ok(buf.len())),
             WriteMode::Fail(kind) | WriteMode::PendingThenFail(kind) => {
                 Poll::Ready(Err(kind.into()))
             }
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.calls.lock().unwrap().push(IoCall::Flush);
-        if matches!(self.write_mode, WriteMode::FlushThenPending)
-            && self.write_blocked.load(Ordering::SeqCst)
-        {
-            *self.blocked_waker.lock().unwrap() = Some(cx.waker().clone());
-            Poll::Pending
-        } else {
-            Poll::Ready(Ok(()))
-        }
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -462,6 +411,11 @@ async fn initial_connection_write_is_separate_from_profile_headers() {
 
         let initial_write = write_positions[0].1.as_ref();
         let request_write = write_positions[1].1.as_ref();
+        assert_eq!(
+            initial_write.len(),
+            70,
+            "unexpected {profile:?} initial item"
+        );
         let frames = wire_frames(initial_write);
         assert_eq!(
             frames
@@ -591,8 +545,8 @@ async fn drains_connection_and_request_queues_in_one_poll() {
             .position(|call| matches!(call, IoCall::Read))
             .expect("connection did not poll the receive side");
         assert!(
-            writes[1].0 < first_read,
-            "request queue was not write-first"
+            writes[0].0 < first_read && first_read < writes[1].0,
+            "the normal upstream read poll did not run between write items"
         );
 
         let mut expected_initial = vec![(4, 0)];
@@ -754,315 +708,37 @@ enum RequestState {
 }
 
 #[tokio::test]
-async fn blocked_initial_write_still_processes_peer_frames() {
+async fn blocked_initial_write_preserves_upstream_poll_order() {
     h2_support::trace_init!();
 
-    for write_mode in [
+    let (io, calls, write_blocked, blocked_waker) = recording_io(
         WriteMode::PartialThenPending,
-        WriteMode::PendingThenComplete,
-        WriteMode::FlushThenPending,
-    ] {
-        let peer_frames = match write_mode {
-            WriteMode::PartialThenPending => PEER_EMPTY_SETTINGS,
-            WriteMode::PendingThenComplete => PEER_SETTINGS_AND_GOAWAY_ZERO,
-            WriteMode::FlushThenPending => PEER_SETTINGS_AND_GOAWAY,
-            WriteMode::SecondWritePartialThenPending
-            | WriteMode::Complete
-            | WriteMode::Fail(_)
-            | WriteMode::PendingThenFail(_) => unreachable!(),
-        };
-        let (io, calls, write_blocked, blocked_waker) =
-            recording_io(write_mode, Bytes::from_static(peer_frames));
-        let mut builder = client::Builder::new();
-        builder.initial_connection_window_size(1_000_000);
-
-        let (mut send_request, mut connection) = builder
-            .handshake::<_, Bytes>(io)
-            .now_or_never()
-            .expect("handshake attempted transport I/O")
-            .unwrap();
-        let request = Request::get("https://example.com/").body(()).unwrap();
-        let (_response, _send_stream) = send_request.send_request(request, true).unwrap();
-
-        let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
-        let waker = Waker::from(wake_counter.clone());
-        let mut cx = Context::from_waker(&waker);
-        assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
-
-        let first_write = {
-            let calls = calls.lock().unwrap();
-            let first_read = calls
-                .iter()
-                .position(|call| matches!(call, IoCall::Read))
-                .expect("write backpressure starved the receive side");
-            let first_write = calls
-                .iter()
-                .position(|call| matches!(call, IoCall::Write(_)))
-                .expect("initial connection item was not written");
-            assert!(first_write < first_read);
-
-            let IoCall::Write(first) = &calls[first_write] else {
-                unreachable!();
-            };
-            assert_eq!(frame_layout(first), vec![(4, 0), (8, 0)]);
-
-            if matches!(write_mode, WriteMode::PartialThenPending) {
-                let retries: Vec<_> = calls
-                    .iter()
-                    .filter_map(|call| match call {
-                        IoCall::Write(buf) => Some(buf),
-                        IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
-                    })
-                    .skip(1)
-                    .collect();
-                assert!(!retries.is_empty());
-                for retry in retries {
-                    assert_eq!(retry.as_ref(), &first[PARTIAL_WRITE_LEN..]);
-                }
-            }
-
-            first.clone()
-        };
-
-        if matches!(write_mode, WriteMode::PartialThenPending) {
-            assert_eq!(connection.max_concurrent_send_streams(), usize::MAX);
-        } else {
-            assert_eq!(connection.max_concurrent_send_streams(), 0);
-            let request = Request::get("https://example.com/rejected")
-                .body(())
-                .unwrap();
-            assert!(send_request.send_request(request, true).is_err());
-        }
-
-        let blocked_call_count = calls.lock().unwrap().len();
-        write_blocked.store(false, Ordering::SeqCst);
-        let blocked_waker = blocked_waker
-            .lock()
-            .unwrap()
-            .take()
-            .expect("write task was not registered");
-        let wake_count = wake_counter.0.load(Ordering::SeqCst);
-        blocked_waker.wake();
-        assert!(wake_counter.0.load(Ordering::SeqCst) > wake_count);
-        let resumed = Pin::new(&mut connection).poll(&mut cx);
-        assert!(
-            !matches!(resumed, Poll::Ready(Err(_))),
-            "connection failed after write capacity resumed"
-        );
-
-        let calls = calls.lock().unwrap();
-        let mut wire = Vec::new();
-        match write_mode {
-            WriteMode::PartialThenPending => {
-                wire.extend_from_slice(&first_write[..PARTIAL_WRITE_LEN]);
-                for call in &calls[blocked_call_count..] {
-                    if let IoCall::Write(buf) = call {
-                        wire.extend_from_slice(buf);
-                    }
-                }
-            }
-            WriteMode::PendingThenComplete => {
-                for call in &calls[blocked_call_count..] {
-                    if let IoCall::Write(buf) = call {
-                        wire.extend_from_slice(buf);
-                    }
-                }
-            }
-            WriteMode::FlushThenPending => {
-                for call in calls.iter() {
-                    if let IoCall::Write(buf) = call {
-                        wire.extend_from_slice(buf);
-                    }
-                }
-            }
-            WriteMode::SecondWritePartialThenPending
-            | WriteMode::Complete
-            | WriteMode::Fail(_)
-            | WriteMode::PendingThenFail(_) => {
-                unreachable!()
-            }
-        }
-
-        assert_eq!(&wire[..first_write.len()], first_write.as_ref());
-        let frames = wire_frames(&wire);
-        let layout = frames
-            .iter()
-            .map(|frame| (frame.kind, frame.flags, frame.stream_id))
-            .collect::<Vec<_>>();
-        match write_mode {
-            WriteMode::PartialThenPending => {
-                assert_eq!(layout, [(4, 0, 0), (8, 0, 0), (4, 1, 0), (1, 5, 1)])
-            }
-            WriteMode::PendingThenComplete => {
-                assert_eq!(layout, [(4, 0, 0), (8, 0, 0), (4, 1, 0), (7, 0, 0)])
-            }
-            WriteMode::FlushThenPending => {
-                assert_eq!(layout, [(4, 0, 0), (8, 0, 0), (1, 5, 1), (4, 1, 0)])
-            }
-            WriteMode::SecondWritePartialThenPending
-            | WriteMode::Complete
-            | WriteMode::Fail(_)
-            | WriteMode::PendingThenFail(_) => unreachable!(),
-        }
-        assert_eq!(
-            wire.windows(MAGIC_PREFACE.len())
-                .filter(|window| *window == MAGIC_PREFACE)
-                .count(),
-            1
-        );
-    }
-}
-
-#[tokio::test]
-async fn blocked_initial_write_serializes_peer_ping_acks() {
-    h2_support::trace_init!();
-
-    let (io, calls, write_blocked, blocked_waker) = recording_io(
-        WriteMode::PendingThenComplete,
-        Bytes::from_static(PEER_SETTINGS_AND_TWO_PINGS),
-    );
-    let (_send_request, mut connection) = client::handshake::<_>(io).await.unwrap();
-
-    let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
-    let waker = Waker::from(wake_counter.clone());
-    let mut cx = Context::from_waker(&waker);
-    assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
-
-    // A Future can be polled again even when its registered write waker has
-    // not fired. Keep the first PONG pending instead of reading a second PING
-    // into the single acknowledgement slot.
-    assert!(write_blocked.load(Ordering::SeqCst));
-    assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
-
-    let blocked_call_count = calls.lock().unwrap().len();
-    write_blocked.store(false, Ordering::SeqCst);
-    let blocked_waker = blocked_waker
-        .lock()
-        .unwrap()
-        .take()
-        .expect("write task was not registered");
-    let wake_count = wake_counter.0.load(Ordering::SeqCst);
-    blocked_waker.wake();
-    assert!(wake_counter.0.load(Ordering::SeqCst) > wake_count);
-    assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
-
-    let calls = calls.lock().unwrap();
-    let mut wire = Vec::new();
-    for call in &calls[blocked_call_count..] {
-        if let IoCall::Write(buf) = call {
-            wire.extend_from_slice(buf);
-        }
-    }
-
-    let frames = wire_frames(&wire);
-    assert_eq!(
-        frames
-            .iter()
-            .map(|frame| (frame.kind, frame.flags, frame.stream_id))
-            .collect::<Vec<_>>(),
-        [(4, 0, 0), (6, 1, 0), (4, 1, 0), (6, 1, 0)]
-    );
-    let pongs = frames
-        .iter()
-        .filter(|frame| frame.kind == 6)
-        .map(|frame| frame_payload(&wire, frame))
-        .collect::<Vec<_>>();
-    assert_eq!(pongs, [&[1; 8][..], &[2; 8][..]]);
-}
-
-#[tokio::test]
-async fn blocked_initial_write_preserves_protocol_error_go_away() {
-    h2_support::trace_init!();
-
-    let (io, calls, write_blocked, blocked_waker) = recording_io(
-        WriteMode::PendingThenComplete,
-        Bytes::from_static(PEER_SETTINGS_AND_TWO_INVALID_SETTINGS),
-    );
-    let (send_request, mut connection) = client::handshake::<_>(io).await.unwrap();
-    drop(send_request);
-
-    let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
-    let waker = Waker::from(wake_counter.clone());
-    let mut cx = Context::from_waker(&waker);
-    assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
-
-    // Once the first malformed frame schedules a GOAWAY, a repeated poll must
-    // not consume the second malformed frame or replace the pending error.
-    assert!(write_blocked.load(Ordering::SeqCst));
-    assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
-
-    let blocked_call_count = calls.lock().unwrap().len();
-    write_blocked.store(false, Ordering::SeqCst);
-    let blocked_waker = blocked_waker
-        .lock()
-        .unwrap()
-        .take()
-        .expect("write task was not registered");
-    let wake_count = wake_counter.0.load(Ordering::SeqCst);
-    blocked_waker.wake();
-    assert!(wake_counter.0.load(Ordering::SeqCst) > wake_count);
-
-    let error = match Pin::new(&mut connection).poll(&mut cx) {
-        Poll::Ready(Err(error)) => error,
-        Poll::Ready(Ok(())) => panic!("protocol error closed without an error"),
-        Poll::Pending => panic!("connection did not finish after write capacity resumed"),
-    };
-    assert_eq!(error.reason(), Some(Reason::PROTOCOL_ERROR));
-
-    let calls = calls.lock().unwrap();
-    let mut wire = Vec::new();
-    for call in &calls[blocked_call_count..] {
-        if let IoCall::Write(buf) = call {
-            wire.extend_from_slice(buf);
-        }
-    }
-
-    let frames = wire_frames(&wire);
-    assert_eq!(
-        frames
-            .iter()
-            .map(|frame| (frame.kind, frame.flags, frame.stream_id))
-            .collect::<Vec<_>>(),
-        [(4, 0, 0), (7, 0, 0)]
-    );
-    let go_away = frames
-        .iter()
-        .find(|frame| frame.kind == 7)
-        .expect("GOAWAY was not written");
-    assert_eq!(frame_payload(&wire, go_away), &[0, 0, 0, 0, 0, 0, 0, 1]);
-}
-
-#[tokio::test]
-async fn oversized_request_headers_keep_reads_live_and_continuations_ordered() {
-    h2_support::trace_init!();
-
-    let (io, calls, write_blocked, blocked_waker) = recording_io(
-        WriteMode::SecondWritePartialThenPending,
-        Bytes::from_static(PEER_TWO_SETTINGS_AND_GOAWAY),
+        Bytes::from_static(PEER_SETTINGS_AND_PING),
     );
     let (mut send_request, mut connection) = client::handshake::<_>(io).await.unwrap();
-    let mut ping_pong = connection.ping_pong().expect("ping handle unavailable");
-    ping_pong.send_ping(Ping::opaque()).unwrap();
-    let request = Request::get("https://example.com/")
-        .header("x-large", "a".repeat(40_000))
-        .body(())
-        .unwrap();
-    let (_response, mut send_stream) = send_request.send_request(request, false).unwrap();
-    send_stream
-        .send_data(Bytes::from_static(b"after-headers"), true)
-        .unwrap();
+    let request = Request::get("https://example.com/").body(()).unwrap();
+    let (_response, _send_stream) = send_request.send_request(request, true).unwrap();
 
     let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
     let waker = Waker::from(wake_counter.clone());
     let mut cx = Context::from_waker(&waker);
     assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
 
-    let (initial_write, request_write, blocked_call_count) = {
+    {
         let calls = calls.lock().unwrap();
+        assert!(calls.iter().any(|call| matches!(call, IoCall::Write(_))));
         assert!(
-            calls.iter().any(|call| matches!(call, IoCall::Read)),
-            "a full continuation buffer starved the receive side"
+            calls.iter().all(|call| !matches!(call, IoCall::Read)),
+            "the initial connection item must complete before normal reads begin"
         );
+    }
+
+    // A spurious poll before the writer wakes must keep the same upstream
+    // handshake-style write-before-read behavior.
+    assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+    let (first_write, blocked_call_count) = {
+        let calls = calls.lock().unwrap();
+        assert!(calls.iter().all(|call| !matches!(call, IoCall::Read)));
         let writes = calls
             .iter()
             .filter_map(|call| match call {
@@ -1070,19 +746,15 @@ async fn oversized_request_headers_keep_reads_live_and_continuations_ordered() {
                 IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
             })
             .collect::<Vec<_>>();
-        assert!(writes.len() >= 3, "second write did not reach backpressure");
-        assert_eq!(frame_layout(writes[0]), [(4, 0)]);
-        for retry in &writes[2..] {
-            assert_eq!(retry.as_ref(), &writes[1][PARTIAL_WRITE_LEN..]);
+        let first = writes
+            .first()
+            .expect("initial connection item was not written");
+        assert!(writes.len() >= 3);
+        for retry in &writes[1..] {
+            assert_eq!(retry.as_ref(), &first[PARTIAL_WRITE_LEN..]);
         }
-        (writes[0].clone(), writes[1].clone(), calls.len())
+        ((*first).clone(), calls.len())
     };
-
-    assert_eq!(connection.max_concurrent_send_streams(), 0);
-    let request = Request::get("https://example.com/rejected")
-        .body(())
-        .unwrap();
-    assert!(send_request.send_request(request, true).is_err());
 
     write_blocked.store(false, Ordering::SeqCst);
     let blocked_waker = blocked_waker
@@ -1096,55 +768,58 @@ async fn oversized_request_headers_keep_reads_live_and_continuations_ordered() {
     assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
 
     let calls = calls.lock().unwrap();
-    let mut wire = initial_write.to_vec();
-    wire.extend_from_slice(&request_write[..PARTIAL_WRITE_LEN]);
-    for call in &calls[blocked_call_count..] {
-        if let IoCall::Write(buf) = call {
-            wire.extend_from_slice(buf);
-        }
+    let resumed_calls = &calls[blocked_call_count..];
+    let resumed_write = resumed_calls
+        .iter()
+        .position(|call| matches!(call, IoCall::Write(_)))
+        .expect("the initial connection item was not resumed");
+    let first_read = resumed_calls
+        .iter()
+        .position(|call| matches!(call, IoCall::Read))
+        .expect("normal connection polling did not resume");
+    assert!(
+        resumed_write < first_read,
+        "the receive side ran before the initial item completed"
+    );
+
+    let write_positions = resumed_calls
+        .iter()
+        .enumerate()
+        .filter_map(|(index, call)| match call {
+            IoCall::Write(buf) => Some((index, buf)),
+            IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(write_positions.len(), 2);
+    assert!(
+        resumed_calls[write_positions[0].0 + 1..write_positions[1].0]
+            .iter()
+            .all(|call| !matches!(call, IoCall::Flush))
+    );
+
+    let mut wire = first_write[..PARTIAL_WRITE_LEN].to_vec();
+    for (_, write) in write_positions {
+        wire.extend_from_slice(write);
     }
+    let frames = wire_frames(&wire);
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| (frame.kind, frame.flags, frame.stream_id))
+            .collect::<Vec<_>>(),
+        [(4, 0, 0), (4, 1, 0), (6, 1, 0), (1, 5, 1)]
+    );
+    let pong = frames
+        .iter()
+        .find(|frame| frame.kind == 6)
+        .expect("PING acknowledgement was not written");
+    assert_eq!(frame_payload(&wire, pong), &[1; 8]);
     assert_eq!(
         wire.windows(MAGIC_PREFACE.len())
             .filter(|window| *window == MAGIC_PREFACE)
             .count(),
         1
     );
-    let frames = wire_frames(&wire);
-    assert_eq!(
-        frames.first().map(|frame| (frame.kind, frame.stream_id)),
-        Some((4, 0))
-    );
-    assert_eq!(
-        frames
-            .get(1)
-            .map(|frame| (frame.kind, frame.flags, frame.stream_id)),
-        Some((6, 0, 0))
-    );
-    assert_eq!(
-        frames.get(2).map(|frame| (frame.kind, frame.stream_id)),
-        Some((1, 1))
-    );
-    let acks: Vec<_> = frames
-        .iter()
-        .enumerate()
-        .skip(1)
-        .filter_map(|(index, frame)| {
-            (frame.kind == 4 && frame.stream_id == 0 && frame.flags & 1 == 1).then_some(index)
-        })
-        .collect();
-    assert_eq!(acks.len(), 2, "each peer SETTINGS needs exactly one ACK");
-    assert!(
-        acks[0] > 3,
-        "oversized HEADERS did not produce CONTINUATION"
-    );
-    assert!(frames[3..acks[0]]
-        .iter()
-        .all(|frame| frame.kind == 9 && frame.stream_id == 1));
-    assert_eq!(acks[1], acks[0] + 1);
-    let data = frames.get(acks[1] + 1).expect("DATA was not written");
-    assert_eq!((data.kind, data.stream_id), (0, 1));
-    assert_eq!(data.flags & 1, 1, "DATA must close the request stream");
-    assert_eq!(frames.len(), acks[1] + 2);
 }
 
 #[tokio::test]

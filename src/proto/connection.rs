@@ -210,24 +210,20 @@ where
     ///
     /// Returns `Error` as this may raise errors that are caused by delayed
     /// processing of received frames.
-    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<PollReady, Error>> {
+    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         #[cfg(feature = "tracing")]
         let _e = self.inner.span.enter();
         let _span = tracing::trace_span!("poll_ready");
         // The order of these calls don't really matter too much
         ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
         ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;
-        match self
+        ready!(self
             .inner
             .settings
-            .poll_send(cx, &mut self.codec, &mut self.inner.streams)
-        {
-            Poll::Ready(result) => result?,
-            Poll::Pending => return Poll::Ready(Ok(PollReady::SettingsBlocked)),
-        }
+            .poll_send(cx, &mut self.codec, &mut self.inner.streams))?;
         ready!(self.inner.streams.send_pending_refusal(cx, &mut self.codec))?;
 
-        Poll::Ready(Ok(PollReady::Complete))
+        Poll::Ready(Ok(()))
     }
 
     /// Send any pending GOAWAY frames.
@@ -267,8 +263,10 @@ where
     /// iff there are no streams or references
     pub fn maybe_close_connection_if_no_streams(&mut self) {
         // If we poll() and realize that there are no streams or references
-        // then we can close the connection by transitioning to GOAWAY
-        if !self.inner.go_away.is_going_away()
+        // then we can close the connection by transitioning to GOAWAY. The
+        // client initial state performs this check once its connection item
+        // has been written.
+        if matches!(self.inner.state, State::Open)
             && !self.inner.streams.has_streams_or_other_references()
         {
             self.inner.as_dyn().go_away_now(Reason::NO_ERROR);
@@ -292,10 +290,11 @@ where
     }
 
     /// Writes the client connection-level item before draining request frames.
-    pub(crate) fn advance_client_initial_send(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Error>> {
+    ///
+    /// This method is called only by `Connection::poll`. Like the upstream
+    /// handshake write, it waits for write progress instead of introducing a
+    /// separate receive loop while the connection-level item is pending.
+    fn advance_client_initial_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         if matches!(&self.inner.state, State::ClientInitialSend) {
             if let Err(err) = self
                 .inner
@@ -321,84 +320,20 @@ where
         match self.codec.poll_write_buffered(cx) {
             Poll::Ready(Ok(())) => {
                 tracing::debug!(
-                    "client initial connection write complete; advancing queued frames"
+                    "client initial connection write complete; entering normal polling"
                 );
                 self.inner.state = State::Open;
-
-                // A pending GOAWAY must enter the normal Open write path
-                // before any other control or stream frame is encoded.
-                if self.inner.go_away.is_going_away() {
-                    return Poll::Ready(Ok(()));
-                }
+                self.maybe_close_connection_if_no_streams();
+                Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(err)) => {
-                return Poll::Ready(self.inner.as_dyn().handle_poll2_result(Err(err.into())));
+                Poll::Ready(self.inner.as_dyn().handle_poll2_result(Err(err.into())))
             }
             Poll::Pending => {
-                tracing::debug!("client initial connection write blocked; polling inbound frames");
-
-                // RFC 9113 section 5.2.2 requires endpoints to process
-                // available inbound frames promptly. Reuse the normal receive
-                // path while the connection-level write cursor is blocked;
-                // queued control and stream frames are encoded only after that
-                // cursor completes.
-                // https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2.2
-                if self.inner.go_away.is_going_away() {
-                    return Poll::Pending;
-                }
-
-                if self.inner.ping_pong.has_pending_pong() {
-                    return Poll::Pending;
-                }
-
-                loop {
-                    match self.poll_recv_frame(cx) {
-                        Poll::Ready(Ok(PollRecv::Continue)) => {}
-                        Poll::Ready(Ok(PollRecv::PongPending)) => {
-                            // PING acknowledgements use a single pending slot.
-                            // Stop reading until the initial write completes so
-                            // another peer PING cannot overwrite that slot.
-                            return Poll::Pending;
-                        }
-                        Poll::Ready(Ok(PollRecv::Done)) => {
-                            return Poll::Ready(self.inner.as_dyn().handle_poll2_result(Ok(())));
-                        }
-                        Poll::Ready(Err(err)) => {
-                            return Poll::Ready(self.inner.as_dyn().handle_poll2_result(Err(err)));
-                        }
-                        Poll::Pending => return Poll::Pending,
-                    }
-                }
+                tracing::debug!("client initial connection write blocked");
+                Poll::Pending
             }
         }
-
-        // Preserve the existing write-first round after the connection item
-        // completes. Control frames keep their normal priority, then the
-        // stream scheduler can advance all request frames that are ready. The
-        // codec invokes the transport again for this later item instead of
-        // appending it to the connection-level write.
-        match self.poll_ready(cx) {
-            Poll::Ready(Ok(PollReady::Complete)) => {}
-            Poll::Ready(Ok(PollReady::SettingsBlocked)) | Poll::Pending => {
-                tracing::debug!("queued client control write blocked; entering duplex polling");
-                return Poll::Ready(Ok(()));
-            }
-            Poll::Ready(Err(err)) => {
-                return Poll::Ready(self.inner.as_dyn().handle_poll2_result(Err(err)));
-            }
-        }
-
-        match self.inner.streams.poll_complete(cx, &mut self.codec) {
-            Poll::Ready(Ok(())) => tracing::debug!("queued client frames flushed"),
-            Poll::Pending => {
-                tracing::debug!("queued client frame write blocked; entering duplex polling")
-            }
-            Poll::Ready(Err(err)) => {
-                return Poll::Ready(self.inner.as_dyn().handle_poll2_result(Err(err.into())));
-            }
-        }
-
-        Poll::Ready(Ok(()))
     }
 
     /// Advances the internal state of the connection.
@@ -421,34 +356,14 @@ where
                 }
                 // When open, continue to poll a frame
                 State::Open => {
-                    match self.poll2(cx) {
-                        Poll::Ready(Ok(Poll2::Done)) => {
-                            self.inner.as_dyn().handle_poll2_result(Ok(()))?
-                        }
-                        Poll::Ready(Err(err)) => {
-                            self.inner.as_dyn().handle_poll2_result(Err(err))?
-                        }
-                        Poll::Ready(Ok(Poll2::WriteBlocked)) if !P::r#dyn().is_server() => {
-                            return Poll::Pending;
-                        }
-                        Poll::Ready(Ok(Poll2::WriteBlocked)) | Poll::Pending => {
+                    let result = match self.poll2(cx) {
+                        Poll::Ready(result) => result,
+                        // The connection is not ready to make progress
+                        Poll::Pending => {
                             // Ensure all window updates have been sent.
                             //
                             // This will also handle flushing `self.codec`
-                            if let Err(err) =
-                                ready!(self.inner.streams.poll_complete(cx, &mut self.codec))
-                            {
-                                let err = Error::from(err);
-
-                                if P::r#dyn().is_server() {
-                                    return Poll::Ready(Err(err));
-                                }
-
-                                // Client write errors must notify queued requests. This is
-                                // especially important when an initial write first reports
-                                // backpressure and fails on the retry in this normal poll.
-                                self.inner.as_dyn().handle_poll2_result(Err(err))?;
-                            }
+                            ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
 
                             if (self.inner.error.is_some()
                                 || self.inner.go_away.should_close_on_idle())
@@ -460,7 +375,9 @@ where
 
                             return Poll::Pending;
                         }
-                    }
+                    };
+
+                    self.inner.as_dyn().handle_poll2_result(result)?
                 }
                 State::Closing(reason, initiator) => {
                     tracing::trace!("connection closing after flush");
@@ -477,7 +394,7 @@ where
         }
     }
 
-    fn poll2(&mut self, cx: &mut Context) -> Poll<Result<Poll2, Error>> {
+    fn poll2(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         // This happens outside of the loop to prevent needing to do a clock
         // check and then comparison of the queue possibly multiple times a
         // second (and thus, the clock wouldn't have changed enough to matter).
@@ -489,19 +406,12 @@ where
             // The order here matters:
             // - poll_go_away may buffer a graceful shutdown GOAWAY frame
             // - If it has, we've also added a PING to be sent in poll_ready
-            let reason = match self.poll_go_away(cx) {
-                Poll::Ready(Some(Ok(reason))) => Some(reason),
-                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err.into())),
-                Poll::Ready(None) => None,
-                Poll::Pending => return Poll::Ready(Ok(Poll2::WriteBlocked)),
-            };
-
-            if let Some(reason) = reason {
+            if let Some(reason) = ready!(self.poll_go_away(cx)?) {
                 if self.inner.go_away.should_close_now() {
                     if self.inner.go_away.is_user_initiated() {
                         // A user initiated abrupt shutdown shouldn't return
                         // the same error back to the user.
-                        return Poll::Ready(Ok(Poll2::Done));
+                        return Poll::Ready(Ok(()));
                     } else {
                         return Poll::Ready(Err(Error::library_go_away(reason)));
                     }
@@ -513,55 +423,25 @@ where
                     "graceful GOAWAY should be NO_ERROR"
                 );
             }
+            ready!(self.poll_ready(cx))?;
 
-            let settings_blocked = match self.poll_ready(cx) {
-                Poll::Ready(Ok(PollReady::Complete)) => false,
-                Poll::Ready(Ok(PollReady::SettingsBlocked)) if !P::r#dyn().is_server() => true,
-                Poll::Ready(Ok(PollReady::SettingsBlocked)) | Poll::Pending => {
-                    return Poll::Ready(Ok(Poll2::WriteBlocked));
+            match self
+                .inner
+                .as_dyn()
+                .recv_frame(ready!(Pin::new(&mut self.codec).poll_next(cx)?))?
+            {
+                ReceivedFrame::Settings(frame) => {
+                    self.inner.settings.recv_settings(
+                        frame,
+                        &mut self.codec,
+                        &mut self.inner.streams,
+                    )?;
                 }
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            };
-
-            match self.poll_recv_frame(cx) {
-                Poll::Ready(Ok(PollRecv::Continue | PollRecv::PongPending)) => (),
-                Poll::Ready(Ok(PollRecv::Done)) => {
-                    return Poll::Ready(Ok(Poll2::Done));
+                ReceivedFrame::Continue => (),
+                ReceivedFrame::Done => {
+                    return Poll::Ready(Ok(()));
                 }
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending if settings_blocked => {
-                    return Poll::Ready(Ok(Poll2::WriteBlocked));
-                }
-                Poll::Pending => return Poll::Pending,
             }
-        }
-    }
-
-    /// Polls and applies one inbound frame without scheduling outbound work.
-    ///
-    /// Both normal duplex polling and the client initial-write state use this
-    /// path, so write backpressure does not create a separate receive state
-    /// machine.
-    fn poll_recv_frame(&mut self, cx: &mut Context<'_>) -> Poll<Result<PollRecv, Error>> {
-        let frame = match Pin::new(&mut self.codec).poll_next(cx) {
-            Poll::Ready(Some(Ok(frame))) => Some(frame),
-            Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
-            Poll::Ready(None) => None,
-            Poll::Pending => return Poll::Pending,
-        };
-
-        match self.inner.as_dyn().recv_frame(frame)? {
-            ReceivedFrame::Settings(frame) => {
-                self.inner.settings.recv_settings(
-                    frame,
-                    &mut self.codec,
-                    &mut self.inner.streams,
-                )?;
-                Poll::Ready(Ok(PollRecv::Continue))
-            }
-            ReceivedFrame::PongPending => Poll::Ready(Ok(PollRecv::PongPending)),
-            ReceivedFrame::Continue => Poll::Ready(Ok(PollRecv::Continue)),
-            ReceivedFrame::Done => Poll::Ready(Ok(PollRecv::Done)),
         }
     }
 
@@ -748,7 +628,6 @@ where
             }
             Some(Ping(frame)) => {
                 tracing::trace!(?frame, "recv PING");
-                let must_ack = !frame.is_ack();
                 let status = self.ping_pong.recv_ping(frame);
                 if status.is_shutdown() {
                     assert!(
@@ -758,9 +637,6 @@ where
 
                     let last_processed_id = self.streams.last_processed_id();
                     self.go_away(last_processed_id, Reason::NO_ERROR);
-                }
-                if must_ack {
-                    return Ok(ReceivedFrame::PongPending);
                 }
             }
             Some(WindowUpdate(frame)) => {
@@ -783,25 +659,8 @@ where
 
 enum ReceivedFrame {
     Settings(frame::Settings),
-    PongPending,
     Continue,
     Done,
-}
-
-enum PollRecv {
-    PongPending,
-    Continue,
-    Done,
-}
-
-enum Poll2 {
-    Done,
-    WriteBlocked,
-}
-
-enum PollReady {
-    Complete,
-    SettingsBlocked,
 }
 
 impl<T, B> Connection<T, client::Peer, B>

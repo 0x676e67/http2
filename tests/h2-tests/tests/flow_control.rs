@@ -110,6 +110,7 @@ async fn send_data_without_requesting_capacity() {
 
     let mock = mock_io::Builder::new()
         .handshake()
+        .write(frames::SETTINGS_ACK)
         .write(&[
             // POST /
             0, 0, 16, 1, 4, 0, 0, 0, 1, 131, 135, 65, 139, 157, 41, 172, 75, 143, 168, 233, 25, 151,
@@ -120,7 +121,6 @@ async fn send_data_without_requesting_capacity() {
             0, 4, 0, 0, 1, 0, 0, 0, 1,
         ])
         .write(&payload[..])
-        .write(frames::SETTINGS_ACK)
         // Read response
         .read(&[0, 0, 1, 1, 5, 0, 0, 0, 1, 0x89])
         .build();

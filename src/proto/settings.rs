@@ -8,11 +8,10 @@ use std::task::{Context, Poll};
 pub(crate) struct Settings {
     /// Our local SETTINGS sync state with the remote.
     local: Local,
-    /// Server-side SETTINGS frame pending the existing ACK-before-apply path.
+    /// Received SETTINGS frame pending processing. The ACK must be written to
+    /// the socket first then the settings applied **before** receiving any
+    /// further frames.
     remote: Option<frame::Settings>,
-    /// SETTINGS acknowledgements queued by a client while its current frame
-    /// or field block still has to finish writing.
-    pending_remote_acks: usize,
     /// Whether the connection has received the initial SETTINGS frame from the
     /// remote peer.
     has_received_remote_initial_settings: bool,
@@ -33,10 +32,9 @@ impl Settings {
     pub(crate) fn new(local: frame::Settings) -> Self {
         Settings {
             // The initial local SETTINGS are already buffered in the codec and
-            // are flushed by the connection's initial send path.
+            // are written by the connection's initial send path.
             local: Local::WaitingAck(local),
             remote: None,
-            pending_remote_acks: 0,
             has_received_remote_initial_settings: false,
         }
     }
@@ -81,31 +79,11 @@ impl Settings {
                     Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
                 }
             }
-        } else if P::r#dyn().is_server() {
-            // Preserve the server's existing synchronization behavior.
+        } else {
+            // We always ACK before reading more frames, so `remote` should
+            // always be none!
             assert!(self.remote.is_none());
             self.remote = Some(frame);
-            Ok(())
-        } else {
-            // RFC 9113 section 6.5.3 requires settings to be applied as soon
-            // as possible upon receipt. The ACK can remain logically queued
-            // until an in-progress DATA frame or header block has finished.
-            // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.3
-            let is_initial = self.mark_remote_initial_settings_as_received();
-            streams.apply_remote_settings(&frame, is_initial)?;
-
-            if let Some(val) = frame.header_table_size() {
-                codec.set_send_header_table_size(val as usize);
-            }
-
-            if let Some(val) = frame.max_frame_size() {
-                codec.set_max_send_frame_size(val as usize);
-            }
-
-            self.pending_remote_acks = self
-                .pending_remote_acks
-                .checked_add(1)
-                .ok_or_else(|| Error::library_go_away(Reason::ENHANCE_YOUR_CALM))?;
             Ok(())
         }
     }
@@ -169,16 +147,6 @@ impl Settings {
         }
 
         self.remote = None;
-
-        while self.pending_remote_acks > 0 {
-            if !dst.poll_ready(cx)?.is_ready() {
-                return Poll::Pending;
-            }
-
-            dst.buffer(frame::Settings::ack().into())
-                .map_err(|_| Error::library_go_away(Reason::INTERNAL_ERROR))?;
-            self.pending_remote_acks -= 1;
-        }
 
         match &self.local {
             Local::ToSend(settings) => {

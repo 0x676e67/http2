@@ -76,8 +76,7 @@
 //! pub async fn main() -> Result<(), Box<dyn Error>> {
 //!     // Establish TCP connection to the server.
 //!     let tcp = TcpStream::connect("127.0.0.1:5928").await?;
-//!     let (http2, connection) = client::handshake(tcp).await?;
-//!     let mut http2 = http2.ready().await?;
+//!     let (mut http2, connection) = client::handshake(tcp).await?;
 //!     // Prepare the HTTP request to send to the server.
 //!     let request = Request::builder()
 //!                     .method(Method::GET)
@@ -1541,7 +1540,6 @@ where
     type Output = Result<(), crate::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        ready!(self.inner.advance_client_initial_send(cx)).map_err(crate::Error::from)?;
         self.inner.maybe_close_connection_if_no_streams();
         let had_streams_or_refs = self.inner.has_streams_or_other_references();
         let result = self.inner.poll(cx).map_err(Into::into);

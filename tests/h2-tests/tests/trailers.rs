@@ -7,12 +7,12 @@ async fn recv_trailers_only() {
 
     let mock = mock_io::Builder::new()
         .handshake()
+        .write(frames::SETTINGS_ACK)
         // Write GET /
         .write(&[
             0, 0, 0x10, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
             0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84,
         ])
-        .write(frames::SETTINGS_ACK)
         // Read response
         .read(&[
             0, 0, 1, 1, 4, 0, 0, 0, 1, 0x88, 0, 0, 9, 1, 5, 0, 0, 0, 1, 0x40, 0x84, 0x42, 0x46,
@@ -57,13 +57,13 @@ async fn send_trailers_immediately() {
 
     let mock = mock_io::Builder::new()
         .handshake()
+        .write(frames::SETTINGS_ACK)
         // Write GET /
         .write(&[
             0, 0, 0x10, 1, 4, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
             0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84, 0, 0, 0x0A, 1, 5, 0, 0, 0, 1, 0x40, 0x83,
             0xF6, 0x7A, 0x66, 0x84, 0x9C, 0xB4, 0x50, 0x7F,
         ])
-        .write(frames::SETTINGS_ACK)
         // Read response
         .read(&[
             0, 0, 1, 1, 4, 0, 0, 0, 1, 0x88, 0, 0, 0x0B, 0, 1, 0, 0, 0, 1, 0x68, 0x65, 0x6C, 0x6C,

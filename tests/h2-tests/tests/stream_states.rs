@@ -16,12 +16,12 @@ async fn send_recv_headers_only() {
 
     let mock = mock_io::Builder::new()
         .handshake()
+        .write(frames::SETTINGS_ACK)
         // Write GET /
         .write(&[
             0, 0, 0x10, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
             0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84,
         ])
-        .write(frames::SETTINGS_ACK)
         // Read response
         .read(&[0, 0, 1, 1, 5, 0, 0, 0, 1, 0x89])
         .build();
@@ -49,12 +49,12 @@ async fn send_recv_data() {
 
     let mock = mock_io::Builder::new()
         .handshake()
+        .write(frames::SETTINGS_ACK)
         .write(&[
             // POST /
             0, 0, 16, 1, 4, 0, 0, 0, 1, 131, 135, 65, 139, 157, 41, 172, 75, 143, 168, 233, 25, 151,
             33, 233, 132,
         ])
-        .write(frames::SETTINGS_ACK)
         .write(&[
             // DATA
             0, 0, 5, 0, 1, 0, 0, 0, 1, 104, 101, 108, 108, 111,
@@ -111,12 +111,12 @@ async fn send_headers_recv_data_single_frame() {
 
     let mock = mock_io::Builder::new()
         .handshake()
+        .write(frames::SETTINGS_ACK)
         // Write GET /
         .write(&[
             0, 0, 16, 1, 5, 0, 0, 0, 1, 130, 135, 65, 139, 157, 41, 172, 75, 143, 168, 233, 25,
             151, 33, 233, 132,
         ])
-        .write(frames::SETTINGS_ACK)
         // Read response
         .read(&[
             0, 0, 1, 1, 4, 0, 0, 0, 1, 136, 0, 0, 5, 0, 0, 0, 0, 0, 1, 104, 101, 108, 108, 111, 0,
