@@ -103,6 +103,16 @@ where
         }
     }
 
+    pub(super) fn buffer_client_magic(&mut self, client_magic: &[u8]) {
+        debug_assert!(
+            self.encoder.buf.position() == 0
+                && self.encoder.buf.get_ref().is_empty()
+                && self.encoder.next.is_none(),
+            "client magic must be buffered before any frame bytes"
+        );
+        self.encoder.buf.get_mut().extend_from_slice(client_magic);
+    }
+
     /// Returns `Ready` when `send` is able to accept a frame
     ///
     /// Calling this function may result in the current contents of the buffer
@@ -134,9 +144,15 @@ where
         self.encoder.buffer(item)
     }
 
-    /// Flush buffered data to the wire
-    pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        let _span = tracing::trace_span!("FramedWrite::flush");
+    /// Writes all encoded bytes without flushing the upstream writer.
+    ///
+    /// This lets the client connection driver finish its connection-level
+    /// initial write before it starts draining the stream frame queue. The
+    /// regular flush still happens after all currently ready write items have
+    /// been processed.
+    pub(crate) fn poll_write_buffered(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::trace_span!("FramedWrite::poll_write_buffered");
 
         loop {
             while !self.encoder.is_empty() {
@@ -167,6 +183,15 @@ where
                 ControlFlow::Break => break,
             }
         }
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Flush buffered data to the wire
+    pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        let _span = tracing::trace_span!("FramedWrite::flush");
+
+        ready!(self.poll_write_buffered(cx))?;
 
         tracing::trace!("flushing buffer");
         // Flush the upstream

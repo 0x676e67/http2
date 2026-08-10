@@ -11,11 +11,12 @@ use futures::{ready, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use super::assert::assert_frame_eq;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
-use std::{cmp, io, usize};
+use std::{cmp, io};
 
 /// A mock I/O
 #[derive(Debug)]
@@ -26,6 +27,7 @@ pub struct Mock {
 #[derive(Debug)]
 pub struct Handle {
     codec: crate::Codec<Pipe>,
+    pending_frames: VecDeque<Frame>,
 }
 
 #[derive(Debug)]
@@ -88,6 +90,7 @@ pub fn new_with_write_capacity(cap: usize) -> (Mock, Handle) {
 
     let handle = Handle {
         codec: h2::Codec::new(Pipe { inner }),
+        pending_frames: VecDeque::new(),
     };
 
     (mock, handle)
@@ -206,11 +209,14 @@ impl Handle {
             }
         };
 
-        let frame = self.next().await.unwrap().unwrap();
-        let f = assert_settings!(frame);
+        loop {
+            let frame = self.codec.next().await.unwrap().unwrap();
 
-        // Is ACK
-        assert!(f.is_ack());
+            match frame {
+                Frame::Settings(settings) if settings.is_ack() => break,
+                frame => self.pending_frames.push_back(frame),
+            }
+        }
 
         settings
     }
@@ -256,9 +262,14 @@ impl Handle {
 
     pub async fn buffer_bytes(&mut self, num: usize) {
         // Set tx_rem to num
-        {
+        let write_task = {
             let mut i = self.codec.get_mut().inner.lock().unwrap();
             i.tx_rem = num;
+            i.tx_rem_task.take()
+        };
+
+        if let Some(task) = write_task {
+            task.wake();
         }
 
         poll_fn(move |cx| {
@@ -291,6 +302,10 @@ impl Stream for Handle {
     type Item = Result<Frame, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(frame) = self.pending_frames.pop_front() {
+            return Poll::Ready(Some(Ok(frame)));
+        }
+
         Pin::new(&mut self.codec).poll_next(cx)
     }
 }

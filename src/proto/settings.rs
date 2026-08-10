@@ -31,8 +31,8 @@ enum Local {
 impl Settings {
     pub(crate) fn new(local: frame::Settings) -> Self {
         Settings {
-            // We assume the initial local SETTINGS were flushed during
-            // the handshake process.
+            // The initial local SETTINGS are already buffered in the codec and
+            // are written by the connection's initial send path.
             local: Local::WaitingAck(local),
             remote: None,
             has_received_remote_initial_settings: false,

@@ -91,6 +91,15 @@ pub(crate) struct Config {
 
 #[derive(Debug)]
 enum State {
+    /// The client connection-level write has not been prepared yet.
+    ClientInitialSend,
+
+    /// The client connection-level bytes are currently being written.
+    ///
+    /// Request frames remain in the stream scheduler until this item is
+    /// complete, so HEADERS are passed to the transport by a later write call.
+    ClientInitialWrite,
+
     /// Currently open in a sane state
     Open,
 
@@ -137,10 +146,16 @@ where
         let span = ::tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         #[cfg(feature = "tracing")]
         span.follows_from(::tracing::Span::current());
+        let state = if P::r#dyn().is_server() {
+            State::Open
+        } else {
+            State::ClientInitialSend
+        };
+
         Connection {
             codec,
             inner: ConnectionInner {
-                state: State::Open,
+                state,
                 error: None,
                 go_away: GoAway::new(),
                 ping_pong: PingPong::new(),
@@ -248,8 +263,12 @@ where
     /// iff there are no streams or references
     pub fn maybe_close_connection_if_no_streams(&mut self) {
         // If we poll() and realize that there are no streams or references
-        // then we can close the connection by transitioning to GOAWAY
-        if !self.inner.streams.has_streams_or_other_references() {
+        // then we can close the connection by transitioning to GOAWAY. The
+        // client initial state performs this check once its connection item
+        // has been written.
+        if matches!(self.inner.state, State::Open)
+            && !self.inner.streams.has_streams_or_other_references()
+        {
             self.inner.as_dyn().go_away_now(Reason::NO_ERROR);
         }
     }
@@ -270,6 +289,53 @@ where
         self.inner.ping_pong.take_user_pings()
     }
 
+    /// Writes the client connection-level item before draining request frames.
+    ///
+    /// This method is called only by `Connection::poll`. Like the upstream
+    /// handshake write, it waits for write progress instead of introducing a
+    /// separate receive loop while the connection-level item is pending.
+    fn advance_client_initial_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        if matches!(&self.inner.state, State::ClientInitialSend) {
+            if let Err(err) = self
+                .inner
+                .streams
+                .buffer_client_initial_window_update(&mut self.codec)
+            {
+                return Poll::Ready(self.inner.as_dyn().handle_poll2_result(Err(err.into())));
+            }
+
+            self.inner.state = State::ClientInitialWrite;
+            tracing::debug!(
+                "client connection preface, settings, and optional window update ready"
+            );
+        } else if !matches!(&self.inner.state, State::ClientInitialWrite) {
+            return Poll::Ready(Ok(()));
+        }
+
+        #[cfg(feature = "tracing")]
+        let _span1 = self.inner.span.clone().entered();
+        #[cfg(feature = "tracing")]
+        let _span2 = tracing::trace_span!("advance_client_initial_send");
+
+        match self.codec.poll_write_buffered(cx) {
+            Poll::Ready(Ok(())) => {
+                tracing::debug!(
+                    "client initial connection write complete; entering normal polling"
+                );
+                self.inner.state = State::Open;
+                self.maybe_close_connection_if_no_streams();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => {
+                Poll::Ready(self.inner.as_dyn().handle_poll2_result(Err(err.into())))
+            }
+            Poll::Pending => {
+                tracing::debug!("client initial connection write blocked");
+                Poll::Pending
+            }
+        }
+    }
+
     /// Advances the internal state of the connection.
     pub fn poll(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         // XXX(eliza): cloning the span is unfortunately necessary here in
@@ -284,6 +350,10 @@ where
             tracing::trace!(connection.state = ?self.inner.state);
             // TODO: probably clean up this glob of code
             match self.inner.state {
+                State::ClientInitialSend | State::ClientInitialWrite => {
+                    ready!(self.advance_client_initial_send(cx))?;
+                    continue;
+                }
                 // When open, continue to poll a frame
                 State::Open => {
                     let result = match self.poll2(cx) {

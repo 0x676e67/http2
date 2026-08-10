@@ -56,6 +56,15 @@ where
 
         Codec { inner }
     }
+
+    /// Buffers the fixed 24-byte client magic before the first encoded frame.
+    ///
+    /// The initial SETTINGS frame that follows completes the client connection
+    /// preface described in RFC 9113 section 3.4.
+    /// https://www.rfc-editor.org/rfc/rfc9113.html#section-3.4
+    pub(crate) fn buffer_client_magic(&mut self, client_magic: &[u8]) {
+        self.inner.get_mut().buffer_client_magic(client_magic);
+    }
 }
 
 impl<T, B> Codec<T, B> {
@@ -150,6 +159,11 @@ where
     /// TODO: Rename this to avoid conflicts with Sink::buffer
     pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
         self.framed_write().buffer(item)
+    }
+
+    /// Writes encoded bytes without flushing the upstream writer.
+    pub(crate) fn poll_write_buffered(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().poll_write_buffered(cx)
     }
 
     /// Flush buffered data to the wire

@@ -293,15 +293,15 @@ async fn single_stream_send_extra_large_body_multi_frames_multi_buffer() {
         // .handshake()
         .write(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
         .write(frames::SETTINGS)
-        .read(frames::SETTINGS)
-        // Add wait to force the data writes to chill
-        .wait(Duration::from_millis(10))
-        // Rest
         .write(&[
             // POST /
             0, 0, 16, 1, 4, 0, 0, 0, 1, 131, 135, 65, 139, 157, 41, 172, 75, 143, 168, 233, 25, 151,
             33, 233, 132,
         ])
+        .read(frames::SETTINGS)
+        // Add wait to force the data writes to chill
+        .wait(Duration::from_millis(10))
+        // Rest
         .write(frames::SETTINGS_ACK)
         .read(frames::SETTINGS_ACK)
         .write(&[
@@ -473,12 +473,15 @@ async fn stream_count_over_max_stream_limit_does_not_starve_capacity() {
 
     let client = async move {
         let (mut client, mut conn) = client::Builder::new()
+            .initial_max_send_streams(1)
             .handshake::<_, Bytes>(io)
             .await
             .expect("handshake");
 
+        let mut client2 = client.clone();
+        let mut queued_clients: Vec<_> = (0..5).map(|_| client.clone()).collect();
         let (req1, mut send1) = client.send_request(request(), false).unwrap();
-        let (req2, mut send2) = client.send_request(request(), false).unwrap();
+        let (req2, mut send2) = client2.send_request(request(), false).unwrap();
 
         // Use up the connection window.
         send1.send_data(vec![0; 65535].into(), true).unwrap();
@@ -486,7 +489,7 @@ async fn stream_count_over_max_stream_limit_does_not_starve_capacity() {
         send2.send_data(vec![0; 65535].into(), true).unwrap();
 
         // Queue up more pending open streams
-        for _ in 0..5 {
+        for client in &mut queued_clients {
             let (_, mut send) = client.send_request(request(), false).unwrap();
             send.send_data(vec![0; 65535].into(), true).unwrap();
         }

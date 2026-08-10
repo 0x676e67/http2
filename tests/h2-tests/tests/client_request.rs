@@ -65,12 +65,12 @@ async fn recv_invalid_server_stream_id() {
 
     let mock = mock_io::Builder::new()
         .handshake()
+        .write(SETTINGS_ACK)
         // Write GET /
         .write(&[
             0, 0, 0x10, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
             0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84,
         ])
-        .write(SETTINGS_ACK)
         // Read response
         .read(&[0, 0, 1, 1, 5, 0, 0, 0, 2, 137])
         // Write GO_AWAY
@@ -102,7 +102,7 @@ async fn request_stream_id_overflows() {
 
     let h2 = async move {
         let (mut client, mut h2) = client::Builder::new()
-            .initial_stream_id(::std::u32::MAX >> 1)
+            .initial_stream_id(u32::MAX >> 1)
             .handshake::<_, Bytes>(io)
             .await
             .unwrap();
@@ -135,12 +135,12 @@ async fn request_stream_id_overflows() {
         let settings = srv.assert_client_handshake().await;
         assert_default_settings!(settings);
         srv.recv_frame(
-            frames::headers(::std::u32::MAX >> 1)
+            frames::headers(u32::MAX >> 1)
                 .request("GET", "https://example.com/")
                 .eos(),
         )
         .await;
-        srv.send_frame(frames::headers(::std::u32::MAX >> 1).response(200).eos())
+        srv.send_frame(frames::headers(u32::MAX >> 1).response(200).eos())
             .await;
         idle_ms(10).await;
     };
@@ -1577,7 +1577,9 @@ async fn invalid_connect_protocol_enabled_setting() {
     };
 
     let h2 = async move {
-        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let mut builder = client::Builder::new();
+        builder.initial_max_send_streams(0);
+        let (mut client, mut h2) = builder.handshake::<_, Bytes>(io).await.unwrap();
 
         // we send a simple req here just to drive the connection so we can
         // receive the server settings.
