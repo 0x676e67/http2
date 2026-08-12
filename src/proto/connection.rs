@@ -92,14 +92,26 @@ pub(crate) struct Config {
 
 #[derive(Debug)]
 enum State {
-    /// The client connection-level write has not been prepared yet.
-    ClientInitialSend(Option<IntoIter<Priority>>),
+    /// The client connection item still needs its optional WINDOW_UPDATE and
+    /// configured PRIORITY frames.
+    ClientInitialSend {
+        /// Configured PRIORITY frames to encode after the optional connection
+        /// WINDOW_UPDATE. RFC 9113 deprecates this signal but retains its frame
+        /// definition for RFC 7540 interoperability; see sections 5.3.2 and 6.3:
+        /// https://www.rfc-editor.org/rfc/rfc9113.html#section-5.3.2
+        /// https://www.rfc-editor.org/rfc/rfc9113.html#section-6.3
+        pending_priorities: Option<IntoIter<Priority>>,
+    },
 
-    /// The client connection-level bytes are currently being written.
+    /// The client connection item is being encoded or written.
     ///
-    /// Request frames remain in the stream scheduler until this item is
-    /// complete, so HEADERS are passed to the transport by a later write call.
-    ClientInitialWrite(Option<IntoIter<Priority>>),
+    /// Request frames remain queued until this item is fully written. The codec
+    /// can still contain unwritten bytes after `pending_priorities` becomes
+    /// `None`.
+    ClientInitialWrite {
+        /// PRIORITY frames not yet encoded into the connection item.
+        pending_priorities: Option<IntoIter<Priority>>,
+    },
 
     /// Currently open in a sane state
     Open,
@@ -144,12 +156,12 @@ where
         let state = if P::r#dyn().is_server() {
             State::Open
         } else {
-            let priorities = config
+            let pending_priorities = config
                 .priorities
                 .take()
                 .filter(|priorities| !priorities.max_stream_id().is_zero())
                 .map(IntoIterator::into_iter);
-            State::ClientInitialSend(priorities)
+            State::ClientInitialSend { pending_priorities }
         };
         let streams = Streams::new(streams_config(&config));
         #[cfg(feature = "tracing")]
@@ -300,7 +312,7 @@ where
     /// handshake write, it waits for write progress instead of introducing a
     /// separate receive loop while the connection-level item is pending.
     fn advance_client_initial_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        if matches!(&self.inner.state, State::ClientInitialSend(_)) {
+        if matches!(&self.inner.state, State::ClientInitialSend { .. }) {
             if let Err(err) = self
                 .inner
                 .streams
@@ -309,15 +321,15 @@ where
                 return Poll::Ready(self.inner.as_dyn().handle_poll2_result(Err(err.into())));
             }
 
-            let priorities = match &mut self.inner.state {
-                State::ClientInitialSend(priorities) => priorities.take(),
+            let pending_priorities = match &mut self.inner.state {
+                State::ClientInitialSend { pending_priorities } => pending_priorities.take(),
                 _ => None,
             };
-            self.inner.state = State::ClientInitialWrite(priorities);
+            self.inner.state = State::ClientInitialWrite { pending_priorities };
             tracing::debug!(
                 "client connection preface, settings, and optional window update ready"
             );
-        } else if !matches!(&self.inner.state, State::ClientInitialWrite(_)) {
+        } else if !matches!(&self.inner.state, State::ClientInitialWrite { .. }) {
             return Poll::Ready(Ok(()));
         }
 
@@ -338,10 +350,10 @@ where
             }
 
             let priority = match &mut self.inner.state {
-                State::ClientInitialWrite(priorities) => {
-                    let priority = priorities.as_mut().and_then(Iterator::next);
+                State::ClientInitialWrite { pending_priorities } => {
+                    let priority = pending_priorities.as_mut().and_then(Iterator::next);
                     if priority.is_none() {
-                        *priorities = None;
+                        *pending_priorities = None;
                     }
                     priority
                 }
@@ -400,7 +412,7 @@ where
             tracing::trace!(connection.state = ?self.inner.state);
             // TODO: probably clean up this glob of code
             match self.inner.state {
-                State::ClientInitialSend(_) | State::ClientInitialWrite(_) => {
+                State::ClientInitialSend { .. } | State::ClientInitialWrite { .. } => {
                     ready!(self.advance_client_initial_send(cx))?;
                     continue;
                 }
