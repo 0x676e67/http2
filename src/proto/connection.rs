@@ -1,5 +1,5 @@
 use crate::codec::UserError;
-use crate::frame::{Priorities, PseudoOrder, Reason, StreamDependency, StreamId};
+use crate::frame::{Priorities, Priority, PseudoOrder, Reason, StreamDependency, StreamId};
 use crate::{client, server, tracing};
 
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
@@ -12,6 +12,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
+use std::vec::IntoIter;
 use tokio::io::AsyncRead;
 
 /// An H2 connection
@@ -92,13 +93,13 @@ pub(crate) struct Config {
 #[derive(Debug)]
 enum State {
     /// The client connection-level write has not been prepared yet.
-    ClientInitialSend,
+    ClientInitialSend(Option<IntoIter<Priority>>),
 
     /// The client connection-level bytes are currently being written.
     ///
     /// Request frames remain in the stream scheduler until this item is
     /// complete, so HEADERS are passed to the transport by a later write call.
-    ClientInitialWrite,
+    ClientInitialWrite(Option<IntoIter<Priority>>),
 
     /// Currently open in a sane state
     Open,
@@ -116,7 +117,7 @@ where
     P: Peer,
     B: Buf,
 {
-    pub fn new(codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
+    pub fn new(codec: Codec<T, Prioritized<B>>, mut config: Config) -> Connection<T, P, B> {
         fn streams_config(config: &Config) -> streams::Config {
             streams::Config {
                 initial_max_send_streams: config.initial_max_send_streams,
@@ -138,9 +139,13 @@ where
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
                 headers_stream_dependency: config.headers_stream_dependency,
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
-                priorities: config.priorities.clone(),
             }
         }
+        let priorities = config
+            .priorities
+            .take()
+            .filter(|priorities| !priorities.max_stream_id().is_zero());
+        let initial_priorities = priorities.map(IntoIterator::into_iter);
         let streams = Streams::new(streams_config(&config));
         #[cfg(feature = "tracing")]
         let span = ::tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
@@ -149,7 +154,7 @@ where
         let state = if P::r#dyn().is_server() {
             State::Open
         } else {
-            State::ClientInitialSend
+            State::ClientInitialSend(initial_priorities)
         };
 
         Connection {
@@ -295,7 +300,7 @@ where
     /// handshake write, it waits for write progress instead of introducing a
     /// separate receive loop while the connection-level item is pending.
     fn advance_client_initial_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        if matches!(&self.inner.state, State::ClientInitialSend) {
+        if matches!(&self.inner.state, State::ClientInitialSend(_)) {
             if let Err(err) = self
                 .inner
                 .streams
@@ -304,12 +309,58 @@ where
                 return Poll::Ready(self.inner.as_dyn().handle_poll2_result(Err(err.into())));
             }
 
-            self.inner.state = State::ClientInitialWrite;
+            let priorities = match &mut self.inner.state {
+                State::ClientInitialSend(priorities) => priorities.take(),
+                _ => None,
+            };
+            self.inner.state = State::ClientInitialWrite(priorities);
             tracing::debug!(
                 "client connection preface, settings, and optional window update ready"
             );
-        } else if !matches!(&self.inner.state, State::ClientInitialWrite) {
+        } else if !matches!(&self.inner.state, State::ClientInitialWrite(_)) {
             return Poll::Ready(Ok(()));
+        }
+
+        // Firefox's legacy dependency mode appends its idle PRIORITY nodes to
+        // the connection output after the optional WINDOW_UPDATE and flushes
+        // the combined item once. Drain the configured nodes here so they
+        // never become part of a request stream queue.
+        loop {
+            if !self.codec.has_send_capacity() {
+                match self.codec.poll_write_buffered(cx) {
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(err)) => {
+                        return Poll::Ready(
+                            self.inner.as_dyn().handle_poll2_result(Err(err.into())),
+                        );
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            let priority = match &mut self.inner.state {
+                State::ClientInitialWrite(priorities) => {
+                    let priority = priorities.as_mut().and_then(Iterator::next);
+                    if priority.is_none() {
+                        *priorities = None;
+                    }
+                    priority
+                }
+                _ => None,
+            };
+
+            match priority {
+                Some(priority) => {
+                    tracing::trace!(?priority, "buffering client initial PRIORITY");
+                    if let Err(err) = self.codec.buffer(priority.into()) {
+                        let err = io::Error::new(io::ErrorKind::InvalidInput, err);
+                        return Poll::Ready(
+                            self.inner.as_dyn().handle_poll2_result(Err(err.into())),
+                        );
+                    }
+                }
+                None => break,
+            }
         }
 
         #[cfg(feature = "tracing")]
@@ -350,7 +401,7 @@ where
             tracing::trace!(connection.state = ?self.inner.state);
             // TODO: probably clean up this glob of code
             match self.inner.state {
-                State::ClientInitialSend | State::ClientInitialWrite => {
+                State::ClientInitialSend(_) | State::ClientInitialWrite(_) => {
                     ready!(self.advance_client_initial_send(cx))?;
                     continue;
                 }

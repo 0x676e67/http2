@@ -26,7 +26,7 @@ use self::state::State;
 use self::store::Store;
 use self::stream::Stream;
 
-use crate::frame::{Priorities, PseudoOrder, StreamDependency, StreamId, StreamIdOverflow};
+use crate::frame::{PseudoOrder, StreamDependency, StreamId, StreamIdOverflow};
 use crate::proto::*;
 
 use bytes::Bytes;
@@ -85,9 +85,6 @@ pub struct Config {
 
     /// Pseudo order of the headers stream
     pub headers_pseudo_order: Option<PseudoOrder>,
-
-    /// Priorities stream
-    pub priorities: Option<Priorities>,
 }
 
 trait DebugStructExt<'a, 'b> {

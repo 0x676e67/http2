@@ -1240,15 +1240,17 @@ async fn reset_new_stream_before_send() {
         )
         .await;
         srv.send_frame(frames::headers(1).response(200).eos()).await;
-        // Send unexpected headers, that depends on itself, causing a framing error.
+        // Self-dependency is accepted under RFC 9113. The duplicate :status
+        // still makes this response malformed after the field block is decoded.
         srv.send_bytes(&[
-            0, 0, 0x6,  // len
+            0, 0, 0x7,  // len
             0x1,  // type (headers)
             0x25, // flags (eos, eoh, pri)
             0, 0, 0, 0x3, // stream id
             0, 0, 0, 0x3,  // dependency
             2,    // weight
             0x88, // HPACK :status=200
+            0x88, // duplicate :status=200
         ])
         .await;
         srv.recv_frame(frames::reset(3).protocol_error()).await;

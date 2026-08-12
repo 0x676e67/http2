@@ -151,12 +151,11 @@ fn decode_frame(
             // Parse the header frame w/o parsing the payload
             let (mut frame, mut payload) = match frame::$frame::load($head, $bytes) {
                 Ok(res) => res,
-                Err(frame::Error::InvalidDependencyId) => {
-                    proto_err!(stream: "invalid HEADERS dependency ID");
-                    // A stream cannot depend on itself. An endpoint MUST
-                    // treat this as a stream error (Section 5.4.2) of type
-                    // `PROTOCOL_ERROR`.
-                    return Err(Error::library_reset($head.stream_id(), Reason::PROTOCOL_ERROR));
+                Err(frame::Error::InvalidPayloadLength) => {
+                    // RFC 9113 section 4.2 requires FRAME_SIZE_ERROR when a
+                    // field-carrying frame is too small for mandatory data.
+                    proto_err!(conn: "header frame is missing mandatory fields");
+                    return Err(Error::library_go_away(Reason::FRAME_SIZE_ERROR));
                 },
                 Err(_e) => {
                     proto_err!(conn: "failed to load frame; err={:?}", _e);
@@ -270,13 +269,14 @@ fn decode_frame(
 
             match frame::Priority::load(head, &bytes[frame::HEADER_LEN..]) {
                 Ok(frame) => frame.into(),
-                Err(frame::Error::InvalidDependencyId) => {
-                    // A stream cannot depend on itself. An endpoint MUST
-                    // treat this as a stream error (Section 5.4.2) of type
-                    // `PROTOCOL_ERROR`.
+                Err(frame::Error::InvalidPayloadLength) => {
+                    // RFC 9113 section 6.3 defines this as a stream error.
+                    // The connection layer promotes it only when the target
+                    // stream cannot safely carry RST_STREAM (for example, an
+                    // idle stream).
                     let id = head.stream_id();
-                    proto_err!(stream: "PRIORITY invalid dependency ID; stream={:?}", id);
-                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
+                    proto_err!(stream: "PRIORITY frame payload length is not 5; stream={:?}", id);
+                    return Err(Error::library_reset(id, Reason::FRAME_SIZE_ERROR));
                 }
                 Err(_e) => {
                     proto_err!(conn: "failed to load PRIORITY frame; err={:?};", _e);

@@ -9,7 +9,7 @@ use http::{HeaderMap, Request, Response};
 use tokio::io::AsyncWrite;
 
 use super::{
-    frame::{Priorities, PseudoOrder, StreamDependency},
+    frame::{PseudoOrder, StreamDependency},
     recv::RecvHeaderBlockError,
     store::{self, Entry, Resolve, Store},
     sync::Mutex,
@@ -94,9 +94,6 @@ struct Inner {
 
     /// Pseudo order of the headers stream
     headers_pseudo_order: Option<PseudoOrder>,
-
-    /// Priority of the headers stream
-    priorities: Option<Priorities>,
 }
 
 #[derive(Debug)]
@@ -358,18 +355,6 @@ where
             stream.content_length = ContentLength::Head;
         }
 
-        // Priorities frame check before sending the request.
-        if let Some(priorities) = &me.priorities {
-            let next_id = priorities
-                .max_stream_id()
-                .next_id()
-                .map_err(|_| SendError::User(UserError::OverflowedStreamId))?;
-
-            if next_id > stream_id {
-                return Err(SendError::User(UserError::OverflowedStreamId));
-            }
-        }
-
         // Convert the message
         let headers = client::Peer::convert_send_message(
             stream_id,
@@ -382,8 +367,7 @@ where
 
         let mut stream = me.store.insert(stream.id, stream);
 
-        let sent = me.actions.send.send_priority_and_headers(
-            me.priorities.clone(),
+        let sent = me.actions.send.send_headers(
             headers,
             send_buffer,
             &mut stream,
@@ -521,7 +505,6 @@ impl Inner {
             refs: 1,
             headers_stream_dependency: config.headers_stream_dependency,
             headers_pseudo_order: config.headers_pseudo_order,
-            priorities: config.priorities,
         }))
     }
 
@@ -1072,6 +1055,18 @@ impl Inner {
         let key = match self.store.find_entry(id) {
             Entry::Occupied(e) => e.key(),
             Entry::Vacant(e) => {
+                // PRIORITY is permitted on idle and closed streams. RFC 9113
+                // section 6.4 forbids RST_STREAM on idle streams, while
+                // section 5.1 generally permits only PRIORITY on closed
+                // streams. Promote the stream error when it cannot be reported
+                // with RST_STREAM.
+                if reason == Reason::FRAME_SIZE_ERROR {
+                    return Err(crate::proto::error::GoAway {
+                        debug_data: Bytes::new(),
+                        reason,
+                    });
+                }
+
                 // Resetting a stream we don't know about? That could be OK...
                 //
                 // 1. As a server, we just received a request, but that request was bad, so we're
@@ -1099,6 +1094,18 @@ impl Inner {
         };
 
         let stream = self.store.resolve(key);
+        // A pending-open stream has passed the local state transition, but its
+        // HEADERS has not reached the wire and the peer still sees it as idle.
+        // A retained closed stream likewise cannot carry a new RST_STREAM.
+        if reason == Reason::FRAME_SIZE_ERROR
+            && (stream.is_pending_open || stream.state.is_idle() || stream.state.is_closed())
+        {
+            return Err(crate::proto::error::GoAway {
+                debug_data: Bytes::new(),
+                reason,
+            });
+        }
+
         let mut send_buffer = send_buffer.inner.lock();
         let send_buffer = &mut *send_buffer;
         self.actions.send_reset(

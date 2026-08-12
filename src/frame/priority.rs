@@ -5,10 +5,10 @@ use crate::tracing;
 use bytes::BufMut;
 use smallvec::SmallVec;
 
-/// The PRIORITY frame (type=0x2) specifies the sender-advised priority
-/// of a stream [Section 5.3].  It can be sent in any stream state,
-/// including idle or closed streams.
-/// [Section 5.3]: <https://tools.ietf.org/html/rfc7540#section-5.3>
+/// The deprecated PRIORITY frame (type=0x2) carries a priority signal for a
+/// stream. It can be sent in any stream state, including idle or closed.
+///
+/// See [RFC 9113 section 6.3](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.3).
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Priority {
     /// The stream ID of the stream that this priority frame is for
@@ -59,11 +59,11 @@ impl Priority {
     pub fn load(head: Head, payload: &[u8]) -> Result<Self, Error> {
         tracing::trace!("loading priority frame; stream_id={:?}", head.stream_id());
 
-        let dependency = StreamDependency::load(payload)?;
-
-        if dependency.dependency_id() == head.stream_id() {
-            return Err(Error::InvalidDependencyId);
+        if head.stream_id().is_zero() {
+            return Err(Error::InvalidStreamId);
         }
+
+        let dependency = StreamDependency::load(payload)?;
 
         Ok(Priority {
             stream_id: head.stream_id(),
@@ -202,6 +202,14 @@ impl PrioritiesBuilder {
             return self;
         }
 
+        if priority.stream_id == priority.dependency.dependency_id() {
+            tracing::warn!(
+                "ignoring self-dependent priority for stream_id={:?}",
+                priority.stream_id
+            );
+            return self;
+        }
+
         const MAX_BITMAP_STREAMS: u32 = 32;
 
         let id: u32 = priority.stream_id.into();
@@ -272,8 +280,9 @@ mod tests {
         let priority = Priority::new(StreamId::from(3), dependency);
         let mut priority_buf = Vec::new();
         priority.encode(&mut priority_buf);
+        assert_eq!(priority_buf[4], 0, "PRIORITY flags must be unset");
         let priority = Priority::load(
-            frame::Head::new(frame::Kind::Priority, 0, priority.stream_id),
+            frame::Head::new(frame::Kind::Priority, 0xff, priority.stream_id),
             &priority_buf[frame::HEADER_LEN..],
         )
         .unwrap();
@@ -281,6 +290,29 @@ mod tests {
         assert_eq!(priority.dependency.dependency_id, StreamId::zero());
         assert_eq!(priority.dependency.weight, 201);
         assert!(!priority.dependency.is_exclusive);
+
+        let self_dependent = Priority::load(
+            frame::Head::new(frame::Kind::Priority, 0, StreamId::from(3)),
+            &[0, 0, 0, 3, 15],
+        )
+        .expect("RFC 9113 deprecates dependency semantics");
+        assert_eq!(
+            self_dependent.dependency.dependency_id(),
+            self_dependent.stream_id
+        );
+    }
+
+    #[test]
+    fn test_priority_frame_rejects_stream_id_zero() {
+        use crate::frame::{self, Priority, StreamId};
+
+        assert_eq!(
+            Priority::load(
+                frame::Head::new(frame::Kind::Priority, 0, StreamId::zero()),
+                &[0; 5],
+            ),
+            Err(frame::Error::InvalidStreamId)
+        );
     }
 
     #[test]
@@ -316,14 +348,28 @@ mod tests {
         assert_eq!(priorities.priorities[0].stream_id, StreamId::from(4));
 
         // stream id > 31
-        let dependency3 = StreamDependency::new(StreamId::from(32), 150, false);
+        let dependency3 = StreamDependency::new(StreamId::from(1), 150, false);
         let priority3 = Priority::new(StreamId::from(32), dependency3);
 
-        let dependency4 = StreamDependency::new(StreamId::from(32), 200, false); // Duplicate stream ID
+        let dependency4 = StreamDependency::new(StreamId::from(2), 200, false); // Duplicate stream ID
         let priority4 = Priority::new(StreamId::from(32), dependency4);
 
         let priorities = Priorities::builder().extend([priority3, priority4]).build();
         assert_eq!(priorities.priorities.len(), 1);
         assert_eq!(priorities.priorities[0].stream_id, StreamId::from(32));
+    }
+
+    #[test]
+    fn test_priorities_builder_ignores_self_dependency() {
+        use crate::frame::{Priorities, Priority, StreamDependency, StreamId};
+
+        let priorities = Priorities::builder()
+            .push(Priority::new(
+                StreamId::from(3),
+                StreamDependency::new(StreamId::from(3), 100, false),
+            ))
+            .build();
+
+        assert!(priorities.priorities.is_empty());
     }
 }

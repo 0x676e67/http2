@@ -161,8 +161,8 @@ pub enum Error {
 
     /// An invalid stream identifier was provided.
     ///
-    /// This is returned if a SETTINGS or PING frame is received with a stream
-    /// identifier other than zero.
+    /// This is returned if a connection-level frame uses a nonzero stream ID,
+    /// or if a stream-specific frame such as PRIORITY uses stream ID zero.
     InvalidStreamId,
 
     /// A request or response is malformed.
@@ -171,10 +171,10 @@ pub enum Error {
     /// The decoded header list was too large to continue processing.
     HeaderListWayTooLarge,
 
-    /// An invalid stream dependency ID was provided
+    /// Legacy dependency validation error retained for API compatibility.
     ///
-    /// This is returned if a HEADERS or PRIORITY frame is received with an
-    /// invalid stream identifier.
+    /// RFC 9113 deprecates dependency semantics, so the frame decoder no
+    /// longer emits this error for self-dependent priority fields.
     InvalidDependencyId,
 
     /// Failed to perform HPACK decoding
