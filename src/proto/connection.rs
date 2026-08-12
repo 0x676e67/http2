@@ -141,21 +141,21 @@ where
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
             }
         }
-        let priorities = config
-            .priorities
-            .take()
-            .filter(|priorities| !priorities.max_stream_id().is_zero());
-        let initial_priorities = priorities.map(IntoIterator::into_iter);
+        let state = if P::r#dyn().is_server() {
+            State::Open
+        } else {
+            let priorities = config
+                .priorities
+                .take()
+                .filter(|priorities| !priorities.max_stream_id().is_zero())
+                .map(IntoIterator::into_iter);
+            State::ClientInitialSend(priorities)
+        };
         let streams = Streams::new(streams_config(&config));
         #[cfg(feature = "tracing")]
         let span = ::tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         #[cfg(feature = "tracing")]
         span.follows_from(::tracing::Span::current());
-        let state = if P::r#dyn().is_server() {
-            State::Open
-        } else {
-            State::ClientInitialSend(initial_priorities)
-        };
 
         Connection {
             codec,
@@ -321,10 +321,9 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        // Firefox's legacy dependency mode appends its idle PRIORITY nodes to
-        // the connection output after the optional WINDOW_UPDATE and flushes
-        // the combined item once. Drain the configured nodes here so they
-        // never become part of a request stream queue.
+        // Append configured legacy RFC 7540 PRIORITY nodes after the optional
+        // WINDOW_UPDATE. Keeping them in the connection item sends them once
+        // and prevents them from entering a request stream queue.
         loop {
             if !self.codec.has_send_capacity() {
                 match self.codec.poll_write_buffered(cx) {

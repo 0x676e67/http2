@@ -1055,18 +1055,6 @@ impl Inner {
         let key = match self.store.find_entry(id) {
             Entry::Occupied(e) => e.key(),
             Entry::Vacant(e) => {
-                // PRIORITY is permitted on idle and closed streams. RFC 9113
-                // section 6.4 forbids RST_STREAM on idle streams, while
-                // section 5.1 generally permits only PRIORITY on closed
-                // streams. Promote the stream error when it cannot be reported
-                // with RST_STREAM.
-                if reason == Reason::FRAME_SIZE_ERROR {
-                    return Err(crate::proto::error::GoAway {
-                        debug_data: Bytes::new(),
-                        reason,
-                    });
-                }
-
                 // Resetting a stream we don't know about? That could be OK...
                 //
                 // 1. As a server, we just received a request, but that request was bad, so we're
@@ -1094,18 +1082,6 @@ impl Inner {
         };
 
         let stream = self.store.resolve(key);
-        // A pending-open stream has passed the local state transition, but its
-        // HEADERS has not reached the wire and the peer still sees it as idle.
-        // A retained closed stream likewise cannot carry a new RST_STREAM.
-        if reason == Reason::FRAME_SIZE_ERROR
-            && (stream.is_pending_open || stream.state.is_idle() || stream.state.is_closed())
-        {
-            return Err(crate::proto::error::GoAway {
-                debug_data: Bytes::new(),
-                reason,
-            });
-        }
-
         let mut send_buffer = send_buffer.inner.lock();
         let send_buffer = &mut *send_buffer;
         self.actions.send_reset(

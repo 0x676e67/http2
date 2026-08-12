@@ -1241,6 +1241,9 @@ impl Builder {
     /// stream ID of zero or a dependency on the same stream will be ignored.
     /// PRIORITY does not reserve stream IDs. Profiles that start requests later
     /// can configure `initial_stream_id` when the `unstable` feature is enabled.
+    /// If `no_rfc7540_priorities(true)` is also configured, a conforming server
+    /// ignores these legacy priority signals as required by
+    /// [RFC 9218 section 2.1](https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1).
     pub fn priorities(&mut self, priorities: Priorities) -> &mut Self {
         self.priorities = Some(priorities);
         self

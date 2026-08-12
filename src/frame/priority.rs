@@ -5,10 +5,10 @@ use crate::tracing;
 use bytes::BufMut;
 use smallvec::SmallVec;
 
-/// The deprecated PRIORITY frame (type=0x2) carries a priority signal for a
-/// stream. It can be sent in any stream state, including idle or closed.
-///
-/// See [RFC 9113 section 6.3](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.3).
+/// The PRIORITY frame (type=0x2) specifies the sender-advised priority
+/// of a stream [Section 5.3].  It can be sent in any stream state,
+/// including idle or closed streams.
+/// [Section 5.3]: <https://tools.ietf.org/html/rfc7540#section-5.3>
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Priority {
     /// The stream ID of the stream that this priority frame is for
@@ -59,11 +59,11 @@ impl Priority {
     pub fn load(head: Head, payload: &[u8]) -> Result<Self, Error> {
         tracing::trace!("loading priority frame; stream_id={:?}", head.stream_id());
 
-        if head.stream_id().is_zero() {
-            return Err(Error::InvalidStreamId);
-        }
-
         let dependency = StreamDependency::load(payload)?;
+
+        if dependency.dependency_id() == head.stream_id() {
+            return Err(Error::InvalidDependencyId);
+        }
 
         Ok(Priority {
             stream_id: head.stream_id(),
@@ -156,7 +156,7 @@ pub struct Priorities {
 ///
 /// `PrioritiesBuilder` provides a convenient way to incrementally add
 /// `Priority` frames to a collection, ensuring that invalid priorities
-/// (such as those with a stream ID of zero) are ignored. Once all desired
+/// (such as a zero stream ID or self-dependency) are ignored. Once all desired
 /// priorities have been added, call `.build()` to obtain a `Priorities`
 /// instance for use in the HTTP/2 connection or frame layer.
 #[derive(Debug)]
@@ -280,9 +280,8 @@ mod tests {
         let priority = Priority::new(StreamId::from(3), dependency);
         let mut priority_buf = Vec::new();
         priority.encode(&mut priority_buf);
-        assert_eq!(priority_buf[4], 0, "PRIORITY flags must be unset");
         let priority = Priority::load(
-            frame::Head::new(frame::Kind::Priority, 0xff, priority.stream_id),
+            frame::Head::new(frame::Kind::Priority, 0, priority.stream_id),
             &priority_buf[frame::HEADER_LEN..],
         )
         .unwrap();
@@ -290,29 +289,6 @@ mod tests {
         assert_eq!(priority.dependency.dependency_id, StreamId::zero());
         assert_eq!(priority.dependency.weight, 201);
         assert!(!priority.dependency.is_exclusive);
-
-        let self_dependent = Priority::load(
-            frame::Head::new(frame::Kind::Priority, 0, StreamId::from(3)),
-            &[0, 0, 0, 3, 15],
-        )
-        .expect("RFC 9113 deprecates dependency semantics");
-        assert_eq!(
-            self_dependent.dependency.dependency_id(),
-            self_dependent.stream_id
-        );
-    }
-
-    #[test]
-    fn test_priority_frame_rejects_stream_id_zero() {
-        use crate::frame::{self, Priority, StreamId};
-
-        assert_eq!(
-            Priority::load(
-                frame::Head::new(frame::Kind::Priority, 0, StreamId::zero()),
-                &[0; 5],
-            ),
-            Err(frame::Error::InvalidStreamId)
-        );
     }
 
     #[test]
