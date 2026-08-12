@@ -9,7 +9,7 @@ use http::{HeaderMap, Request, Response};
 use tokio::io::AsyncWrite;
 
 use super::{
-    frame::{Priorities, PseudoOrder, StreamDependency},
+    frame::{PseudoOrder, StreamDependency},
     recv::RecvHeaderBlockError,
     store::{self, Entry, Resolve, Store},
     sync::Mutex,
@@ -94,9 +94,6 @@ struct Inner {
 
     /// Pseudo order of the headers stream
     headers_pseudo_order: Option<PseudoOrder>,
-
-    /// Priority of the headers stream
-    priorities: Option<Priorities>,
 }
 
 #[derive(Debug)]
@@ -358,18 +355,6 @@ where
             stream.content_length = ContentLength::Head;
         }
 
-        // Priorities frame check before sending the request.
-        if let Some(priorities) = &me.priorities {
-            let next_id = priorities
-                .max_stream_id()
-                .next_id()
-                .map_err(|_| SendError::User(UserError::OverflowedStreamId))?;
-
-            if next_id > stream_id {
-                return Err(SendError::User(UserError::OverflowedStreamId));
-            }
-        }
-
         // Convert the message
         let headers = client::Peer::convert_send_message(
             stream_id,
@@ -382,8 +367,7 @@ where
 
         let mut stream = me.store.insert(stream.id, stream);
 
-        let sent = me.actions.send.send_priority_and_headers(
-            me.priorities.clone(),
+        let sent = me.actions.send.send_headers(
             headers,
             send_buffer,
             &mut stream,
@@ -521,7 +505,6 @@ impl Inner {
             refs: 1,
             headers_stream_dependency: config.headers_stream_dependency,
             headers_pseudo_order: config.headers_pseudo_order,
-            priorities: config.priorities,
         }))
     }
 

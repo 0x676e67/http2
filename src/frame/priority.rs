@@ -156,7 +156,7 @@ pub struct Priorities {
 ///
 /// `PrioritiesBuilder` provides a convenient way to incrementally add
 /// `Priority` frames to a collection, ensuring that invalid priorities
-/// (such as those with a stream ID of zero) are ignored. Once all desired
+/// (such as a zero stream ID or self-dependency) are ignored. Once all desired
 /// priorities have been added, call `.build()` to obtain a `Priorities`
 /// instance for use in the HTTP/2 connection or frame layer.
 #[derive(Debug)]
@@ -199,6 +199,14 @@ impl PrioritiesBuilder {
     pub fn push(mut self, priority: Priority) -> Self {
         if priority.stream_id.is_zero() {
             tracing::warn!("ignoring priority frame with stream ID 0");
+            return self;
+        }
+
+        if priority.stream_id == priority.dependency.dependency_id() {
+            tracing::warn!(
+                "ignoring self-dependent priority for stream_id={:?}",
+                priority.stream_id
+            );
             return self;
         }
 
@@ -316,14 +324,28 @@ mod tests {
         assert_eq!(priorities.priorities[0].stream_id, StreamId::from(4));
 
         // stream id > 31
-        let dependency3 = StreamDependency::new(StreamId::from(32), 150, false);
+        let dependency3 = StreamDependency::new(StreamId::from(1), 150, false);
         let priority3 = Priority::new(StreamId::from(32), dependency3);
 
-        let dependency4 = StreamDependency::new(StreamId::from(32), 200, false); // Duplicate stream ID
+        let dependency4 = StreamDependency::new(StreamId::from(2), 200, false); // Duplicate stream ID
         let priority4 = Priority::new(StreamId::from(32), dependency4);
 
         let priorities = Priorities::builder().extend([priority3, priority4]).build();
         assert_eq!(priorities.priorities.len(), 1);
         assert_eq!(priorities.priorities[0].stream_id, StreamId::from(32));
+    }
+
+    #[test]
+    fn test_priorities_builder_ignores_self_dependency() {
+        use crate::frame::{Priorities, Priority, StreamDependency, StreamId};
+
+        let priorities = Priorities::builder()
+            .push(Priority::new(
+                StreamId::from(3),
+                StreamDependency::new(StreamId::from(3), 100, false),
+            ))
+            .build();
+
+        assert!(priorities.priorities.is_empty());
     }
 }

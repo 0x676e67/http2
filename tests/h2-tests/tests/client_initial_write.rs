@@ -553,12 +553,12 @@ async fn drains_connection_and_request_queues_in_one_poll() {
         if connection_window.is_some() {
             expected_initial.push((8, 0));
         }
+        if with_priority {
+            expected_initial.push((2, 1));
+        }
         assert_eq!(frame_layout(writes[0].1), expected_initial);
 
         let mut expected_requests = Vec::new();
-        if with_priority {
-            expected_requests.push((2, 1));
-        }
         let first_request_id = if with_priority { 3 } else { 1 };
         expected_requests
             .extend((0..request_count).map(|index| (1, first_request_id + 2 * index as u32)));
@@ -579,19 +579,100 @@ async fn drains_connection_and_request_queues_in_one_poll() {
 }
 
 #[tokio::test]
+async fn large_initial_priority_block_drains_before_read_without_flush() {
+    h2_support::trace_init!();
+
+    const PRIORITY_COUNT: u32 = 1_200;
+    let priorities = h2::frame::Priorities::builder()
+        .extend((0..PRIORITY_COUNT).map(|index| {
+            h2::frame::Priority::new(
+                StreamId::from(1 + index * 2),
+                h2::frame::StreamDependency::new(StreamId::zero(), 15, false),
+            )
+        }))
+        .build();
+
+    let (io, calls, _write_blocked, _blocked_waker) =
+        recording_io(WriteMode::Complete, Bytes::new());
+    let mut builder = client::Builder::new();
+    builder
+        .initial_stream_id(PRIORITY_COUNT * 2 + 1)
+        .priorities(priorities);
+
+    let (send_request, mut connection) = builder
+        .handshake::<_, Bytes>(io)
+        .now_or_never()
+        .expect("handshake attempted transport I/O")
+        .unwrap();
+
+    poll_fn(|cx| {
+        assert!(Pin::new(&mut connection).poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+
+    let calls = calls.lock().unwrap();
+    let first_read = calls
+        .iter()
+        .position(|call| matches!(call, IoCall::Read))
+        .expect("connection did not poll the receive side");
+    let initial_writes = calls[..first_read]
+        .iter()
+        .filter_map(|call| match call {
+            IoCall::Write(buf) => Some(buf),
+            IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        initial_writes.len() > 1,
+        "the test did not exceed codec capacity"
+    );
+    assert!(calls[..first_read]
+        .iter()
+        .all(|call| !matches!(call, IoCall::Flush)));
+
+    let wire = initial_writes.iter().fold(Vec::new(), |mut wire, write| {
+        wire.extend_from_slice(write);
+        wire
+    });
+    let frames = wire_frames(&wire);
+    assert_eq!(frames.len(), PRIORITY_COUNT as usize + 1);
+    assert_eq!((frames[0].kind, frames[0].stream_id), (4, 0));
+    assert!(frames[1..]
+        .iter()
+        .enumerate()
+        .all(|(index, frame)| frame.kind == 2
+            && frame.flags == 0
+            && frame.stream_id == 1 + index as u32 * 2));
+
+    drop(send_request);
+}
+
+#[tokio::test]
 async fn initial_write_does_not_wait_for_a_request() {
     h2_support::trace_init!();
 
-    for request_state in [
-        RequestState::None,
-        RequestState::Cancelled,
-        RequestState::Pending,
+    for (request_state, with_priority) in [
+        (RequestState::None, false),
+        (RequestState::None, true),
+        (RequestState::Cancelled, false),
+        (RequestState::Pending, false),
     ] {
         let (io, calls, _write_blocked, _blocked_waker) =
             recording_io(WriteMode::Complete, Bytes::new());
         let mut builder = client::Builder::new();
         if matches!(request_state, RequestState::Pending) {
             builder.initial_max_send_streams(0);
+        }
+        if with_priority {
+            builder.initial_stream_id(3).priorities(
+                h2::frame::Priorities::builder()
+                    .push(h2::frame::Priority::new(
+                        StreamId::from(1),
+                        h2::frame::StreamDependency::new(StreamId::zero(), 15, false),
+                    ))
+                    .build(),
+            );
         }
 
         let (mut send_request, mut connection) =
@@ -625,7 +706,17 @@ async fn initial_write_does_not_wait_for_a_request() {
         assert!(!wire.is_empty(), "initial control frames were not written");
         let layout = frame_layout(&wire);
         assert_eq!(layout.first(), Some(&(4, 0)));
-        if matches!(request_state, RequestState::None | RequestState::Pending) {
+        if with_priority {
+            let first_write = calls
+                .iter()
+                .find_map(|call| match call {
+                    IoCall::Write(buf) => Some(buf),
+                    IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
+                })
+                .expect("client initial item was not written");
+            assert_eq!(frame_layout(first_write), [(4, 0), (2, 1)]);
+            assert_eq!(layout.iter().filter(|&&(kind, _)| kind == 2).count(), 1);
+        } else if matches!(request_state, RequestState::None | RequestState::Pending) {
             assert!(layout.iter().all(|&(_, stream_id)| stream_id == 0));
         } else if let Some(&(kind, _)) = layout.iter().find(|&&(_, stream_id)| stream_id != 0) {
             assert_eq!(kind, 1, "a cancelled stream was used before HEADERS");
@@ -642,7 +733,22 @@ async fn idle_client_finishes_initial_write_before_go_away() {
 
     let (io, calls, write_blocked, blocked_waker) =
         recording_io(WriteMode::PartialThenPending, Bytes::new());
-    let (send_request, mut connection) = client::handshake::<_>(io).await.unwrap();
+    let mut builder = client::Builder::new();
+    builder.initial_stream_id(5).priorities(
+        h2::frame::Priorities::builder()
+            .extend([
+                h2::frame::Priority::new(
+                    StreamId::from(1),
+                    h2::frame::StreamDependency::new(StreamId::zero(), 200, false),
+                ),
+                h2::frame::Priority::new(
+                    StreamId::from(3),
+                    h2::frame::StreamDependency::new(StreamId::from(1), 100, false),
+                ),
+            ])
+            .build(),
+    );
+    let (send_request, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
     drop(send_request);
 
     let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
@@ -690,7 +796,7 @@ async fn idle_client_finishes_initial_write_before_go_away() {
             wire.extend_from_slice(buf);
         }
     }
-    assert_eq!(frame_layout(&wire), [(4, 0), (7, 0)]);
+    assert_eq!(frame_layout(&wire), [(4, 0), (2, 1), (2, 3), (7, 0)]);
     assert_eq!(
         wire.windows(MAGIC_PREFACE.len())
             .filter(|window| *window == MAGIC_PREFACE)

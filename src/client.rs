@@ -1230,14 +1230,20 @@ impl Builder {
         self
     }
 
-    /// Sets the list of PRIORITY frames to be sent before request HEADERS.
+    /// Sets the list of PRIORITY frames appended once to the initial client
+    /// connection item after SETTINGS and the optional WINDOW_UPDATE.
     ///
     /// This allows you to pre-configure the HTTP/2 stream dependency tree by specifying a set of
-    /// PRIORITY frames that will be sent with the request queue. This can be useful for
-    /// optimizing resource allocation or testing custom stream prioritization strategies.
+    /// PRIORITY frames that will be sent independently of the request queue. This can be useful
+    /// for pre-configuring dependency nodes without replaying them for every request.
     ///
     /// Each `Priority` in the list must have a valid (non-zero) stream ID. Any priority with a
-    /// stream ID of zero will be ignored.
+    /// stream ID of zero or a dependency on the same stream will be ignored.
+    /// PRIORITY does not reserve stream IDs. Profiles that start requests later
+    /// can configure `initial_stream_id` when the `unstable` feature is enabled.
+    /// If `no_rfc7540_priorities(true)` is also configured, a conforming server
+    /// ignores these legacy priority signals as required by
+    /// [RFC 9218 section 2.1](https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1).
     pub fn priorities(&mut self, priorities: Priorities) -> &mut Self {
         self.priorities = Some(priorities);
         self
@@ -1257,13 +1263,13 @@ impl Builder {
     /// the client preface or initial SETTINGS are reported when the returned
     /// [`Connection`] is polled.
     ///
-    /// The first application-layer write contains the client magic, SETTINGS,
-    /// and an optional connection WINDOW_UPDATE. Request frames stay in the
-    /// normal stream queue until that write completes. If a request can be
-    /// opened immediately and is queued through [`SendRequest`] before polling
-    /// [`Connection`], the same poll can continue with a separate write for its
-    /// configured PRIORITY frames and HEADERS. No flush is inserted between
-    /// those write items.
+    /// The initial connection item contains the client magic, SETTINGS, an
+    /// optional connection WINDOW_UPDATE, and any configured PRIORITY frames.
+    /// Request frames stay in the normal stream queue until that item completes.
+    /// If a request can be opened immediately and is queued through
+    /// [`SendRequest`] before polling [`Connection`], the same poll can continue
+    /// with a separate write for its HEADERS and other ready stream frames. No
+    /// flush is inserted between those write items.
     ///
     /// A partial write resumes from the same item before the next queue is
     /// advanced. A request held by the initial stream concurrency limit remains
