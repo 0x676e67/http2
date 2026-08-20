@@ -33,7 +33,7 @@ http2 = "0.5"
 Next, add this to your crate:
 
 ```rust
-use http2::server::Connection;
+use http2::client::Connection;
 
 fn main() {
     // ...
