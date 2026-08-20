@@ -579,7 +579,7 @@ async fn drains_connection_and_request_queues_in_one_poll() {
 }
 
 #[tokio::test]
-async fn large_initial_priority_block_drains_before_read_without_flush() {
+async fn large_initial_priority_block_resumes_before_read_without_flush() {
     h2_support::trace_init!();
 
     const PRIORITY_COUNT: u32 = 1_200;
@@ -592,8 +592,8 @@ async fn large_initial_priority_block_drains_before_read_without_flush() {
         }))
         .build();
 
-    let (io, calls, _write_blocked, _blocked_waker) =
-        recording_io(WriteMode::Complete, Bytes::new());
+    let (io, calls, write_blocked, blocked_waker) =
+        recording_io(WriteMode::PartialThenPending, Bytes::new());
     let mut builder = client::Builder::new();
     builder
         .initial_stream_id(PRIORITY_COUNT * 2 + 1)
@@ -611,12 +611,51 @@ async fn large_initial_priority_block_drains_before_read_without_flush() {
     })
     .await;
 
+    let (first_write, blocked_call_count) = {
+        let calls = calls.lock().unwrap();
+        assert!(calls
+            .iter()
+            .all(|call| !matches!(call, IoCall::Read | IoCall::Flush)));
+        let writes = calls
+            .iter()
+            .filter_map(|call| match call {
+                IoCall::Write(buf) => Some(buf),
+                IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
+            })
+            .collect::<Vec<_>>();
+        let first = writes
+            .first()
+            .expect("initial connection item was not written");
+        assert!(writes.len() >= 2, "initial write did not block");
+        for retry in &writes[1..] {
+            assert_eq!(retry.as_ref(), &first[PARTIAL_WRITE_LEN..]);
+        }
+        ((*first).clone(), calls.len())
+    };
+
+    write_blocked.store(false, Ordering::SeqCst);
+    blocked_waker
+        .lock()
+        .unwrap()
+        .take()
+        .expect("write task was not registered")
+        .wake();
+
+    poll_fn(|cx| {
+        assert!(Pin::new(&mut connection).poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+
     let calls = calls.lock().unwrap();
     let first_read = calls
         .iter()
         .position(|call| matches!(call, IoCall::Read))
         .expect("connection did not poll the receive side");
-    let initial_writes = calls[..first_read]
+    assert!(calls[..first_read]
+        .iter()
+        .all(|call| !matches!(call, IoCall::Flush)));
+    let resumed_writes = calls[blocked_call_count..first_read]
         .iter()
         .filter_map(|call| match call {
             IoCall::Write(buf) => Some(buf),
@@ -624,17 +663,17 @@ async fn large_initial_priority_block_drains_before_read_without_flush() {
         })
         .collect::<Vec<_>>();
     assert!(
-        initial_writes.len() > 1,
-        "the test did not exceed codec capacity"
+        resumed_writes.len() > 1,
+        "the resumed write did not exceed codec capacity"
     );
-    assert!(calls[..first_read]
-        .iter()
-        .all(|call| !matches!(call, IoCall::Flush)));
 
-    let wire = initial_writes.iter().fold(Vec::new(), |mut wire, write| {
-        wire.extend_from_slice(write);
-        wire
-    });
+    let wire = resumed_writes.iter().fold(
+        first_write[..PARTIAL_WRITE_LEN].to_vec(),
+        |mut wire, write| {
+            wire.extend_from_slice(write);
+            wire
+        },
+    );
     let frames = wire_frames(&wire);
     assert_eq!(frames.len(), PRIORITY_COUNT as usize + 1);
     assert_eq!((frames[0].kind, frames[0].stream_id), (4, 0));

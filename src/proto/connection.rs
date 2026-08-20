@@ -159,7 +159,7 @@ where
             let pending_priorities = config
                 .priorities
                 .take()
-                .filter(|priorities| !priorities.max_stream_id().is_zero())
+                .filter(|priorities| !priorities.is_empty())
                 .map(IntoIterator::into_iter);
             State::ClientInitialSend { pending_priorities }
         };

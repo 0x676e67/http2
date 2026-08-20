@@ -149,7 +149,6 @@ const DEFAULT_STACK_SIZE: usize = 8;
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Priorities {
     priorities: SmallVec<[Priority; DEFAULT_STACK_SIZE]>,
-    max_stream_id: StreamId,
 }
 
 /// A builder for constructing a `Priorities` collection.
@@ -162,7 +161,6 @@ pub struct Priorities {
 #[derive(Debug)]
 pub struct PrioritiesBuilder {
     priorities: SmallVec<[Priority; DEFAULT_STACK_SIZE]>,
-    max_stream_id: StreamId,
     inserted_bitmap: u32,
 }
 
@@ -172,14 +170,13 @@ impl Priorities {
     pub fn builder() -> PrioritiesBuilder {
         PrioritiesBuilder {
             priorities: SmallVec::new(),
-            max_stream_id: StreamId::zero(),
             inserted_bitmap: 0,
         }
     }
 
     #[inline]
-    pub(crate) fn max_stream_id(&self) -> StreamId {
-        self.max_stream_id
+    pub(crate) fn is_empty(&self) -> bool {
+        self.priorities.is_empty()
     }
 }
 
@@ -240,10 +237,6 @@ impl PrioritiesBuilder {
             }
         }
 
-        if priority.stream_id > self.max_stream_id {
-            self.max_stream_id = priority.stream_id;
-        }
-
         self.priorities.push(priority);
         self
     }
@@ -258,7 +251,6 @@ impl PrioritiesBuilder {
     pub fn build(self) -> Priorities {
         Priorities {
             priorities: self.priorities,
-            max_stream_id: self.max_stream_id,
         }
     }
 }
