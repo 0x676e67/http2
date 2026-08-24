@@ -15,6 +15,8 @@ use super::{
     sync::Mutex,
     Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId,
 };
+#[cfg(feature = "unstable")]
+use crate::ext::HeadersStreamDependency;
 use crate::{
     client,
     codec::{Codec, SendError, UserError},
@@ -308,6 +310,11 @@ where
         use super::stream::ContentLength;
 
         let protocol = request.extensions_mut().remove::<Protocol>();
+        #[cfg(feature = "unstable")]
+        let request_headers_stream_dependency = request
+            .extensions_mut()
+            .remove::<HeadersStreamDependency>()
+            .map(HeadersStreamDependency::into_inner);
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -355,6 +362,12 @@ where
             stream.content_length = ContentLength::Head;
         }
 
+        #[cfg(feature = "unstable")]
+        let headers_stream_dependency =
+            request_headers_stream_dependency.or(me.headers_stream_dependency);
+        #[cfg(not(feature = "unstable"))]
+        let headers_stream_dependency = me.headers_stream_dependency;
+
         // Convert the message
         let headers = client::Peer::convert_send_message(
             stream_id,
@@ -362,7 +375,7 @@ where
             protocol,
             end_of_stream,
             me.headers_pseudo_order.clone(),
-            me.headers_stream_dependency,
+            headers_stream_dependency,
         )?;
 
         let mut stream = me.store.insert(stream.id, stream);

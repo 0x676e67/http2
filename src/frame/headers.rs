@@ -366,9 +366,21 @@ impl Headers {
         &self.header_block.pseudo
     }
 
-    // If the stream dependency is set, the PRIORITY flag must be set
+    /// Sets the deprecated RFC 7540 priority fields carried by this HEADERS
+    /// frame.
+    ///
+    /// RFC 9113 retains the wire fields for interoperability. A dependency on
+    /// the stream itself is not useful to compatible peers, so it is ignored.
     pub fn set_stream_dependency(&mut self, stream_dep: StreamDependency) {
-        self.flags = HeadersFlag(END_HEADERS | PRIORITY);
+        if stream_dep.dependency_id() == self.stream_id {
+            tracing::warn!(
+                "ignoring self-dependent HEADERS priority for stream_id={:?}",
+                self.stream_id
+            );
+            return;
+        }
+
+        self.flags.set_priority();
         self.stream_dep = Some(stream_dep);
     }
 
@@ -910,6 +922,10 @@ impl HeadersFlag {
         self.0 |= END_HEADERS;
     }
 
+    fn set_priority(&mut self) {
+        self.0 |= PRIORITY;
+    }
+
     pub fn is_padded(&self) -> bool {
         self.0 & PADDED == PADDED
     }
@@ -1233,6 +1249,22 @@ mod test {
         assert_eq!("zomg", huff_decode(&dst[15..18]));
         assert_eq!(&[15, 47, 0x80 | 3], &dst[18..21]);
         assert_eq!("sup", huff_decode(&dst[21..]));
+    }
+
+    #[test]
+    fn stream_dependency_preserves_flags_and_ignores_self_dependency() {
+        let stream_id = StreamId::from(3);
+        let mut headers = Headers::trailers(stream_id, HeaderMap::new());
+
+        headers.set_stream_dependency(StreamDependency::new(StreamId::zero(), 15, false));
+        assert!(headers.flags.is_end_headers());
+        assert!(headers.flags.is_end_stream());
+        assert!(headers.flags.is_priority());
+
+        let mut self_dependent = Headers::new(stream_id, Pseudo::default(), HeaderMap::new());
+        self_dependent.set_stream_dependency(StreamDependency::new(stream_id, 15, false));
+        assert!(!self_dependent.flags.is_priority());
+        assert!(self_dependent.stream_dep.is_none());
     }
 
     fn huff_decode(src: &[u8]) -> BytesMut {
