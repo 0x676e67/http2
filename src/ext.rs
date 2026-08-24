@@ -1,7 +1,7 @@
 //! Extensions specific to the HTTP/2 protocol.
 
 #[cfg(feature = "unstable")]
-use crate::frame::{StreamDependency, StreamId};
+use crate::frame::StreamDependency;
 use crate::hpack::BytesStr;
 
 use bytes::Bytes;
@@ -21,16 +21,16 @@ use std::fmt;
 /// # Examples
 ///
 /// ```
-/// use http2::{ext::HeadersStreamDependency, frame::StreamId};
+/// use http2::{
+///     ext::HeadersStreamDependency,
+///     frame::{StreamDependency, StreamId},
+/// };
 ///
+/// let dependency = StreamDependency::new(StreamId::from(1), 146, true);
 /// let _request = http::Request::builder()
-///     .extension(HeadersStreamDependency::depends_on(
-///         StreamId::from(1),
-///         146,
-///         true,
-///     ))
-///     .body(())
-///     .unwrap();
+///     .extension(HeadersStreamDependency::new(dependency))
+///     .body(())?;
+/// # Ok::<(), http::Error>(())
 /// ```
 ///
 /// [RFC 9113 section 5.3.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.3.2
@@ -40,20 +40,9 @@ pub struct HeadersStreamDependency(StreamDependency);
 
 #[cfg(feature = "unstable")]
 impl HeadersStreamDependency {
-    /// Overrides the request to depend on the connection root, stream 0.
-    ///
-    /// `weight` is the encoded value in the range 0 through 255. Its effective
-    /// HTTP/2 weight is one greater, in the range 1 through 256.
-    pub fn root(weight: u8, is_exclusive: bool) -> Self {
-        Self(StreamDependency::new(StreamId::ZERO, weight, is_exclusive))
-    }
-
-    /// Overrides the request to depend on an HTTP/2 stream.
-    ///
-    /// `weight` is the encoded value in the range 0 through 255. Its effective
-    /// HTTP/2 weight is one greater, in the range 1 through 256.
-    pub fn depends_on(dependency_id: StreamId, weight: u8, is_exclusive: bool) -> Self {
-        Self(StreamDependency::new(dependency_id, weight, is_exclusive))
+    /// Creates a per-request override from an HTTP/2 stream dependency.
+    pub fn new(stream_dependency: StreamDependency) -> Self {
+        Self(stream_dependency)
     }
 
     pub(crate) fn into_inner(self) -> StreamDependency {
