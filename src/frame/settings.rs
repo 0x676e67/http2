@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::frame::{util, Error, Frame, FrameSize, Head, Kind, StreamId};
+use crate::frame::{Error, Frame, FrameSize, Head, Kind, StreamId, util};
 use crate::tracing;
 use bytes::{BufMut, BytesMut};
 use smallvec::SmallVec;

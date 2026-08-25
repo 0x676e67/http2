@@ -1,4 +1,4 @@
-use crate::{tracing, Reason};
+use crate::{Reason, tracing};
 
 use super::*;
 

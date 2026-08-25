@@ -4,7 +4,7 @@ use http2 as h2;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use tokio_rustls::rustls::{pki_types::ServerName, RootCertStore};
+use tokio_rustls::rustls::{RootCertStore, pki_types::ServerName};
 
 use std::error::Error;
 use std::net::ToSocketAddrs;

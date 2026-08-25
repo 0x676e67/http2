@@ -1,6 +1,6 @@
 use bytes::Bytes;
-use h2::server::{self, SendResponse};
 use h2::RecvStream;
+use h2::server::{self, SendResponse};
 use http::Request;
 
 use std::{

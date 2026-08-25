@@ -6,8 +6,8 @@ use crate::tracing;
 use atomic_waker::AtomicWaker;
 use bytes::Buf;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 
