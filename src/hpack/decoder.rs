@@ -6,7 +6,6 @@ use http::header;
 use http::method::{self, Method};
 use http::status::{self, StatusCode};
 
-use std::cmp;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::ops::ControlFlow;
@@ -15,11 +14,30 @@ use std::str::Utf8Error;
 /// Decodes headers using HPACK
 #[derive(Debug)]
 pub struct Decoder {
-    // Protocol indicated that the max table size will update
-    max_size_update: Option<usize>,
-    last_max_update: usize,
     table: Table,
     buffer: BytesMut,
+    table_size: DecoderTableSize,
+}
+
+/// SETTINGS_HEADER_TABLE_SIZE state shared by every fragment of one header
+/// block. RFC 7541 section 4.2 allows at most two updates at the start of the
+/// block when the acknowledged limit changed more than once.
+/// https://www.rfc-editor.org/rfc/rfc7541.html#section-4.2
+#[derive(Debug)]
+struct DecoderTableSize {
+    lowest: usize,
+    final_size: usize,
+    require_update: bool,
+    allow_update: bool,
+    saw_update: bool,
+    semantic_error: Option<DecoderError>,
+    block_mode: Option<HeaderBlockMode>,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum HeaderBlockMode {
+    Explicit,
+    Implicit,
 }
 
 /// Represents all errors that can be encountered while performing the decoding
@@ -34,6 +52,7 @@ pub enum DecoderError {
     InvalidStatusCode,
     InvalidPseudoheader,
     InvalidMaxDynamicSize,
+    MissingDynamicTableSizeUpdate,
     IntegerOverflow,
     NeedMore(NeedMore),
 }
@@ -138,9 +157,24 @@ enum Representation {
 
 #[derive(Debug)]
 struct Table {
-    entries: VecDeque<Header>,
+    entries: VecDeque<TableEntry>,
     size: usize,
     max_size: usize,
+}
+
+#[derive(Debug, Clone)]
+enum TableEntry {
+    Header(Header),
+    Malformed {
+        name: Bytes,
+        value: Bytes,
+        error: DecoderError,
+    },
+}
+
+pub(crate) enum DecodedHeader {
+    Header(Header),
+    Malformed { len: usize },
 }
 
 struct StringMarker {
@@ -155,25 +189,20 @@ impl Decoder {
     /// Creates a new `Decoder` with all settings set to default values.
     pub fn new(size: usize) -> Decoder {
         Decoder {
-            max_size_update: None,
-            last_max_update: size,
             table: Table::new(size),
             buffer: BytesMut::with_capacity(4096),
+            table_size: DecoderTableSize::new(size),
         }
     }
 
-    /// Queues a potential size update
+    /// Applies a SETTINGS_HEADER_TABLE_SIZE value acknowledged by the peer.
     #[allow(dead_code)]
     pub fn queue_size_update(&mut self, size: usize) {
-        let size = match self.max_size_update {
-            Some(v) => cmp::max(v, size),
-            None => size,
-        };
-
-        self.max_size_update = Some(size);
+        self.table_size.apply_setting(size);
     }
 
     /// Decodes the headers found in the given buffer.
+    #[cfg(any(test, fuzzing))]
     pub fn decode<F>(
         &mut self,
         src: &mut Cursor<&mut BytesMut>,
@@ -182,88 +211,16 @@ impl Decoder {
     where
         F: FnMut(Header) -> ControlFlow<()>,
     {
-        use self::Representation::*;
-
-        let mut can_resize = true;
-
-        if let Some(size) = self.max_size_update.take() {
-            self.last_max_update = size;
-        }
-
-        let _span = tracing::trace_span!("hpack::decode");
-
-        tracing::trace!("decode");
-
-        while let Some(ty) = peek_u8(src) {
-            // At this point we are always at the beginning of the next block
-            // within the HPACK data. The type of the block can always be
-            // determined from the first byte.
-            match Representation::load(ty)? {
-                Indexed => {
-                    tracing::trace!(rem = src.remaining(), kind = %"Indexed");
-                    can_resize = false;
-                    let entry = self.decode_indexed(src)?;
-                    consume(src);
-                    if f(entry).is_break() {
-                        break;
-                    }
-                }
-                LiteralWithIndexing => {
-                    tracing::trace!(rem = src.remaining(), kind = %"LiteralWithIndexing");
-                    can_resize = false;
-                    let entry = self.decode_literal(src, true)?;
-
-                    // Insert the header into the table
-                    self.table.insert(entry.clone());
-                    consume(src);
-
-                    if f(entry).is_break() {
-                        break;
-                    }
-                }
-                LiteralWithoutIndexing => {
-                    tracing::trace!(rem = src.remaining(), kind = %"LiteralWithoutIndexing");
-                    can_resize = false;
-                    let entry = self.decode_literal(src, false)?;
-                    consume(src);
-                    if f(entry).is_break() {
-                        break;
-                    }
-                }
-                LiteralNeverIndexed => {
-                    tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
-                    can_resize = false;
-                    let entry = self.decode_literal(src, false)?;
-                    consume(src);
-
-                    // TODO: Track that this should never be indexed
-
-                    if f(entry).is_break() {
-                        break;
-                    }
-                }
-                SizeUpdate => {
-                    tracing::trace!(rem = src.remaining(), kind = %"SizeUpdate");
-                    if !can_resize {
-                        return Err(DecoderError::InvalidMaxDynamicSize);
-                    }
-
-                    // Handle the dynamic table size update
-                    self.process_size_update(src)?;
-                    consume(src);
-                }
-            }
-        }
-
-        Ok(())
+        self.decode_with_meta(src, |header| match header {
+            DecodedHeader::Header(header) => f(header),
+            DecodedHeader::Malformed { .. } => ControlFlow::Continue(()),
+        })
     }
 
     fn process_size_update(&mut self, buf: &mut Cursor<&mut BytesMut>) -> Result<(), DecoderError> {
         let new_size = decode_int(buf, 5)?;
 
-        if new_size > self.last_max_update {
-            return Err(DecoderError::InvalidMaxDynamicSize);
-        }
+        self.table_size.on_size_update(new_size)?;
 
         tracing::debug!(
             from = self.table.size(),
@@ -276,7 +233,7 @@ impl Decoder {
         Ok(())
     }
 
-    fn decode_indexed(&self, buf: &mut Cursor<&mut BytesMut>) -> Result<Header, DecoderError> {
+    fn decode_indexed(&self, buf: &mut Cursor<&mut BytesMut>) -> Result<TableEntry, DecoderError> {
         let index = decode_int(buf, 7)?;
         self.table.get(index)
     }
@@ -285,7 +242,7 @@ impl Decoder {
         &mut self,
         buf: &mut Cursor<&mut BytesMut>,
         index: bool,
-    ) -> Result<Header, DecoderError> {
+    ) -> Result<TableEntry, DecoderError> {
         let prefix = if index { 6 } else { 4 };
 
         // Extract the table index for the name, or 0 if not indexed
@@ -300,12 +257,12 @@ impl Decoder {
             // Read the name as a literal
             let name = name_marker.consume(buf);
             let value = value_marker.consume(buf);
-            Header::new(name, value)
+            Ok(TableEntry::from_raw(name, value))
         } else {
             let e = self.table.get(table_idx)?;
             let value = self.decode_string(buf)?;
 
-            e.name().into_entry(value)
+            Ok(e.with_value(value))
         }
     }
 
@@ -358,6 +315,269 @@ impl Decoder {
         let marker = self.try_decode_string(buf)?;
         buf.set_position(old_pos);
         Ok(marker.consume(buf))
+    }
+
+    pub(crate) fn begin_header_block(&mut self) -> Result<(), DecoderError> {
+        self.table_size.begin_header_block(
+            self.table.size(),
+            self.table.max_size,
+            HeaderBlockMode::Explicit,
+        )
+    }
+
+    pub(crate) fn end_header_block(&mut self) -> Result<Option<DecoderError>, DecoderError> {
+        self.table_size.end_header_block()
+    }
+
+    pub(crate) fn decode_with_meta<F>(
+        &mut self,
+        src: &mut Cursor<&mut BytesMut>,
+        mut f: F,
+    ) -> Result<(), DecoderError>
+    where
+        F: FnMut(DecodedHeader) -> ControlFlow<()>,
+    {
+        use self::Representation::*;
+
+        let implicit_block = self
+            .table_size
+            .ensure_header_block(self.table.size(), self.table.max_size);
+
+        let _span = tracing::trace_span!("hpack::decode");
+
+        tracing::trace!("decode");
+
+        while let Some(ty) = peek_u8(src) {
+            // At this point we are always at the beginning of the next block
+            // within the HPACK data. The type of the block can always be
+            // determined from the first byte.
+            match Representation::load(ty)? {
+                Indexed => {
+                    tracing::trace!(rem = src.remaining(), kind = %"Indexed");
+                    self.table_size.on_header()?;
+                    let entry = self.decode_indexed(src)?;
+                    consume(src);
+                    if self.emit(entry, &mut f) {
+                        break;
+                    }
+                }
+                LiteralWithIndexing => {
+                    tracing::trace!(rem = src.remaining(), kind = %"LiteralWithIndexing");
+                    self.table_size.on_header()?;
+                    let entry = self.decode_literal(src, true)?;
+
+                    // Insert the header into the table
+                    self.table.insert(entry.clone());
+                    consume(src);
+
+                    if self.emit(entry, &mut f) {
+                        break;
+                    }
+                }
+                LiteralWithoutIndexing => {
+                    tracing::trace!(rem = src.remaining(), kind = %"LiteralWithoutIndexing");
+                    self.table_size.on_header()?;
+                    let entry = self.decode_literal(src, false)?;
+                    consume(src);
+                    if self.emit(entry, &mut f) {
+                        break;
+                    }
+                }
+                LiteralNeverIndexed => {
+                    tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
+                    self.table_size.on_header()?;
+                    let entry = self.decode_literal(src, false)?;
+                    consume(src);
+
+                    // TODO: Track that this should never be indexed
+
+                    if self.emit(entry, &mut f) {
+                        break;
+                    }
+                }
+                SizeUpdate => {
+                    tracing::trace!(rem = src.remaining(), kind = %"SizeUpdate");
+                    // Handle the dynamic table size update
+                    self.process_size_update(src)?;
+                    consume(src);
+                }
+            }
+        }
+
+        if implicit_block && !src.has_remaining() {
+            if let Some(error) = self.table_size.end_header_block()? {
+                return Err(error);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn emit<F>(&mut self, entry: TableEntry, f: &mut F) -> bool
+    where
+        F: FnMut(DecodedHeader) -> ControlFlow<()>,
+    {
+        match entry {
+            TableEntry::Header(header) => f(DecodedHeader::Header(header)).is_break(),
+            TableEntry::Malformed {
+                ref name,
+                ref value,
+                error,
+            } => {
+                self.table_size.on_semantic_error(error);
+                f(DecodedHeader::Malformed {
+                    len: 32usize
+                        .saturating_add(name.len())
+                        .saturating_add(value.len()),
+                })
+                .is_break()
+            }
+        }
+    }
+}
+
+impl DecoderTableSize {
+    fn new(size: usize) -> Self {
+        Self {
+            lowest: size,
+            final_size: size,
+            require_update: false,
+            allow_update: true,
+            saw_update: false,
+            semantic_error: None,
+            block_mode: None,
+        }
+    }
+
+    fn apply_setting(&mut self, size: usize) {
+        self.lowest = self.lowest.min(size);
+        self.final_size = size;
+    }
+
+    fn begin_header_block(
+        &mut self,
+        current_size: usize,
+        current_limit: usize,
+        mode: HeaderBlockMode,
+    ) -> Result<(), DecoderError> {
+        if self.block_mode.is_some() {
+            return Err(DecoderError::InvalidRepresentation);
+        }
+
+        self.allow_update = true;
+        self.saw_update = false;
+        self.semantic_error = None;
+        self.require_update = self.lowest < current_size || self.final_size < current_limit;
+        self.block_mode = Some(mode);
+        Ok(())
+    }
+
+    fn ensure_header_block(&mut self, current_size: usize, current_limit: usize) -> bool {
+        if self.block_mode.is_none() {
+            self.allow_update = true;
+            self.saw_update = false;
+            self.semantic_error = None;
+            self.require_update = self.lowest < current_size || self.final_size < current_limit;
+            self.block_mode = Some(HeaderBlockMode::Implicit);
+        }
+
+        self.block_mode == Some(HeaderBlockMode::Implicit)
+    }
+
+    fn on_header(&mut self) -> Result<(), DecoderError> {
+        if self.require_update {
+            return Err(DecoderError::MissingDynamicTableSizeUpdate);
+        }
+
+        self.allow_update = false;
+        Ok(())
+    }
+
+    fn on_size_update(&mut self, size: usize) -> Result<(), DecoderError> {
+        if !self.allow_update {
+            return Err(DecoderError::InvalidMaxDynamicSize);
+        }
+
+        if self.require_update {
+            if size > self.lowest {
+                return Err(DecoderError::InvalidMaxDynamicSize);
+            }
+            self.require_update = false;
+        } else if size > self.final_size {
+            return Err(DecoderError::InvalidMaxDynamicSize);
+        }
+
+        if self.saw_update {
+            self.allow_update = false;
+        } else {
+            self.saw_update = true;
+        }
+        self.lowest = self.final_size;
+        Ok(())
+    }
+
+    fn on_semantic_error(&mut self, error: DecoderError) {
+        if self.semantic_error.is_none() {
+            self.semantic_error = Some(error);
+        }
+    }
+
+    fn end_header_block(&mut self) -> Result<Option<DecoderError>, DecoderError> {
+        if self.block_mode.is_none() {
+            return Err(DecoderError::InvalidRepresentation);
+        }
+
+        if self.require_update {
+            Err(DecoderError::MissingDynamicTableSizeUpdate)
+        } else {
+            self.block_mode = None;
+            Ok(self.semantic_error.take())
+        }
+    }
+}
+
+impl TableEntry {
+    fn from_raw(name: Bytes, value: Bytes) -> Self {
+        match Header::new(name.clone(), value.clone()) {
+            Ok(header) => Self::Header(header),
+            Err(error) => Self::Malformed { name, value, error },
+        }
+    }
+
+    fn with_value(self, value: Bytes) -> Self {
+        match self {
+            Self::Header(header) => match header.name().into_entry(value.clone()) {
+                Ok(header) => Self::Header(header),
+                Err(error) => Self::Malformed {
+                    name: Bytes::copy_from_slice(header.name().as_slice()),
+                    value,
+                    error,
+                },
+            },
+            Self::Malformed { name, .. } => Self::from_raw(name, value),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Header(header) => header.len(),
+            Self::Malformed { name, value, .. } => 32usize
+                .saturating_add(name.len())
+                .saturating_add(value.len()),
+        }
+    }
+
+    fn compact_malformed(self) -> Self {
+        match self {
+            // Dynamic-table accounting uses the field length, so do not let a
+            // small invalid field retain the complete input frame allocation.
+            Self::Malformed { name, value, error } => Self::Malformed {
+                name: Bytes::copy_from_slice(&name),
+                value: Bytes::copy_from_slice(&value),
+                error,
+            },
+            entry => entry,
+        }
     }
 }
 
@@ -502,7 +722,6 @@ impl Table {
         }
     }
 
-    #[cfg(any(feature = "tracing", test))]
     fn size(&self) -> usize {
         self.size
     }
@@ -515,13 +734,13 @@ impl Table {
     ///
     /// This is according to the [HPACK spec, section 2.3.3.]
     /// (http://http2.github.io/http2-spec/compression.html#index.address.space)
-    pub fn get(&self, index: usize) -> Result<Header, DecoderError> {
+    fn get(&self, index: usize) -> Result<TableEntry, DecoderError> {
         if index == 0 {
             return Err(DecoderError::InvalidTableIndex);
         }
 
         if index <= 61 {
-            return Ok(get_static(index));
+            return Ok(TableEntry::Header(get_static(index)));
         }
 
         // Convert the index for lookup in the entries structure.
@@ -531,16 +750,20 @@ impl Table {
         }
     }
 
-    fn insert(&mut self, entry: Header) {
+    fn insert(&mut self, entry: TableEntry) {
         let len = entry.len();
 
         self.reserve(len);
 
-        if self.size + len <= self.max_size {
-            self.size += len;
+        if let Some(size) = self
+            .size
+            .checked_add(len)
+            .filter(|size| *size <= self.max_size)
+        {
+            self.size = size;
 
             // Track the entry
-            self.entries.push_front(entry);
+            self.entries.push_front(entry.compact_malformed());
         }
     }
 
@@ -551,10 +774,10 @@ impl Table {
     }
 
     fn reserve(&mut self, size: usize) {
-        while self.size + size > self.max_size {
+        while self.size.saturating_add(size) > self.max_size {
             match self.entries.pop_back() {
                 Some(last) => {
-                    self.size -= last.len();
+                    self.size = self.size.saturating_sub(last.len());
                 }
                 None => return,
             }
@@ -563,20 +786,15 @@ impl Table {
 
     fn consolidate(&mut self) {
         while self.size > self.max_size {
-            {
-                let last = match self.entries.back() {
-                    Some(x) => x,
-                    None => {
-                        // Can never happen as the size of the table must reach
-                        // 0 by the time we've exhausted all elements.
-                        panic!("Size of table != 0, but no headers left!");
-                    }
-                };
-
-                self.size -= last.len();
+            match self.entries.pop_back() {
+                Some(last) => {
+                    self.size = self.size.saturating_sub(last.len());
+                }
+                None => {
+                    self.size = 0;
+                    break;
+                }
             }
-
-            self.entries.pop_back();
         }
     }
 }

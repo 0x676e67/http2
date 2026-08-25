@@ -188,11 +188,33 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
             };
 
             let is_end_headers = frame.is_end_headers();
+            if let Err(_e) = decoder.hpack.begin_header_block() {
+                proto_err!(conn: "failed to start HPACK block; err={:?}", _e);
+                return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+            }
 
             // Load the HPACK encoded headers
-            match frame.load_hpack(&mut payload, decoder.max_header_list_size, &mut decoder.hpack) {
+            let decoded = frame.load_hpack(&mut payload, decoder.max_header_list_size, &mut decoder.hpack);
+            let decoder_malformed =
+                if is_end_headers && !matches!(&decoded, Err(frame::Error::Hpack(_))) {
+                    match decoder.hpack.end_header_block() {
+                        Ok(error) => error.is_some(),
+                        Err(_e) => {
+                            proto_err!(conn: "failed HPACK block validation; err={:?}", _e);
+                            return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+                        }
+                    }
+                } else {
+                    false
+                };
+
+            match decoded {
                 Ok(_) => {},
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {},
+                Err(frame::Error::Hpack(_e)) => {
+                    proto_err!(conn: "failed HPACK decoding; err={:?}", _e);
+                    return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+                },
                 Err(frame::Error::MalformedMessage) => {
                     let id = $head.stream_id();
                     proto_err!(stream: "malformed header block; stream={:?}", id);
@@ -212,6 +234,11 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
             }
 
             if is_end_headers {
+                if decoder_malformed || frame.is_malformed() {
+                    let id = $head.stream_id();
+                    proto_err!(stream: "malformed header block; stream={:?}", id);
+                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
+                }
                 frame.into()
             } else {
                 tracing::trace!("loaded partial header block");
@@ -369,13 +396,31 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
                 partial.buf.extend_from_slice(&bytes[frame::HEADER_LEN..]);
             }
 
-            match partial.frame.load_hpack(
+            let decoded = partial.frame.load_hpack(
                 &mut partial.buf,
                 decoder.max_header_list_size,
                 &mut decoder.hpack,
-            ) {
+            );
+            let decoder_malformed =
+                if is_end_headers && !matches!(&decoded, Err(frame::Error::Hpack(_))) {
+                    match decoder.hpack.end_header_block() {
+                        Ok(error) => error.is_some(),
+                        Err(_e) => {
+                            proto_err!(conn: "failed HPACK block validation; err={:?}", _e);
+                            return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+                        }
+                    }
+                } else {
+                    false
+                };
+
+            match decoded {
                 Ok(_) => {}
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {}
+                Err(frame::Error::Hpack(_e)) => {
+                    proto_err!(conn: "failed HPACK decoding; err={:?}", _e);
+                    return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+                }
                 Err(frame::Error::MalformedMessage) => {
                     let id = head.stream_id();
                     proto_err!(stream: "malformed CONTINUATION frame; stream={:?}", id);
@@ -395,6 +440,11 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
             }
 
             if is_end_headers {
+                if decoder_malformed || partial.frame.is_malformed() {
+                    let id = head.stream_id();
+                    proto_err!(stream: "malformed CONTINUATION block; stream={:?}", id);
+                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
+                }
                 partial.frame.into()
             } else {
                 decoder.partial = Some(partial);
@@ -472,6 +522,13 @@ impl Continuable {
         match *self {
             Continuable::Headers(ref mut h) => h.load_hpack(src, max_header_list_size, decoder),
             Continuable::PushPromise(ref mut p) => p.load_hpack(src, max_header_list_size, decoder),
+        }
+    }
+
+    fn is_malformed(&self) -> bool {
+        match *self {
+            Continuable::Headers(ref h) => h.is_malformed(),
+            Continuable::PushPromise(ref p) => p.is_malformed(),
         }
     }
 }
