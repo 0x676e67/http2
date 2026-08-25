@@ -55,8 +55,8 @@ pub use self::go_away::GoAway;
 pub use self::head::{Head, Kind};
 #[allow(unused_imports)]
 pub use self::headers::{
-    parse_u64, Continuation, Headers, Pseudo, PseudoId, PseudoOrder, PseudoOrderBuilder,
-    PushPromise, PushPromiseHeaderError,
+    Continuation, Headers, Pseudo, PseudoId, PseudoOrder, PseudoOrderBuilder, PushPromise,
+    PushPromiseHeaderError, parse_u64,
 };
 pub use self::ping::Ping;
 #[allow(unused_imports)]

@@ -118,7 +118,7 @@
 use crate::codec::{Codec, UserError};
 use crate::frame::{self, Pseudo, PushPromiseHeaderError, Reason, Settings, StreamId};
 use crate::proto::{self, Config, Error, Prioritized};
-use crate::{tracing, FlowControl, PingPong, RecvStream, SendStream};
+use crate::{FlowControl, PingPong, RecvStream, SendStream, tracing};
 
 #[cfg(feature = "tracing")]
 use ::tracing::instrument::{Instrument, Instrumented};
@@ -1655,7 +1655,7 @@ impl proto::Peer for Peer {
         fields: HeaderMap,
         stream_id: StreamId,
     ) -> Result<Self::Poll, Error> {
-        use http::{uri, Version};
+        use http::{Version, uri};
 
         let mut b = Request::builder();
 

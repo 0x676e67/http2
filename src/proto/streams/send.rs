@@ -1,6 +1,6 @@
 use super::{
-    store, Buffer, BufferStatus, Codec, Config, Counts, Frame, Prioritize, Prioritized, Store,
-    Stream, StreamId, StreamIdOverflow, WindowSize,
+    Buffer, BufferStatus, Codec, Config, Counts, Frame, Prioritize, Prioritized, Store, Stream,
+    StreamId, StreamIdOverflow, WindowSize, store,
 };
 use crate::codec::UserError;
 use crate::frame::{self, Reason};
@@ -187,10 +187,14 @@ impl Send {
         // Validate headers
         Self::check_headers(frame.fields())?;
 
-        debug_assert!(frame.is_informational(),
-            "Frame must be informational (1xx status code) at this point. Validation should happen at the public API boundary.");
-        debug_assert!(!frame.is_end_stream(),
-            "Informational frames must not have end_stream flag set. Validation should happen at the internal send informational header streams.");
+        debug_assert!(
+            frame.is_informational(),
+            "Frame must be informational (1xx status code) at this point. Validation should happen at the public API boundary."
+        );
+        debug_assert!(
+            !frame.is_end_stream(),
+            "Informational frames must not have end_stream flag set. Validation should happen at the internal send informational header streams."
+        );
 
         // Queue the frame for sending WITHOUT changing stream state
         // This is the key difference from send_headers - we don't call stream.state.send_open()

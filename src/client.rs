@@ -144,12 +144,12 @@ use crate::frame::{
     StreamId,
 };
 use crate::proto::{self, Error};
-use crate::{tracing, FlowControl, PingPong, RecvStream, SendStream};
+use crate::{FlowControl, PingPong, RecvStream, SendStream, tracing};
 
 #[cfg(feature = "tracing")]
 use ::tracing::Instrument;
 use bytes::{Buf, Bytes};
-use http::{uri, HeaderMap, Method, Request, Response, Version};
+use http::{HeaderMap, Method, Request, Response, Version, uri};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -1331,7 +1331,7 @@ impl Builder {
     pub fn handshake<T, B>(
         &self,
         io: T,
-    ) -> impl Future<Output = Result<(SendRequest<B>, Connection<T, B>), crate::Error>>
+    ) -> impl Future<Output = Result<(SendRequest<B>, Connection<T, B>), crate::Error>> + use<T, B>
     where
         T: AsyncRead + AsyncWrite + Unpin,
         B: Buf,

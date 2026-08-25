@@ -1,11 +1,11 @@
-use super::{util, StreamDependency, StreamId};
+use super::{StreamDependency, StreamId, util};
 use crate::ext::Protocol;
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
 use crate::tracing;
 
 use http::header::{self, HeaderName, HeaderValue};
-use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
+use http::{HeaderMap, Method, Request, StatusCode, Uri, uri};
 
 use bytes::{Buf, BufMut, BytesMut};
 use smallvec::SmallVec;
@@ -1178,7 +1178,7 @@ mod test {
 
     use super::*;
     use crate::frame;
-    use crate::hpack::{huffman, Encoder};
+    use crate::hpack::{Encoder, huffman};
 
     #[test]
     fn test_nameless_header_at_resume() {
@@ -1218,9 +1218,11 @@ mod test {
 
         dst.clear();
 
-        assert!(continuation
-            .encode(&mut (&mut dst).limit(frame::HEADER_LEN + 16))
-            .is_none());
+        assert!(
+            continuation
+                .encode(&mut (&mut dst).limit(frame::HEADER_LEN + 16))
+                .is_none()
+        );
 
         world.extend_from_slice(&dst[9..12]);
         assert_eq!("world", huff_decode(&world));

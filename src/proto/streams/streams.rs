@@ -9,11 +9,11 @@ use http::{HeaderMap, Request, Response};
 use tokio::io::AsyncWrite;
 
 use super::{
+    Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId,
     frame::{PseudoOrder, StreamDependency},
     recv::RecvHeaderBlockError,
     store::{self, Entry, Resolve, Store},
     sync::Mutex,
-    Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId,
 };
 use crate::{
     client,
@@ -21,7 +21,7 @@ use crate::{
     ext::Protocol,
     frame::{self, Frame, Reason},
     proto,
-    proto::{peer, Error, Initiator, Open, Peer, WindowSize},
+    proto::{Error, Initiator, Open, Peer, WindowSize, peer},
     server, tracing,
 };
 

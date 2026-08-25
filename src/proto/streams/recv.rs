@@ -1,6 +1,6 @@
 use super::*;
 use crate::codec::UserError;
-use crate::frame::{PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
+use crate::frame::{DEFAULT_INITIAL_WINDOW_SIZE, PushPromiseHeaderError, Reason};
 use crate::proto;
 use crate::tracing;
 
@@ -346,7 +346,10 @@ impl Recv {
             match stream.pending_recv.pop_front(&mut self.buffer) {
                 Some(Event::Headers(Client(response))) => return Poll::Ready(Ok(response)),
                 Some(Event::InformationalHeaders(_)) => {
-                    tracing::trace!("Skipping informational response in poll_response - should be consumed via poll_informational; stream_id={:?}", stream.id);
+                    tracing::trace!(
+                        "Skipping informational response in poll_response - should be consumed via poll_informational; stream_id={:?}",
+                        stream.id
+                    );
                     continue;
                 }
                 Some(_) => panic!("poll_response called after response returned"),
