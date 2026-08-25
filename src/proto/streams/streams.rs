@@ -362,12 +362,6 @@ where
             stream.content_length = ContentLength::Head;
         }
 
-        #[cfg(feature = "unstable")]
-        let headers_stream_dependency =
-            request_headers_stream_dependency.or(me.headers_stream_dependency);
-        #[cfg(not(feature = "unstable"))]
-        let headers_stream_dependency = me.headers_stream_dependency;
-
         // Convert the message
         let headers = client::Peer::convert_send_message(
             stream_id,
@@ -375,7 +369,10 @@ where
             protocol,
             end_of_stream,
             me.headers_pseudo_order.clone(),
-            headers_stream_dependency,
+            #[cfg(not(feature = "unstable"))]
+            me.headers_stream_dependency,
+            #[cfg(feature = "unstable")]
+            request_headers_stream_dependency.or(me.headers_stream_dependency),
         )?;
 
         let mut stream = me.store.insert(stream.id, stream);

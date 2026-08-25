@@ -7,49 +7,6 @@ use crate::hpack::BytesStr;
 use bytes::Bytes;
 use std::fmt;
 
-/// Overrides the deprecated stream dependency fields in one request's
-/// HEADERS frame.
-///
-/// Insert this value into [`http::Request::extensions_mut`] before calling
-/// [`crate::client::SendRequest::send_request`]. If the extension is absent,
-/// the request uses the default set by
-/// [`crate::client::Builder::headers_stream_dependency`].
-///
-/// This controls the legacy fields described by [RFC 9113 section 5.3.2]. It
-/// is unrelated to the HTTP `priority` header and PRIORITY_UPDATE frames.
-///
-/// # Examples
-///
-/// ```
-/// use http2::{
-///     ext::HeadersStreamDependency,
-///     frame::{StreamDependency, StreamId},
-/// };
-///
-/// let dependency = StreamDependency::new(StreamId::from(1), 146, true);
-/// let _request = http::Request::builder()
-///     .extension(HeadersStreamDependency::new(dependency))
-///     .body(())?;
-/// # Ok::<(), http::Error>(())
-/// ```
-///
-/// [RFC 9113 section 5.3.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.3.2
-#[cfg(feature = "unstable")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HeadersStreamDependency(StreamDependency);
-
-#[cfg(feature = "unstable")]
-impl HeadersStreamDependency {
-    /// Creates a per-request override from an HTTP/2 stream dependency.
-    pub fn new(stream_dependency: StreamDependency) -> Self {
-        Self(stream_dependency)
-    }
-
-    pub(crate) fn into_inner(self) -> StreamDependency {
-        self.0
-    }
-}
-
 /// Represents the `:protocol` pseudo-header used by
 /// the [Extended CONNECT Protocol].
 ///
@@ -96,5 +53,65 @@ impl AsRef<[u8]> for Protocol {
 impl fmt::Debug for Protocol {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.value.fmt(f)
+    }
+}
+
+/// Overrides the deprecated stream dependency fields in one request's
+/// HEADERS frame.
+///
+/// Insert this value into [`http::Request::extensions_mut`] before calling
+/// [`crate::client::SendRequest::send_request`]. If the extension is absent,
+/// the request uses the default set by
+/// [`crate::client::Builder::headers_stream_dependency`].
+///
+/// This controls the legacy fields described by [RFC 9113 section 5.3.2]. It
+/// is unrelated to the HTTP `priority` header and PRIORITY_UPDATE frames.
+///
+/// # Examples
+///
+/// ```
+/// use http2::{
+///     ext::HeadersStreamDependency,
+///     frame::{StreamDependency, StreamId},
+/// };
+///
+/// let dependency = StreamDependency::new(StreamId::from(1), 146, true);
+/// let _request = http::Request::builder()
+///     .extension(HeadersStreamDependency::from(dependency))
+///     .body(())?;
+/// # Ok::<(), http::Error>(())
+/// ```
+///
+/// [RFC 9113 section 5.3.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.3.2
+#[cfg(feature = "unstable")]
+#[derive(Clone, Copy, Hash, Eq, PartialEq)]
+pub struct HeadersStreamDependency(StreamDependency);
+
+#[cfg(feature = "unstable")]
+impl HeadersStreamDependency {
+    /// Consumes this request override and returns its wrapped [`StreamDependency`].
+    pub(crate) fn into_inner(self) -> StreamDependency {
+        self.0
+    }
+}
+
+#[cfg(feature = "unstable")]
+impl From<StreamDependency> for HeadersStreamDependency {
+    fn from(stream_dependency: StreamDependency) -> Self {
+        Self(stream_dependency)
+    }
+}
+
+#[cfg(feature = "unstable")]
+impl AsRef<StreamDependency> for HeadersStreamDependency {
+    fn as_ref(&self) -> &StreamDependency {
+        &self.0
+    }
+}
+
+#[cfg(feature = "unstable")]
+impl fmt::Debug for HeadersStreamDependency {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
     }
 }

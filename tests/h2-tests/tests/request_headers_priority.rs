@@ -76,7 +76,7 @@ async fn request_dependency_overrides_are_isolated_on_reused_connection() {
         let root_dependency = frame::StreamDependency::new(StreamId::zero(), 219, true);
         root_override
             .extensions_mut()
-            .insert(h2::ext::HeadersStreamDependency::new(root_dependency));
+            .insert(h2::ext::HeadersStreamDependency::from(root_dependency));
         let (root_response, _root_stream) = client.send_request(root_override, true).unwrap();
 
         let mut stream_override = Request::get("https://example.com/stream-override")
@@ -85,7 +85,7 @@ async fn request_dependency_overrides_are_isolated_on_reused_connection() {
         let stream_dependency = frame::StreamDependency::new(StreamId::from(1), 146, true);
         stream_override
             .extensions_mut()
-            .insert(h2::ext::HeadersStreamDependency::new(stream_dependency));
+            .insert(h2::ext::HeadersStreamDependency::from(stream_dependency));
         let (stream_response, _stream) = client.send_request(stream_override, true).unwrap();
 
         let inherited_again = Request::get("https://example.com/inherited-again")
