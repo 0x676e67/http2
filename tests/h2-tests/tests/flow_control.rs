@@ -544,6 +544,117 @@ async fn stream_error_release_connection_capacity() {
     join(srv, client).await;
 }
 
+#[tokio::test]
+async fn recv_stream_drop_releases_only_buffered_connection_capacity() {
+    h2_support::trace_init!();
+
+    const FRAME_LEN: usize = 16_384;
+    const TOTAL_LEN: usize = FRAME_LEN * 2;
+
+    // Exercise all relationships between buffered and in-flight capacity:
+    // equal, buffered > in-flight, and buffered < in-flight.
+    for read_frames in 0usize..=1 {
+        for released_frames in 0usize..=1 {
+            let expected_used = read_frames.saturating_sub(released_frames) * FRAME_LEN;
+            let (io, mut peer) = mock::new();
+
+            let peer = async move {
+                let _ = peer.assert_server_handshake().await;
+                peer.send_frame(frames::headers(1).request("POST", "https://example.com/"))
+                    .await;
+                for _ in 0..2 {
+                    peer.send_frame(frames::data(1, vec![0; FRAME_LEN])).await;
+                }
+
+                peer.recv_frame(frames::window_update(0, (TOTAL_LEN - expected_used) as u32))
+                    .await;
+                if released_frames > 0 {
+                    peer.recv_frame(frames::window_update(1, FRAME_LEN as u32))
+                        .await;
+                }
+            };
+
+            let server = async move {
+                let mut server = server::handshake(io).await.unwrap();
+                let (request, _respond) = server.next().await.unwrap().unwrap();
+                let mut body = request.into_body();
+
+                for _ in 0..read_frames {
+                    assert_eq!(body.data().await.unwrap().unwrap().len(), FRAME_LEN);
+                }
+
+                let mut flow = body.flow_control().clone();
+                for _ in 0..released_frames {
+                    flow.release_capacity(FRAME_LEN).unwrap();
+                }
+                drop(body);
+
+                assert_eq!(flow.used_capacity(), expected_used);
+
+                let _ = server.next().await;
+            };
+
+            join(peer, server).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn recv_stream_drop_does_not_charge_budget_for_ignored_data() {
+    h2_support::trace_init!();
+
+    let (io, mut client) = mock::new();
+    let (dropped_tx, dropped_rx) = oneshot::channel();
+    let (done_tx, done_rx) = oneshot::channel();
+
+    let client = async move {
+        let settings = client.assert_server_handshake().await;
+        assert_default_settings!(settings);
+        client
+            .send_frame(frames::headers(1).request("POST", "https://example.com/"))
+            .await;
+        dropped_rx.await.unwrap();
+
+        for _ in 0..3 {
+            client.send_frame(frames::data(1, "a")).await;
+        }
+        client.ping_pong([7; 8]).await;
+
+        client
+            .send_frame(
+                frames::headers(3)
+                    .request("GET", "https://example.com/next")
+                    .eos(),
+            )
+            .await;
+        client
+            .recv_frame(frames::headers(3).response(200).eos())
+            .await;
+        done_tx.send(()).unwrap();
+    };
+
+    let server = async move {
+        let mut builder = server::Builder::new();
+        // Each one-byte frame costs 255 bytes. The third frame would exhaust
+        // this budget if ignored DATA were still charged after dropping it.
+        builder.data_frame_budget(510);
+        let mut server = builder.handshake::<_, Bytes>(io).await.unwrap();
+
+        let (request, respond1) = server.next().await.unwrap().unwrap();
+        drop(request.into_body());
+        dropped_tx.send(()).unwrap();
+
+        let (_request, mut respond3) = server.next().await.unwrap().unwrap();
+        respond3.send_response(Response::new(()), true).unwrap();
+
+        let mut closed = poll_fn(|cx| server.poll_closed(cx));
+        closed.drive(done_rx).await.unwrap();
+        drop(respond1);
+    };
+
+    join(client, server).await;
+}
+
 // Regression test for TODO
 #[tokio::test]
 async fn padded_data_stream_error_releases_connection_capacity() {
