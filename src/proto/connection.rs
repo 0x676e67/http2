@@ -85,9 +85,30 @@ pub(crate) struct Config {
     pub remote_reset_stream_max: usize,
     pub local_error_reset_streams_max: Option<usize>,
     pub settings: frame::Settings,
+    pub data_frame_budget: usize,
     pub headers_pseudo_order: Option<PseudoOrder>,
     pub headers_stream_dependency: Option<StreamDependency>,
     pub priorities: Option<Priorities>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DataFrameBudget {
+    Auto,
+    Configured(usize),
+}
+
+impl DataFrameBudget {
+    pub(crate) fn resolve(self, connection_window: Option<WindowSize>) -> usize {
+        match self {
+            Self::Configured(budget) => budget,
+            Self::Auto => {
+                let window = connection_window.unwrap_or(DEFAULT_INITIAL_WINDOW_SIZE);
+                let budget = window as usize / 2;
+
+                budget.max(DEFAULT_DATA_FRAME_BUDGET)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -149,6 +170,7 @@ where
                     .max_concurrent_streams()
                     .map(|max| max as usize),
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
+                data_frame_budget: config.data_frame_budget,
                 headers_stream_dependency: config.headers_stream_dependency,
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
             }
@@ -779,5 +801,43 @@ where
     fn drop(&mut self) {
         // Ignore errors as this indicates that the mutex is poisoned.
         let _ = self.inner.streams.recv_eof(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_data_frame_budget_scales_with_connection_window() {
+        assert_eq!(
+            DataFrameBudget::Auto.resolve(None),
+            DEFAULT_INITIAL_WINDOW_SIZE as usize / 2
+        );
+        assert_eq!(
+            DataFrameBudget::Auto.resolve(Some(DEFAULT_INITIAL_WINDOW_SIZE)),
+            DEFAULT_INITIAL_WINDOW_SIZE as usize / 2
+        );
+        assert_eq!(DataFrameBudget::Auto.resolve(Some(1024 * 1024)), 512 * 1024);
+    }
+
+    #[test]
+    fn auto_data_frame_budget_has_minimum() {
+        assert_eq!(
+            DataFrameBudget::Auto.resolve(Some(1)),
+            DEFAULT_DATA_FRAME_BUDGET
+        );
+        assert_eq!(
+            DataFrameBudget::Auto.resolve(Some(MAX_WINDOW_SIZE)),
+            MAX_WINDOW_SIZE as usize / 2
+        );
+    }
+
+    #[test]
+    fn configured_data_frame_budget_is_unchanged() {
+        assert_eq!(
+            DataFrameBudget::Configured(123).resolve(Some(MAX_WINDOW_SIZE)),
+            123
+        );
     }
 }

@@ -582,11 +582,9 @@ impl Inner {
         }
 
         let actions = &mut self.actions;
-        let mut send_buffer = send_buffer.inner.lock();
-        let send_buffer = &mut *send_buffer;
 
         self.counts.transition(stream, |counts, stream| {
-           tracing::trace!(
+            tracing::trace!(
                 "recv_headers; stream={:?}; state={:?}",
                 stream.id,
                 stream.state
@@ -597,15 +595,22 @@ impl Inner {
                     Ok(()) => Ok(()),
                     Err(RecvHeaderBlockError::Oversize(resp)) => {
                         if let Some(resp) = resp {
+                            let mut send_buffer = send_buffer.inner.lock();
                             let sent = actions.send.send_headers(
-                                resp, send_buffer, stream, counts, &mut actions.task);
+                                resp,
+                                &mut send_buffer,
+                                stream,
+                                counts,
+                                &mut actions.task,
+                            );
                             debug_assert!(sent.is_ok(), "oversize response should not fail");
 
                             actions.send.schedule_implicit_reset(
                                 stream,
                                 Reason::PROTOCOL_ERROR,
                                 counts,
-                                &mut actions.task);
+                                &mut actions.task,
+                            );
 
                             actions.recv.enqueue_reset_expiration(stream, counts);
 
@@ -627,7 +632,7 @@ impl Inner {
                 actions.recv.recv_trailers(frame, stream)
             };
 
-            actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+            actions.reset_on_recv_stream_err_deferred(send_buffer, stream, counts, res)
         })
     }
 
@@ -679,12 +684,25 @@ impl Inner {
         };
 
         let actions = &mut self.actions;
-        let mut send_buffer = send_buffer.inner.lock();
-        let send_buffer = &mut *send_buffer;
 
         self.counts.transition(stream, |counts, stream| {
             let sz = frame.flow_controlled_len();
-            let res = actions.recv.recv_data(frame, stream);
+            let is_end_stream = frame.is_end_stream();
+            let payload_len = frame.payload().len();
+            // Only DATA retained for the application contributes to the
+            // buffering budget. Empty frames keep their separate lifetime
+            // limit even when the stream is no longer receiving.
+            let should_record_data_frame =
+                payload_len == 0 || (stream.is_recv && !stream.state.is_local_error());
+            let mut res = actions.recv.recv_data(frame, stream);
+            // A stream can receive at most one final DATA frame, so it cannot
+            // be used to create unbounded framing overhead on that stream.
+            if res.is_ok() && !is_end_stream && should_record_data_frame {
+                res = counts.record_data_frame(payload_len).map_err(|_| {
+                    tracing::debug!("too many small DATA frames");
+                    Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_data_frames")
+                });
+            }
 
             // Any stream error after receiving a DATA frame means
             // we won't give the data to the user, and so they can't
@@ -694,7 +712,7 @@ impl Inner {
                     .recv
                     .release_connection_capacity(sz as WindowSize, &mut None);
             }
-            actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+            actions.reset_on_recv_stream_err_deferred(send_buffer, stream, counts, res)
         })
     }
 
@@ -1547,7 +1565,19 @@ impl OpaqueStreamRef {
 
         let mut stream = me.store.resolve(self.key);
 
-        me.actions.recv.poll_data(cx, &mut stream)
+        me.actions
+            .recv
+            .poll_data(cx, &mut stream)
+            .map(|result| match result {
+                Some(Ok(data)) => {
+                    if data.is_budgeted {
+                        me.counts.release_data_frame(data.payload.len());
+                    }
+                    Some(Ok(data.payload))
+                }
+                Some(Err(err)) => Some(Err(err)),
+                None => None,
+            })
     }
 
     pub fn poll_trailers(&mut self, cx: &Context) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
@@ -1595,7 +1625,9 @@ impl OpaqueStreamRef {
 
         let mut stream = me.store.resolve(self.key);
         stream.is_recv = false;
-        me.actions.recv.clear_recv_buffer(&mut stream);
+        me.actions
+            .recv
+            .clear_recv_buffer(&mut stream, &mut me.actions.task, &mut me.counts);
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -1679,7 +1711,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
             // it anymore.
             actions
                 .recv
-                .release_closed_capacity(stream, &mut actions.task);
+                .release_closed_capacity(stream, &mut actions.task, counts);
 
             // We won't be able to reach our push promises anymore
             let mut ppp = stream.pending_push_promises.take();
@@ -1768,6 +1800,21 @@ impl Actions {
 
             Ok(())
         })
+    }
+
+    fn reset_on_recv_stream_err_deferred<B>(
+        &mut self,
+        send_buffer: &SendBuffer<B>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        res: Result<(), Error>,
+    ) -> Result<(), Error> {
+        if matches!(res, Err(Error::Reset(..))) {
+            let mut send_buffer = send_buffer.inner.lock();
+            self.reset_on_recv_stream_err(&mut send_buffer, stream, counts, res)
+        } else {
+            res
+        }
     }
 
     fn reset_on_recv_stream_err<B>(

@@ -80,6 +80,12 @@ pub struct Config {
     /// When this gets exceeded, we issue GOAWAYs.
     pub local_max_error_reset_streams: Option<usize>,
 
+    /// connection-level budget (in bytes) for DATA framing overhead.
+    ///
+    /// The default is half the initial connection window, with a minimum of
+    /// 25,600 bytes.
+    pub data_frame_budget: usize,
+
     /// Priority of the headers stream
     pub headers_stream_dependency: Option<StreamDependency>,
 
