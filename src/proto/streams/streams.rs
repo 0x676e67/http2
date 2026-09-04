@@ -16,7 +16,7 @@ use super::{
     Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId,
 };
 #[cfg(feature = "unstable")]
-use crate::ext::HeadersStreamDependency;
+use crate::ext::HeadersPriority;
 use crate::{
     client,
     codec::{Codec, SendError, UserError},
@@ -313,8 +313,8 @@ where
         #[cfg(feature = "unstable")]
         let request_headers_stream_dependency = request
             .extensions_mut()
-            .remove::<HeadersStreamDependency>()
-            .map(HeadersStreamDependency::into_inner);
+            .remove::<HeadersPriority>()
+            .map(HeadersPriority::into_inner);
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
