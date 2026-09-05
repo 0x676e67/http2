@@ -2,7 +2,7 @@
 
 A Tokio aware, HTTP/2 client & server implementation for Rust.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![GitHub License](https://img.shields.io/github/license/0x676e67/http2)](https://github.com/0x676e67/http2/blob/main/LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/http2.svg)](https://crates.io/crates/http2)
 [![Documentation](https://docs.rs/http2/badge.svg)][dox]
 
