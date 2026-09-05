@@ -15,6 +15,8 @@ use super::{
     store::{self, Entry, Resolve, Store},
     sync::Mutex,
 };
+#[cfg(feature = "unstable")]
+use crate::ext::HeadersPriority;
 use crate::{
     client,
     codec::{Codec, SendError, UserError},
@@ -308,6 +310,11 @@ where
         use super::stream::ContentLength;
 
         let protocol = request.extensions_mut().remove::<Protocol>();
+        #[cfg(feature = "unstable")]
+        let request_headers_stream_dependency = request
+            .extensions_mut()
+            .remove::<HeadersPriority>()
+            .map(HeadersPriority::into_inner);
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -362,7 +369,10 @@ where
             protocol,
             end_of_stream,
             me.headers_pseudo_order.clone(),
+            #[cfg(not(feature = "unstable"))]
             me.headers_stream_dependency,
+            #[cfg(feature = "unstable")]
+            request_headers_stream_dependency.or(me.headers_stream_dependency),
         )?;
 
         let mut stream = me.store.insert(stream.id, stream);
