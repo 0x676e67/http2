@@ -2,9 +2,9 @@
 
 A Tokio aware, HTTP/2 client & server implementation for Rust.
 
+[![CI](https://github.com/0x676e67/http2/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/0x676e67/http2/actions/workflows/CI.yml)
 [![GitHub License](https://img.shields.io/github/license/0x676e67/http2)](https://github.com/0x676e67/http2/blob/main/LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/http2.svg)](https://crates.io/crates/http2)
-[![Documentation](https://docs.rs/http2/badge.svg)][dox]
 
 More information about this crate can be found in the [crate documentation][dox].
 
