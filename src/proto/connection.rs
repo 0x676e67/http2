@@ -750,11 +750,31 @@ enum ReceivedFrame {
 
 impl<T, B> Connection<T, client::Peer, B>
 where
-    T: AsyncRead + AsyncWrite,
+    T: AsyncRead + AsyncWrite + Unpin,
     B: Buf,
 {
     pub(crate) fn streams(&self) -> &Streams<B, client::Peer> {
         &self.inner.streams
+    }
+
+    pub(crate) fn set_client_initial_window_size(
+        &mut self,
+        size: WindowSize,
+    ) -> Result<(), UserError> {
+        self.inner
+            .streams
+            .validate_initial_stream_window_size_update(size)?;
+        self.set_initial_window_size(size)
+    }
+
+    pub(crate) fn set_initial_stream_window_size(
+        &mut self,
+        target: WindowSize,
+        advertised: WindowSize,
+    ) {
+        self.inner
+            .streams
+            .set_initial_stream_window_size(target, advertised);
     }
 }
 

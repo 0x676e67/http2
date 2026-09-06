@@ -1,4 +1,4 @@
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use h2_support::prelude::*;
 use http::HeaderValue;
 use std::convert::TryInto;
@@ -7,12 +7,21 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
 use tokio::io::ReadBuf;
 
 const PARTIAL_WRITE_LEN: usize = 7;
 const PEER_SETTINGS_AND_PING: &[u8] = &[
     // Empty initial SETTINGS followed by a non-ACK PING.
     0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+];
+const PEER_SETTINGS_AND_ACK: &[u8] = &[
+    // Empty initial SETTINGS followed by the ACK for the client SETTINGS.
+    0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 0,
+];
+const PEER_SETTINGS_MAX_CONCURRENT_ONE: &[u8] = &[
+    // Initial SETTINGS with MAX_CONCURRENT_STREAMS set to one.
+    0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1,
 ];
 #[derive(Debug)]
 enum IoCall {
@@ -41,6 +50,7 @@ type RecordingIoParts = (
 #[derive(Clone, Copy)]
 enum WriteMode {
     PartialThenPending,
+    RequestPartialThenPending,
     Complete,
     Fail(io::ErrorKind),
     PendingThenFail(io::ErrorKind),
@@ -114,7 +124,15 @@ impl AsyncWrite for RecordingIo {
             WriteMode::PartialThenPending if call == 0 => {
                 Poll::Ready(Ok(PARTIAL_WRITE_LEN.min(buf.len())))
             }
+            WriteMode::RequestPartialThenPending if call == 0 => Poll::Ready(Ok(buf.len())),
+            WriteMode::RequestPartialThenPending if call == 1 => {
+                Poll::Ready(Ok(buf.len().saturating_sub(5)))
+            }
             WriteMode::PartialThenPending if self.write_blocked.load(Ordering::SeqCst) => {
+                *self.blocked_waker.lock().unwrap() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            WriteMode::RequestPartialThenPending if self.write_blocked.load(Ordering::SeqCst) => {
                 *self.blocked_waker.lock().unwrap() = Some(cx.waker().clone());
                 Poll::Pending
             }
@@ -122,7 +140,9 @@ impl AsyncWrite for RecordingIo {
                 *self.blocked_waker.lock().unwrap() = Some(cx.waker().clone());
                 Poll::Pending
             }
-            WriteMode::PartialThenPending | WriteMode::Complete => Poll::Ready(Ok(buf.len())),
+            WriteMode::PartialThenPending
+            | WriteMode::RequestPartialThenPending
+            | WriteMode::Complete => Poll::Ready(Ok(buf.len())),
             WriteMode::Fail(kind) | WriteMode::PendingThenFail(kind) => {
                 Poll::Ready(Err(kind.into()))
             }
@@ -1045,4 +1065,509 @@ async fn handshake_defers_write_error_to_connection() {
             assert_eq!(write_calls, 1);
         }
     }
+}
+
+#[tokio::test]
+async fn initial_stream_window_update_follows_each_request() {
+    h2_support::trace_init!();
+
+    const SETTINGS_WINDOW: u32 = 131_072;
+    const TARGET_WINDOW: u32 = 12 * 1024 * 1024;
+    const STREAM_INCREMENT: u32 = TARGET_WINDOW - SETTINGS_WINDOW;
+
+    for (target, expected_stream_updates) in [
+        (SETTINGS_WINDOW, Vec::new()),
+        (
+            TARGET_WINDOW,
+            vec![(3, STREAM_INCREMENT), (5, STREAM_INCREMENT)],
+        ),
+    ] {
+        let (io, calls, _write_blocked, _blocked_waker) =
+            recording_io(WriteMode::Complete, Bytes::new());
+        let mut builder = client::Builder::new();
+        builder
+            .initial_window_size(SETTINGS_WINDOW)
+            .initial_connection_window_size(TARGET_WINDOW)
+            .initial_stream_window_size(target)
+            .initial_stream_id(3);
+
+        let (mut send_request, mut connection) = builder
+            .handshake::<_, Bytes>(io)
+            .now_or_never()
+            .expect("handshake attempted transport I/O")
+            .unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+
+        let first = send_request
+            .send_request(
+                Request::get("https://example.com/first").body(()).unwrap(),
+                true,
+            )
+            .unwrap();
+        let second = send_request
+            .send_request(
+                Request::get("https://example.com/second").body(()).unwrap(),
+                true,
+            )
+            .unwrap();
+
+        let waker = Waker::from(Arc::new(WakeCounter(AtomicUsize::new(0))));
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+
+        let calls = calls.lock().unwrap();
+        let writes = calls
+            .iter()
+            .filter_map(|call| match call {
+                IoCall::Write(buf) => Some(buf),
+                IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 2, "unexpected write item count");
+
+        let initial_frames = wire_frames(writes[0]);
+        assert_eq!(
+            initial_frames
+                .iter()
+                .map(|frame| (frame.kind, frame.stream_id))
+                .collect::<Vec<_>>(),
+            [(4, 0), (8, 0)]
+        );
+        assert!(frame_payload(writes[0], &initial_frames[0])
+            .chunks_exact(6)
+            .any(|setting| {
+                u16::from_be_bytes([setting[0], setting[1]]) == 4
+                    && u32::from_be_bytes([setting[2], setting[3], setting[4], setting[5]])
+                        == SETTINGS_WINDOW
+            }));
+        assert_eq!(
+            u32::from_be_bytes(
+                frame_payload(writes[0], &initial_frames[1])
+                    .try_into()
+                    .unwrap()
+            ),
+            TARGET_WINDOW - h2::frame::DEFAULT_INITIAL_WINDOW_SIZE
+        );
+
+        let request_frames = encoded_frames(writes[1]);
+        let layout = request_frames
+            .iter()
+            .map(|frame| (frame.kind, frame.stream_id))
+            .collect::<Vec<_>>();
+        let expected_layout = if expected_stream_updates.is_empty() {
+            vec![(1, 3), (1, 5)]
+        } else {
+            vec![(1, 3), (8, 3), (1, 5), (8, 5)]
+        };
+        assert_eq!(layout, expected_layout);
+
+        let stream_updates = request_frames
+            .iter()
+            .filter(|frame| frame.kind == 8)
+            .map(|frame| {
+                (
+                    frame.stream_id,
+                    u32::from_be_bytes(frame_payload(writes[1], frame).try_into().unwrap()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stream_updates, expected_stream_updates);
+
+        drop((first, second));
+    }
+
+    for cancel_pending in [false, true] {
+        let (io, calls, _write_blocked, _blocked_waker) =
+            recording_io(WriteMode::Complete, Bytes::new());
+        let mut builder = client::Builder::new();
+        builder
+            .initial_window_size(SETTINGS_WINDOW)
+            .initial_stream_window_size(TARGET_WINDOW)
+            .initial_max_send_streams(0);
+        let (mut send_request, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
+        let pending = send_request
+            .send_request(
+                Request::get("https://example.com/pending")
+                    .body(())
+                    .unwrap(),
+                true,
+            )
+            .unwrap();
+        let pending = (!cancel_pending).then_some(pending);
+
+        let waker = Waker::from(Arc::new(WakeCounter(AtomicUsize::new(0))));
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+
+        let wire = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .fold(Vec::new(), |mut wire, call| {
+                if let IoCall::Write(buf) = call {
+                    wire.extend_from_slice(buf);
+                }
+                wire
+            });
+        assert!(wire_frames(&wire).iter().all(|frame| frame.stream_id == 0));
+
+        drop(pending);
+    }
+
+    // Upstream keeps a canceled pending-open request in the queue. Once the
+    // peer grants a stream slot, its complete request item is followed by the
+    // reset; the companion update must neither precede HEADERS nor become an
+    // orphaned frame.
+    let (io, calls, _write_blocked, _blocked_waker) = recording_io(
+        WriteMode::Complete,
+        Bytes::from_static(PEER_SETTINGS_MAX_CONCURRENT_ONE),
+    );
+    let mut builder = client::Builder::new();
+    builder
+        .initial_window_size(SETTINGS_WINDOW)
+        .initial_stream_window_size(TARGET_WINDOW)
+        .initial_max_send_streams(0);
+    let (mut send_request, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
+    let (response, mut send_stream) = send_request
+        .send_request(
+            Request::get("https://example.com/canceled")
+                .body(())
+                .unwrap(),
+            true,
+        )
+        .unwrap();
+    send_stream.send_reset(h2::Reason::CANCEL);
+    drop((response, send_stream));
+
+    let waker = Waker::from(Arc::new(WakeCounter(AtomicUsize::new(0))));
+    let mut cx = Context::from_waker(&waker);
+    for _ in 0..3 {
+        assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+    }
+
+    let wire = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .fold(Vec::new(), |mut wire, call| {
+            if let IoCall::Write(buf) = call {
+                wire.extend_from_slice(buf);
+            }
+            wire
+        });
+    let request_layout = wire_frames(&wire)
+        .into_iter()
+        .filter(|frame| frame.stream_id != 0)
+        .map(|frame| (frame.kind, frame.stream_id))
+        .collect::<Vec<_>>();
+    assert_eq!(request_layout, [(1, 1), (8, 1), (3, 1)]);
+}
+
+#[tokio::test]
+async fn initial_stream_window_update_follows_complete_header_block() {
+    h2_support::trace_init!();
+
+    let (io, calls, _write_blocked, _blocked_waker) =
+        recording_io(WriteMode::Complete, Bytes::new());
+    let mut builder = client::Builder::new();
+    builder.initial_stream_window_size(1024 * 1024);
+    let (mut send_request, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
+
+    let mut request = Request::builder().uri("https://example.com/large");
+    for (name, value) in build_large_headers() {
+        request = request.header(name, value);
+    }
+    let large = send_request
+        .send_request(request.body(()).unwrap(), true)
+        .unwrap();
+    let small = send_request
+        .send_request(
+            Request::get("https://example.com/small").body(()).unwrap(),
+            true,
+        )
+        .unwrap();
+
+    let waker = Waker::from(Arc::new(WakeCounter(AtomicUsize::new(0))));
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+
+    let calls = calls.lock().unwrap();
+    let writes = calls
+        .iter()
+        .enumerate()
+        .filter_map(|(index, call)| match call {
+            IoCall::Write(buf) => Some((index, buf)),
+            IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(writes.len() > 3, "large header block was not split");
+
+    let mut request_wire = Vec::new();
+    for (_, write) in writes.iter().skip(1) {
+        request_wire.extend_from_slice(write);
+    }
+    let frames = encoded_frames(&request_wire);
+    assert_eq!(frames[0].kind, 1);
+    assert_eq!(frames[0].stream_id, 1);
+    assert_eq!(frames[0].flags & 0x4, 0);
+
+    let first_update = frames
+        .iter()
+        .position(|frame| frame.kind == 8 && frame.stream_id == 1)
+        .expect("stream 1 WINDOW_UPDATE missing");
+    assert!(first_update > 1);
+    assert!(frames[1..first_update]
+        .iter()
+        .all(|frame| frame.kind == 9 && frame.stream_id == 1));
+    assert_ne!(frames[first_update - 1].flags & 0x4, 0);
+    assert_eq!(
+        frames[first_update + 1..]
+            .iter()
+            .map(|frame| (frame.kind, frame.stream_id))
+            .collect::<Vec<_>>(),
+        [(1, 3), (8, 3)]
+    );
+
+    let first_header_write = writes[1].0;
+    let first_update_write = writes
+        .iter()
+        .skip(1)
+        .find_map(|(index, write)| {
+            encoded_frames(write)
+                .iter()
+                .any(|frame| frame.kind == 8 && frame.stream_id == 1)
+                .then_some(*index)
+        })
+        .expect("stream 1 WINDOW_UPDATE write missing");
+    assert!(calls[first_header_write..first_update_write]
+        .iter()
+        .all(|call| !matches!(call, IoCall::Flush)));
+
+    drop((large, small));
+    drop(calls);
+
+    let (io, calls, write_blocked, blocked_waker) =
+        recording_io(WriteMode::RequestPartialThenPending, Bytes::new());
+    let mut builder = client::Builder::new();
+    builder.initial_stream_window_size(1024 * 1024);
+    let (mut send_request, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
+    let request = send_request
+        .send_request(
+            Request::get("https://example.com/partial")
+                .body(())
+                .unwrap(),
+            true,
+        )
+        .unwrap();
+
+    let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    let waker = Waker::from(wake_counter.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+
+    let (request_item, blocked_call_count) = {
+        let calls = calls.lock().unwrap();
+        let writes = calls
+            .iter()
+            .filter_map(|call| match call {
+                IoCall::Write(buf) => Some(buf),
+                IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 3);
+        assert_eq!(writes[2].as_ref(), &writes[1][writes[1].len() - 5..]);
+        ((*writes[1]).clone(), calls.len())
+    };
+
+    write_blocked.store(false, Ordering::SeqCst);
+    let blocked_waker = blocked_waker
+        .lock()
+        .unwrap()
+        .take()
+        .expect("request write task was not registered");
+    let wake_count = wake_counter.0.load(Ordering::SeqCst);
+    blocked_waker.wake();
+    assert!(wake_counter.0.load(Ordering::SeqCst) > wake_count);
+    assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+
+    let calls = calls.lock().unwrap();
+    let resumed = calls[blocked_call_count..]
+        .iter()
+        .find_map(|call| match call {
+            IoCall::Write(buf) => Some(buf),
+            IoCall::Read | IoCall::Flush | IoCall::Shutdown => None,
+        })
+        .expect("partial request item was not resumed");
+    assert_eq!(resumed.as_ref(), &request_item[request_item.len() - 5..]);
+    let mut request_wire = request_item[..request_item.len() - 5].to_vec();
+    request_wire.extend_from_slice(resumed);
+    assert_eq!(
+        encoded_frames(&request_wire)
+            .iter()
+            .map(|frame| (frame.kind, frame.stream_id))
+            .collect::<Vec<_>>(),
+        [(1, 1), (8, 1)]
+    );
+
+    drop(request);
+}
+
+#[tokio::test]
+async fn invalid_initial_stream_window_fails_before_io() {
+    h2_support::trace_init!();
+
+    for (advertised, target) in [(131_072, 65_535), (65_535, u32::MAX)] {
+        let (io, calls, _write_blocked, _blocked_waker) =
+            recording_io(WriteMode::Complete, Bytes::new());
+        let mut builder = client::Builder::new();
+        builder
+            .initial_window_size(advertised)
+            .initial_stream_window_size(target);
+
+        let result = builder
+            .handshake::<_, Bytes>(io)
+            .now_or_never()
+            .expect("handshake attempted transport I/O");
+        let err = match result {
+            Ok(_) => panic!("invalid stream window was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.to_string(),
+            "user error: invalid initial stream window size"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn dynamic_initial_window_cannot_outgrow_pending_stream_update() {
+    h2_support::trace_init!();
+
+    let (io, _calls, _write_blocked, _blocked_waker) = recording_io(
+        WriteMode::Complete,
+        Bytes::from_static(PEER_SETTINGS_AND_ACK),
+    );
+    let mut builder = client::Builder::new();
+    builder.initial_stream_window_size(i32::MAX as u32);
+    let (mut send_request, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
+
+    let waker = Waker::from(Arc::new(WakeCounter(AtomicUsize::new(0))));
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+
+    let request = send_request
+        .send_request(
+            Request::get("https://example.com/pending-update")
+                .body(())
+                .unwrap(),
+            true,
+        )
+        .unwrap();
+    let err = connection.set_initial_window_size(65_536).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "user error: invalid initial stream window size"
+    );
+    connection.set_initial_window_size(65_535).unwrap();
+
+    drop(request);
+}
+
+#[tokio::test]
+async fn initial_stream_window_is_active_before_settings_ack() {
+    h2_support::trace_init!();
+
+    const SETTINGS_WINDOW: u32 = 131_072;
+    const TARGET_WINDOW: u32 = 163_840;
+    const CONNECTION_WINDOW: u32 = 1024 * 1024;
+    const CHUNK_SIZE: usize = 16_384;
+    const CHUNK_COUNT: usize = 9;
+
+    let (io, mut server) = mock::new();
+
+    let server = async move {
+        // Advertise the server SETTINGS, but deliberately withhold the ACK for
+        // the client's SETTINGS throughout the response body. This
+        // intentionally violates RFC 9113 section 6.5.3 to stress the client's
+        // pre-ACK receive accounting; it is not a normal peer frame sequence.
+        server.send_frame(frames::settings()).await;
+        server.read_preface().await.unwrap();
+
+        let client_settings = server.next().await.unwrap().unwrap();
+        let client_settings = match client_settings {
+            h2::frame::Frame::Settings(settings) if !settings.is_ack() => settings,
+            frame => panic!("expected client SETTINGS, got {:?}", frame),
+        };
+        assert_eq!(client_settings.initial_window_size(), Some(SETTINGS_WINDOW));
+
+        let mut saw_headers = false;
+        let mut saw_stream_update = false;
+        while !(saw_headers && saw_stream_update) {
+            match server.next().await.unwrap().unwrap() {
+                h2::frame::Frame::Settings(settings) if settings.is_ack() => {}
+                h2::frame::Frame::WindowUpdate(update) if update.stream_id().is_zero() => {
+                    assert_eq!(
+                        update.size_increment(),
+                        CONNECTION_WINDOW - h2::frame::DEFAULT_INITIAL_WINDOW_SIZE
+                    );
+                }
+                h2::frame::Frame::Headers(headers) => {
+                    assert_eq!(headers.stream_id(), StreamId::from(1));
+                    saw_headers = true;
+                }
+                h2::frame::Frame::WindowUpdate(update) => {
+                    assert!(saw_headers, "stream WINDOW_UPDATE preceded HEADERS");
+                    assert_eq!(update.stream_id(), StreamId::from(1));
+                    assert_eq!(update.size_increment(), TARGET_WINDOW - SETTINGS_WINDOW);
+                    saw_stream_update = true;
+                }
+                frame => panic!("unexpected client frame: {:?}", frame),
+            }
+        }
+
+        server.send_frame(frames::headers(1).response(200)).await;
+        for index in 0..CHUNK_COUNT {
+            let frame = frames::data(1, vec![b'x'; CHUNK_SIZE]);
+            if index + 1 == CHUNK_COUNT {
+                server.send_frame(frame.eos()).await;
+            } else {
+                server.send_frame(frame).await;
+            }
+        }
+    };
+
+    let client = async move {
+        let mut builder = client::Builder::new();
+        builder
+            .initial_window_size(SETTINGS_WINDOW)
+            .initial_connection_window_size(CONNECTION_WINDOW)
+            .initial_stream_window_size(TARGET_WINDOW);
+        let (mut send_request, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
+        let (response, _send_stream) = send_request
+            .send_request(
+                Request::get("https://example.com/large-response")
+                    .body(())
+                    .unwrap(),
+                true,
+            )
+            .unwrap();
+
+        let received = connection
+            .drive(async move {
+                let response = response.await.unwrap();
+                let mut body = response.into_body();
+                let mut received = 0;
+                while let Some(chunk) = body.data().await {
+                    received += chunk.unwrap().len();
+                }
+                received
+            })
+            .await;
+        assert_eq!(received, CHUNK_SIZE * CHUNK_COUNT);
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), join(server, client))
+        .await
+        .expect("initial stream window exchange stalled");
 }

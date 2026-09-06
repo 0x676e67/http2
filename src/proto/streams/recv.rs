@@ -8,6 +8,7 @@ use http::{HeaderMap, Request, Response};
 
 use std::cmp::Ordering;
 use std::io;
+use std::num::NonZeroU32;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
@@ -60,6 +61,9 @@ pub(super) struct Recv {
 
     /// If extended connect protocol is enabled.
     is_extended_connect_protocol_enabled: bool,
+
+    /// Receive window target for locally initiated request streams.
+    initial_target_stream_window_sz: Option<WindowSize>,
 }
 
 #[derive(Debug)]
@@ -115,12 +119,92 @@ impl Recv {
             refused: None,
             is_push_enabled: config.local_push_enabled,
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
+            initial_target_stream_window_sz: None,
         }
     }
 
     /// Returns the initial receive window size
     pub fn init_window_sz(&self) -> WindowSize {
         self.init_window_sz
+    }
+
+    pub(crate) fn set_initial_stream_window_target(
+        &mut self,
+        target: WindowSize,
+        advertised: WindowSize,
+    ) {
+        // The client sends this value before any request HEADERS. A server
+        // cannot send a response or related push until it receives that
+        // request, so it has already received and must apply the SETTINGS
+        // value first. Use it as the receive baseline before the ACK arrives;
+        // applying the ACK later sees the same value and does not add it twice
+        // (RFC 9113 §§6.5.3 and 6.9.2).
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2
+        self.init_window_sz = advertised;
+        self.initial_target_stream_window_sz = Some(target);
+    }
+
+    pub(crate) fn prepare_initial_stream_window_update(
+        &self,
+        stream: &mut Stream,
+        headers: &mut frame::Headers,
+    ) -> Result<(), UserError> {
+        let Some(target) = self.initial_target_stream_window_sz else {
+            return Ok(());
+        };
+        let current = stream.recv_flow.window_size();
+        if target <= current {
+            return Ok(());
+        }
+
+        let increment = target
+            .checked_sub(current)
+            .and_then(NonZeroU32::new)
+            .ok_or(UserError::InvalidInitialStreamWindowSize)?;
+
+        // Validate both counters before changing either one. The peer cannot
+        // send response DATA before this request opens the stream, and the
+        // update is encoded directly after its complete header block.
+        stream
+            .recv_flow
+            .available()
+            .add(increment.get())
+            .map_err(|_| UserError::InvalidInitialStreamWindowSize)?;
+        stream
+            .recv_flow
+            .inc_window(increment.get())
+            .map_err(|_| UserError::InvalidInitialStreamWindowSize)?;
+        stream
+            .recv_flow
+            .assign_capacity(increment.get())
+            .map_err(|_| UserError::InvalidInitialStreamWindowSize)?;
+        headers.set_initial_stream_window_update(increment);
+
+        Ok(())
+    }
+
+    pub(crate) fn validate_initial_stream_window_size_update(
+        &self,
+        size: WindowSize,
+    ) -> Result<(), UserError> {
+        if self.initial_target_stream_window_sz.is_none() {
+            return Ok(());
+        }
+
+        // A pending request can already contain an update calculated from the
+        // current SETTINGS baseline. Control frames are sent first, so an
+        // increase could reach the peer before that request and let it send
+        // more response DATA than our pre-ACK flow-control state permits.
+        // Keeping or lowering the baseline makes the peer's derived window no
+        // larger than ours and also keeps its old companion update below the
+        // RFC 9113 §6.9.1 limit. Supporting increases would require rewriting
+        // every request that has not reached the codec yet.
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
+        if size > self.init_window_sz {
+            return Err(UserError::InvalidInitialStreamWindowSize);
+        }
+
+        Ok(())
     }
 
     /// Returns the ID of the last processed stream

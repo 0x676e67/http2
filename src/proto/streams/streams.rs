@@ -355,7 +355,7 @@ where
         }
 
         // Convert the message
-        let headers = client::Peer::convert_send_message(
+        let mut headers = client::Peer::convert_send_message(
             stream_id,
             request,
             protocol,
@@ -363,6 +363,10 @@ where
             me.headers_pseudo_order.clone(),
             me.headers_stream_dependency,
         )?;
+
+        me.actions
+            .recv
+            .prepare_initial_stream_window_update(&mut stream, &mut headers)?;
 
         let mut stream = me.store.insert(stream.id, stream);
 
@@ -1123,6 +1127,29 @@ impl<B> Streams<B, client::Peer>
 where
     B: Buf,
 {
+    pub(crate) fn validate_initial_stream_window_size_update(
+        &self,
+        size: WindowSize,
+    ) -> Result<(), UserError> {
+        self.inner
+            .lock()
+            .actions
+            .recv
+            .validate_initial_stream_window_size_update(size)
+    }
+
+    pub(crate) fn set_initial_stream_window_size(
+        &mut self,
+        target: WindowSize,
+        advertised: WindowSize,
+    ) {
+        self.inner
+            .lock()
+            .actions
+            .recv
+            .set_initial_stream_window_target(target, advertised);
+    }
+
     pub fn poll_pending_open(
         &mut self,
         cx: &Context,
