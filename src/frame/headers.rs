@@ -67,6 +67,7 @@ pub struct Continuation {
     /// Stream ID of continuation frame
     stream_id: StreamId,
 
+    /// The encoding header block fragment
     header_block: EncodingHeaderBlock,
 
     /// Carries the client-only companion to the final END_HEADERS fragment.
