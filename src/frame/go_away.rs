@@ -41,7 +41,15 @@ impl GoAway {
         &self.debug_data
     }
 
-    pub fn load(payload: &[u8]) -> Result<GoAway, Error> {
+    pub fn load(head: Head, payload: &[u8]) -> Result<GoAway, Error> {
+        debug_assert_eq!(head.kind(), crate::frame::Kind::GoAway);
+
+        // RFC 9113 §6.8 requires a connection PROTOCOL_ERROR for a nonzero stream ID.
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.8
+        if !head.stream_id().is_zero() {
+            return Err(Error::InvalidStreamId);
+        }
+
         if payload.len() < 8 {
             return Err(Error::BadFrameSize);
         }

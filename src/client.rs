@@ -1245,7 +1245,7 @@ impl Builder {
     /// are encoded in the HEADERS frame. Customizing the order may be useful for interoperability
     /// or testing purposes.
     pub fn headers_pseudo_order(&mut self, order: PseudoOrder) -> &mut Self {
-        self.headers_pseudo_order = Some(order.into());
+        self.headers_pseudo_order = Some(order);
         self
     }
 

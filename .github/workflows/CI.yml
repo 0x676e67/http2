@@ -12,6 +12,22 @@ permissions:
   packages: write
 
 jobs:
+  ci-pass:
+    name: CI is green
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    needs:
+      - style
+      - clippy
+      - test
+      - msrv
+    steps:
+      - run: |
+          test "${{ needs.style.result }}" = success
+          test "${{ needs.clippy.result }}" = success
+          test "${{ needs.test.result }}" = success
+          test "${{ needs.msrv.result }}" = success
+
   style:
     name: Check Style
     runs-on: ubuntu-latest
@@ -71,12 +87,20 @@ jobs:
         run: ./ci/h2spec.sh
         if: matrix.rust == 'stable'
 
-  #clippy_check:
-  #  runs-on: ubuntu-latest
-  #  steps:
-  #    - uses: actions/checkout@v7
-  #    - name: Run Clippy
-  #      run: cargo clippy --all-targets --all-features
+  clippy:
+    name: Clippy
+    needs: [style]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - run: cargo clippy --lib --all-features -- -D warnings
 
   msrv:
     name: Check MSRV

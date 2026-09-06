@@ -761,8 +761,7 @@ impl Pseudo {
 
     /// Whether it has status 1xx
     pub(crate) fn is_informational(&self) -> bool {
-        self.status
-            .map_or(false, |status| status.is_informational())
+        self.status.is_some_and(|status| status.is_informational())
     }
 }
 
@@ -1081,7 +1080,7 @@ impl HeaderBlock {
                         }
                         if !self.is_over_size {
                             self.field_size += header_size;
-                            if let Err(_) = self.fields.try_append(name, value) {
+                            if self.fields.try_append(name, value).is_err() {
                                 // HeaderMap capacity exceeded — treat as over-size
                                 // so the stream is rejected downstream (RST_STREAM / 431)
                                 // instead of panicking on the 24,577th unique header.
