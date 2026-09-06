@@ -1307,6 +1307,9 @@ async fn initial_stream_window_update_follows_complete_header_block() {
         request_wire.extend_from_slice(write);
     }
     let frames = encoded_frames(&request_wire);
+    assert!(frames
+        .iter()
+        .all(|frame| frame.payload_len <= h2::frame::DEFAULT_MAX_FRAME_SIZE as usize));
     assert_eq!(frames[0].kind, 1);
     assert_eq!(frames[0].stream_id, 1);
     assert_eq!(frames[0].flags & 0x4, 0);
@@ -1345,6 +1348,63 @@ async fn initial_stream_window_update_follows_complete_header_block() {
 
     drop((large, small));
     drop(calls);
+
+    // HPACK encodes GET https://a/ in six bytes. Each literal `x` field adds
+    // six bytes around its value, and `Z` has an eight-bit Huffman code.
+    // These fixtures fill either HEADERS or its final CONTINUATION exactly.
+    // RFC 9113 §6.10 requires the companion frame to follow END_HEADERS.
+    // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.10
+    const MAX_FRAME_SIZE: usize = h2::frame::DEFAULT_MAX_FRAME_SIZE as usize;
+    for (fragment_count, value_len) in [(1, MAX_FRAME_SIZE - 12), (2, MAX_FRAME_SIZE - 9)] {
+        let (io, calls, _write_blocked, _blocked_waker) =
+            recording_io(WriteMode::Complete, Bytes::new());
+        let mut builder = client::Builder::new();
+        builder.initial_stream_window_size(1024 * 1024);
+        let (mut send_request, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
+        let mut request = Request::get("https://a/");
+        for _ in 0..fragment_count {
+            request = request.header("x", "Z".repeat(value_len));
+        }
+        let request = send_request
+            .send_request(request.body(()).unwrap(), true)
+            .unwrap();
+        assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+
+        let calls = calls.lock().unwrap();
+        let writes = calls
+            .iter()
+            .filter_map(|call| match call {
+                IoCall::Write(buf) => Some(buf),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let wire = writes
+            .iter()
+            .skip(1)
+            .flat_map(|write| write.iter().copied())
+            .collect::<Vec<_>>();
+        let frames = encoded_frames(&wire);
+        assert_eq!(frames.len(), fragment_count + 1);
+        for (index, frame) in frames[..fragment_count].iter().enumerate() {
+            assert_eq!(frame.kind, if index == 0 { 1 } else { 9 });
+            assert_eq!(frame.stream_id, 1);
+            assert_eq!(frame.payload_len, MAX_FRAME_SIZE);
+            assert_eq!(frame.flags & 0x4 != 0, index + 1 == fragment_count);
+        }
+        let update = &frames[fragment_count];
+        assert_eq!((update.kind, update.flags, update.stream_id), (8, 0, 1));
+        assert_eq!(update.payload_len, 4);
+        assert_eq!(
+            u32::from_be_bytes(frame_payload(&wire, update).try_into().unwrap()),
+            1024 * 1024 - h2::frame::DEFAULT_INITIAL_WINDOW_SIZE
+        );
+        // The final full fragment and update share a write with no flush between.
+        let final_write_frames = encoded_frames(writes.last().unwrap());
+        assert_eq!(final_write_frames.len(), 2);
+        assert_eq!(final_write_frames[0].payload_len, MAX_FRAME_SIZE);
+        assert_eq!(final_write_frames[1].kind, 8);
+        drop(request);
+    }
 
     let (io, calls, write_blocked, blocked_waker) =
         recording_io(WriteMode::RequestPartialThenPending, Bytes::new());
