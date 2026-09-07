@@ -1220,11 +1220,15 @@ impl Builder {
         self
     }
 
-    /// Sets the stream dependency and weight for the outgoing HEADERS frame.
+    /// Sets the default dependency, weight, and exclusive flag for outgoing
+    /// request `HEADERS` frames.
     ///
-    /// This configures the priority of the stream by specifying its dependency and weight,
-    /// as defined by the HTTP/2 priority mechanism. This can be used to influence how the
-    /// server allocates resources to this stream relative to others.
+    /// Each new request uses this value unless it carries a `HeadersPriority`
+    /// extension, which is available with the `unstable` feature.
+    ///
+    /// These priority fields are deprecated by [RFC 9113 §5.3.2].
+    ///
+    /// [RFC 9113 §5.3.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.3.2
     pub fn headers_stream_dependency(&mut self, stream_dependency: StreamDependency) -> &mut Self {
         self.headers_stream_dependency = Some(stream_dependency);
         self

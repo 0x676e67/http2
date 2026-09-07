@@ -366,11 +366,18 @@ impl Headers {
         &self.header_block.pseudo
     }
 
-    /// Sets the deprecated RFC 7540 priority fields carried by this HEADERS
+    /// Sets the deprecated priority fields carried by this `HEADERS`
     /// frame.
     ///
-    /// RFC 9113 retains the wire fields for interoperability. A dependency on
-    /// the stream itself is not useful to compatible peers, so it is ignored.
+    /// This sets the `PRIORITY` flag without changing the frame's existing
+    /// flags. If `stream_dep` refers to this frame's own stream, the frame is
+    /// left unchanged.
+    ///
+    /// [RFC 9113 §5.3.2] retains these fields for interoperability. A
+    /// self-dependency is invalid under [RFC 7540 §5.3.1].
+    ///
+    /// [RFC 7540 §5.3.1]: https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3.1
+    /// [RFC 9113 §5.3.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.3.2
     pub fn set_stream_dependency(&mut self, stream_dep: StreamDependency) {
         if stream_dep.dependency_id() == self.stream_id {
             tracing::warn!(
