@@ -375,9 +375,6 @@ pub struct Builder {
     window_update_policy: WindowUpdatePolicy,
 }
 
-#[derive(Debug)]
-pub(crate) struct Peer;
-
 /// Controls when the client replenishes HTTP/2 receive windows.
 /// Defaults to application-driven updates, independently of initial windows.
 /// See [`Builder::window_update_policy`] for configuration and limits.
@@ -398,6 +395,9 @@ pub enum WindowUpdatePolicy {
         max_buffered_data: u32,
     },
 }
+
+#[derive(Debug)]
+pub(crate) struct Peer;
 
 // ===== impl SendRequest =====
 

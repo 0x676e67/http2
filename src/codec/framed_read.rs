@@ -59,44 +59,6 @@ enum Continuable {
     PushPromise(frame::PushPromise),
 }
 
-/// DATA metadata available before the payload has been read completely.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DataHead {
-    pub(crate) stream_id: frame::StreamId,
-    pub(crate) flow_len: u32,
-    pub(crate) payload_len: u32,
-    pub(crate) end_stream: bool,
-}
-
-#[derive(Debug)]
-// Keep the existing inline Frame transfer without a heap allocation per frame.
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum ReadEvent {
-    DataHead(DataHead),
-    Frame(Frame),
-}
-
-#[derive(Debug)]
-enum DelimitedEvent {
-    DataHead(DataHead),
-    Frame(BytesMut),
-}
-
-#[derive(Debug)]
-struct DataHeadCodec {
-    inner: LengthDelimitedCodec,
-    state: DataHeadState,
-}
-
-#[derive(Debug)]
-enum DataHeadState {
-    Disabled,
-    Reading,
-    // A complete frame may already be buffered when its head is reported.
-    // Keep ownership of that allocation until the next decode, without copying.
-    Reported(Option<BytesMut>),
-}
-
 impl<T> FramedRead<T> {
     pub fn new(inner: InnerFramedRead<T, LengthDelimitedCodec>) -> FramedRead<T> {
         let decoder = FrameDecoder::new(inner.decoder().max_frame_length());
@@ -563,6 +525,44 @@ impl<T> From<Continuable> for Frame<T> {
             }
         }
     }
+}
+
+/// DATA metadata available before the payload has been read completely.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DataHead {
+    pub(crate) stream_id: frame::StreamId,
+    pub(crate) flow_len: u32,
+    pub(crate) payload_len: u32,
+    pub(crate) end_stream: bool,
+}
+
+#[derive(Debug)]
+// Keep the existing inline Frame transfer without a heap allocation per frame.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ReadEvent {
+    DataHead(DataHead),
+    Frame(Frame),
+}
+
+#[derive(Debug)]
+enum DelimitedEvent {
+    DataHead(DataHead),
+    Frame(BytesMut),
+}
+
+#[derive(Debug)]
+struct DataHeadCodec {
+    inner: LengthDelimitedCodec,
+    state: DataHeadState,
+}
+
+#[derive(Debug)]
+enum DataHeadState {
+    Disabled,
+    Reading,
+    // A complete frame may already be buffered when its head is reported.
+    // Keep ownership of that allocation until the next decode, without copying.
+    Reported(Option<BytesMut>),
 }
 
 impl DataHeadCodec {

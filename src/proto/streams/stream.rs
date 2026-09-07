@@ -119,6 +119,13 @@ pub(super) struct Stream {
     pub initial_window: Option<InitialWindow>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InitialWindow {
+    Pending,
+    /// SETTINGS baseline already included in this stream's receive window.
+    Sent(WindowSize),
+}
+
 /// State related to validating a stream's content-length
 #[derive(Debug)]
 pub enum ContentLength {
@@ -144,13 +151,6 @@ pub(super) struct NextOpen;
 
 #[derive(Debug)]
 pub(super) struct NextResetExpire;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum InitialWindow {
-    Pending,
-    /// SETTINGS baseline already included in this stream's receive window.
-    Sent(WindowSize),
-}
 
 impl Stream {
     pub fn new(id: StreamId, init_send_window: WindowSize, init_recv_window: WindowSize) -> Stream {
