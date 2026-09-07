@@ -136,76 +136,6 @@ impl Recv {
         self.init_window_sz
     }
 
-    pub(crate) fn set_initial_stream_window_target(
-        &mut self,
-        target: WindowSize,
-        advertised: WindowSize,
-    ) {
-        // The client sends this value before any request HEADERS. A server
-        // cannot send a response or related push until it receives that
-        // request, so it has already received and must apply the SETTINGS
-        // value first. Use it as the receive baseline before the ACK arrives;
-        // applying the ACK later sees the same value and does not add it twice
-        // (RFC 9113 §§6.5.3 and 6.9.2).
-        // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2
-        self.init_window_sz = advertised;
-        self.initial_target_stream_window_sz = Some(target);
-        self.sent_initial_window_sz = advertised;
-    }
-
-    pub(crate) fn prepare_initial_stream_window_update(
-        &self,
-        stream: &mut Stream,
-        headers: &mut frame::Headers,
-    ) -> io::Result<()> {
-        if stream.initial_window != Some(stream::InitialWindow::Pending) {
-            return Ok(());
-        }
-        let Some(target) = self.initial_target_stream_window_sz else {
-            return Ok(());
-        };
-
-        // SETTINGS precedes these HEADERS even when its ACK is still pending.
-        // A new stream uses that baseline; existing streams retain the old
-        // allowance until ACK so in-flight DATA remains legal (RFC 9113 §6.9.2).
-        // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2
-        let advertised = self.sent_initial_window_sz;
-        let mut flow = FlowControl::new();
-        flow.inc_window(target.max(advertised))
-            .and_then(|()| flow.assign_capacity(target.max(advertised)))
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid initial stream window")
-            })?;
-        stream.recv_flow = flow;
-        stream.initial_window = Some(stream::InitialWindow::Sent(advertised));
-
-        if let Some(increment) = NonZeroU32::new(target.saturating_sub(advertised)) {
-            headers.set_initial_stream_window_update(increment);
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn validate_initial_stream_window_size_update(
-        &self,
-        size: WindowSize,
-    ) -> Result<(), UserError> {
-        if self.initial_target_stream_window_sz.is_none() {
-            return Ok(());
-        }
-
-        // An increase can overflow an already-open stream's target window,
-        // and the peer can use it before our ACK-based receive state changes.
-        // Keep increases disabled until both cases can be checked when the
-        // SETTINGS is queued, not only when its ACK arrives (RFC 9113 §6.9.1).
-        // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
-        if size > self.init_window_sz {
-            return Err(UserError::InvalidInitialStreamWindowSize);
-        }
-
-        Ok(())
-    }
-
     /// Returns the ID of the last processed stream
     pub fn last_processed_id(&self) -> StreamId {
         self.last_processed_id
@@ -1462,6 +1392,76 @@ impl Recv {
         }
     }
 
+    pub(crate) fn set_initial_stream_window_target(
+        &mut self,
+        target: WindowSize,
+        advertised: WindowSize,
+    ) {
+        // The client sends this value before any request HEADERS. A server
+        // cannot send a response or related push until it receives that
+        // request, so it has already received and must apply the SETTINGS
+        // value first. Use it as the receive baseline before the ACK arrives;
+        // applying the ACK later sees the same value and does not add it twice
+        // (RFC 9113 §§6.5.3 and 6.9.2).
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2
+        self.init_window_sz = advertised;
+        self.initial_target_stream_window_sz = Some(target);
+        self.sent_initial_window_sz = advertised;
+    }
+
+    pub(crate) fn prepare_initial_stream_window_update(
+        &self,
+        stream: &mut Stream,
+        headers: &mut frame::Headers,
+    ) -> io::Result<()> {
+        if stream.initial_window != Some(stream::InitialWindow::Pending) {
+            return Ok(());
+        }
+        let Some(target) = self.initial_target_stream_window_sz else {
+            return Ok(());
+        };
+
+        // SETTINGS precedes these HEADERS even when its ACK is still pending.
+        // A new stream uses that baseline; existing streams retain the old
+        // allowance until ACK so in-flight DATA remains legal (RFC 9113 §6.9.2).
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2
+        let advertised = self.sent_initial_window_sz;
+        let mut flow = FlowControl::new();
+        flow.inc_window(target.max(advertised))
+            .and_then(|()| flow.assign_capacity(target.max(advertised)))
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid initial stream window")
+            })?;
+        stream.recv_flow = flow;
+        stream.initial_window = Some(stream::InitialWindow::Sent(advertised));
+
+        if let Some(increment) = NonZeroU32::new(target.saturating_sub(advertised)) {
+            headers.set_initial_stream_window_update(increment);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn validate_initial_stream_window_size_update(
+        &self,
+        size: WindowSize,
+    ) -> Result<(), UserError> {
+        if self.initial_target_stream_window_sz.is_none() {
+            return Ok(());
+        }
+
+        // An increase can overflow an already-open stream's target window,
+        // and the peer can use it before our ACK-based receive state changes.
+        // Keep increases disabled until both cases can be checked when the
+        // SETTINGS is queued, not only when its ACK arrives (RFC 9113 §6.9.1).
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
+        if size > self.init_window_sz {
+            return Err(UserError::InvalidInitialStreamWindowSize);
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn init_request_window(&self, stream: &mut Stream) {
         if self.initial_target_stream_window_sz.is_some() {
             stream.initial_window = Some(stream::InitialWindow::Pending);
@@ -1503,9 +1503,7 @@ impl Recv {
         }
         Ok(true)
     }
-}
 
-impl Recv {
     pub(crate) fn set_window_update_policy(&mut self, policy: crate::client::WindowUpdatePolicy) {
         self.receive_driven = match policy {
             crate::client::WindowUpdatePolicy::Default => None,

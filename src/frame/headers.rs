@@ -436,12 +436,12 @@ impl Headers {
         }
     }
 
-    pub(crate) fn set_initial_stream_window_update(&mut self, increment: NonZeroU32) {
-        self.initial_stream_window_update = Some(increment);
-    }
-
     fn head(&self) -> Head {
         Head::new(Kind::Headers, self.flags.into(), self.stream_id)
+    }
+
+    pub(crate) fn set_initial_stream_window_update(&mut self, increment: NonZeroU32) {
+        self.initial_stream_window_update = Some(increment);
     }
 }
 
@@ -718,25 +718,6 @@ impl Continuation {
             }
         }
     }
-}
-
-fn encode_initial_stream_window_update(
-    stream_id: StreamId,
-    increment: Option<NonZeroU32>,
-    dst: &mut EncodeBuf<'_>,
-) {
-    let Some(increment) = increment else {
-        return;
-    };
-
-    // RFC 9113 §6.10 forbids interleaving another frame inside a header
-    // block. This runs only after END_HEADERS has been encoded. The Limit is
-    // scoped to the header fragment, so append the separate WINDOW_UPDATE to
-    // its underlying buffer rather than counting it as header payload.
-    // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.10
-    let update = WindowUpdate::new(stream_id, increment.get());
-    tracing::debug!(frame = ?update, "send");
-    update.encode(&mut **dst.get_mut());
 }
 
 // ===== impl Pseudo =====
@@ -1238,6 +1219,25 @@ fn calculate_headermap_size(map: &HeaderMap) -> usize {
 
 fn decoded_header_size(name: usize, value: usize) -> usize {
     name + value + 32
+}
+
+fn encode_initial_stream_window_update(
+    stream_id: StreamId,
+    increment: Option<NonZeroU32>,
+    dst: &mut EncodeBuf<'_>,
+) {
+    let Some(increment) = increment else {
+        return;
+    };
+
+    // RFC 9113 §6.10 forbids interleaving another frame inside a header
+    // block. This runs only after END_HEADERS has been encoded. The Limit is
+    // scoped to the header fragment, so append the separate WINDOW_UPDATE to
+    // its underlying buffer rather than counting it as header payload.
+    // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.10
+    let update = WindowUpdate::new(stream_id, increment.get());
+    tracing::debug!(frame = ?update, "send");
+    update.encode(&mut **dst.get_mut());
 }
 
 #[cfg(test)]

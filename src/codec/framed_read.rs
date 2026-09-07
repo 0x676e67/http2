@@ -59,6 +59,44 @@ enum Continuable {
     PushPromise(frame::PushPromise),
 }
 
+/// DATA metadata available before the payload has been read completely.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DataHead {
+    pub(crate) stream_id: frame::StreamId,
+    pub(crate) flow_len: u32,
+    pub(crate) payload_len: u32,
+    pub(crate) end_stream: bool,
+}
+
+#[derive(Debug)]
+// Keep the existing inline Frame transfer without a heap allocation per frame.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ReadEvent {
+    DataHead(DataHead),
+    Frame(Frame),
+}
+
+#[derive(Debug)]
+enum DelimitedEvent {
+    DataHead(DataHead),
+    Frame(BytesMut),
+}
+
+#[derive(Debug)]
+struct DataHeadCodec {
+    inner: LengthDelimitedCodec,
+    state: DataHeadState,
+}
+
+#[derive(Debug)]
+enum DataHeadState {
+    Disabled,
+    Reading,
+    // A complete frame may already be buffered when its head is reported.
+    // Keep ownership of that allocation until the next decode, without copying.
+    Reported(Option<BytesMut>),
+}
+
 impl<T> FramedRead<T> {
     pub fn new(inner: InnerFramedRead<T, LengthDelimitedCodec>) -> FramedRead<T> {
         let decoder = FrameDecoder::new(inner.decoder().max_frame_length());
@@ -102,6 +140,48 @@ impl<T> FramedRead<T> {
     #[inline]
     pub fn set_header_table_size(&mut self, val: usize) {
         self.decoder.set_header_table_size(val);
+    }
+
+    pub(super) fn enable_data_head_events(&mut self) {
+        let state = &mut self.inner.decoder_mut().state;
+        if matches!(state, DataHeadState::Disabled) {
+            *state = DataHeadState::Reading;
+        }
+    }
+
+    pub(super) fn poll_next_event(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<ReadEvent, Error>>>
+    where
+        T: AsyncRead + Unpin,
+    {
+        let _span = tracing::trace_span!("FramedRead::poll_next");
+        loop {
+            tracing::trace!("poll");
+            let bytes = match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
+                Some(Ok(DelimitedEvent::Frame(bytes))) => bytes,
+                Some(Ok(DelimitedEvent::DataHead(head))) => {
+                    // DATA cannot interrupt a header block (RFC 9113 §6.10).
+                    // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.10
+                    if self.decoder.partial.is_some() {
+                        proto_err!(conn: "expected CONTINUATION, got DATA");
+                        return Poll::Ready(Some(Err(Error::library_go_away(
+                            Reason::PROTOCOL_ERROR,
+                        ))));
+                    }
+                    return Poll::Ready(Some(Ok(ReadEvent::DataHead(head))));
+                }
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                None => return Poll::Ready(None),
+            };
+
+            tracing::trace!(read.bytes = bytes.len());
+            if let Some(frame) = self.decoder.decode(bytes)? {
+                tracing::debug!(?frame, "received");
+                return Poll::Ready(Some(Ok(ReadEvent::Frame(frame))));
+            }
+        }
     }
 }
 
@@ -429,43 +509,6 @@ where
     }
 }
 
-impl<T> FramedRead<T>
-where
-    T: AsyncRead + Unpin,
-{
-    pub(super) fn poll_next_event(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<ReadEvent, Error>>> {
-        let _span = tracing::trace_span!("FramedRead::poll_next");
-        loop {
-            tracing::trace!("poll");
-            let bytes = match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
-                Some(Ok(DelimitedEvent::Frame(bytes))) => bytes,
-                Some(Ok(DelimitedEvent::DataHead(head))) => {
-                    // DATA cannot interrupt a header block (RFC 9113 §6.10).
-                    // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.10
-                    if self.decoder.partial.is_some() {
-                        proto_err!(conn: "expected CONTINUATION, got DATA");
-                        return Poll::Ready(Some(Err(Error::library_go_away(
-                            Reason::PROTOCOL_ERROR,
-                        ))));
-                    }
-                    return Poll::Ready(Some(Ok(ReadEvent::DataHead(head))));
-                }
-                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                None => return Poll::Ready(None),
-            };
-
-            tracing::trace!(read.bytes = bytes.len());
-            if let Some(frame) = self.decoder.decode(bytes)? {
-                tracing::debug!(?frame, "received");
-                return Poll::Ready(Some(Ok(ReadEvent::Frame(frame))));
-            }
-        }
-    }
-}
-
 fn map_err(err: io::Error) -> Error {
     if let io::ErrorKind::InvalidData = err.kind() {
         if let Some(custom) = err.get_ref() {
@@ -520,44 +563,6 @@ impl<T> From<Continuable> for Frame<T> {
             }
         }
     }
-}
-
-/// DATA metadata available before the payload has been read completely.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DataHead {
-    pub(crate) stream_id: frame::StreamId,
-    pub(crate) flow_len: u32,
-    pub(crate) payload_len: u32,
-    pub(crate) end_stream: bool,
-}
-
-#[derive(Debug)]
-// Keep the existing inline Frame transfer without a heap allocation per frame.
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum ReadEvent {
-    DataHead(DataHead),
-    Frame(Frame),
-}
-
-#[derive(Debug)]
-enum DelimitedEvent {
-    DataHead(DataHead),
-    Frame(BytesMut),
-}
-
-#[derive(Debug)]
-struct DataHeadCodec {
-    inner: LengthDelimitedCodec,
-    state: DataHeadState,
-}
-
-#[derive(Debug)]
-enum DataHeadState {
-    Disabled,
-    Reading,
-    // A complete frame may already be buffered when its head is reported.
-    // Keep ownership of that allocation until the next decode, without copying.
-    Reported(Option<BytesMut>),
 }
 
 impl DataHeadCodec {
@@ -636,15 +641,6 @@ impl DataHead {
             payload_len,
             end_stream: head.flag() & 0x1 != 0,
         }))
-    }
-}
-
-impl<T> FramedRead<T> {
-    pub(super) fn enable_data_head_events(&mut self) {
-        let state = &mut self.inner.decoder_mut().state;
-        if matches!(state, DataHeadState::Disabled) {
-            *state = DataHeadState::Reading;
-        }
     }
 }
 

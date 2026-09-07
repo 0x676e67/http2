@@ -765,7 +765,7 @@ enum ReceivedFrame {
 
 impl<T, B> Connection<T, client::Peer, B>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite,
     B: Buf,
 {
     pub(crate) fn streams(&self) -> &Streams<B, client::Peer> {
@@ -775,7 +775,10 @@ where
     pub(crate) fn set_client_initial_window_size(
         &mut self,
         size: WindowSize,
-    ) -> Result<(), UserError> {
+    ) -> Result<(), UserError>
+    where
+        T: Unpin,
+    {
         self.inner
             .streams
             .validate_initial_stream_window_size_update(size)?;
@@ -786,13 +789,18 @@ where
         &mut self,
         target: WindowSize,
         advertised: WindowSize,
-    ) {
+    ) where
+        T: Unpin,
+    {
         self.inner
             .streams
             .set_initial_stream_window_size(target, advertised);
     }
 
-    pub(crate) fn set_window_update_policy(&mut self, policy: client::WindowUpdatePolicy) {
+    pub(crate) fn set_window_update_policy(&mut self, policy: client::WindowUpdatePolicy)
+    where
+        T: Unpin,
+    {
         self.receive_driven_window_updates =
             matches!(policy, client::WindowUpdatePolicy::ReceiveDriven { .. });
         if self.receive_driven_window_updates {

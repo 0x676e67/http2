@@ -375,6 +375,9 @@ pub struct Builder {
     window_update_policy: WindowUpdatePolicy,
 }
 
+#[derive(Debug)]
+pub(crate) struct Peer;
+
 /// Controls when the client replenishes HTTP/2 receive windows.
 /// Defaults to application-driven updates, independently of initial windows.
 /// See [`Builder::window_update_policy`] for configuration and limits.
@@ -395,9 +398,6 @@ pub enum WindowUpdatePolicy {
         max_buffered_data: u32,
     },
 }
-
-#[derive(Debug)]
-pub(crate) struct Peer;
 
 // ===== impl SendRequest =====
 
@@ -787,41 +787,6 @@ impl Builder {
     /// ```
     pub fn initial_connection_window_size(&mut self, size: u32) -> &mut Self {
         self.initial_target_connection_window_size = Some(size);
-        self
-    }
-
-    /// Sets the initial receive window target for each locally initiated stream.
-    ///
-    /// Targets above the `SETTINGS_INITIAL_WINDOW_SIZE` advertised by
-    /// [`initial_window_size`] add one stream `WINDOW_UPDATE` immediately after
-    /// the complete request header block. Lower or equal targets do not shrink
-    /// the window or send an update; leaving this unset preserves normal behavior.
-    ///
-    /// Targets above 2<sup>31</sup> - 1 fail [`handshake`] before transport I/O.
-    /// See [RFC 9113 section 6.9] for flow-control requirements.
-    ///
-    /// [`initial_window_size`]: Self::initial_window_size
-    /// [`handshake`]: Self::handshake
-    /// [RFC 9113 section 6.9]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use bytes::Bytes;
-    /// # use http2::client::*;
-    /// # use tokio::io::{AsyncRead, AsyncWrite};
-    /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
-    /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
-    /// # {
-    /// let client_fut = Builder::new()
-    ///     .initial_window_size(131_072)
-    ///     .initial_stream_window_size(12 * 1024 * 1024)
-    ///     .handshake(my_io);
-    /// # client_fut.await
-    /// # }
-    /// ```
-    pub fn initial_stream_window_size(&mut self, target: u32) -> &mut Self {
-        self.initial_target_stream_window_size = Some(target);
         self
     }
 
@@ -1430,6 +1395,41 @@ impl Builder {
         B: Buf,
     {
         Connection::handshake2(io, self.clone())
+    }
+
+    /// Sets the initial receive window target for each locally initiated stream.
+    ///
+    /// Targets above the `SETTINGS_INITIAL_WINDOW_SIZE` advertised by
+    /// [`initial_window_size`] add one stream `WINDOW_UPDATE` immediately after
+    /// the complete request header block. Lower or equal targets do not shrink
+    /// the window or send an update; leaving this unset preserves normal behavior.
+    ///
+    /// Targets above 2<sup>31</sup> - 1 fail [`handshake`] before transport I/O.
+    /// See [RFC 9113 section 6.9] for flow-control requirements.
+    ///
+    /// [`initial_window_size`]: Self::initial_window_size
+    /// [`handshake`]: Self::handshake
+    /// [RFC 9113 section 6.9]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use bytes::Bytes;
+    /// # use http2::client::*;
+    /// # use tokio::io::{AsyncRead, AsyncWrite};
+    /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
+    /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
+    /// # {
+    /// let client_fut = Builder::new()
+    ///     .initial_window_size(131_072)
+    ///     .initial_stream_window_size(12 * 1024 * 1024)
+    ///     .handshake(my_io);
+    /// # client_fut.await
+    /// # }
+    /// ```
+    pub fn initial_stream_window_size(&mut self, target: u32) -> &mut Self {
+        self.initial_target_stream_window_size = Some(target);
+        self
     }
 
     /// Selects the policy for replenishing receive windows after DATA arrives.
