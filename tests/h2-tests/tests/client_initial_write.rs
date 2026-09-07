@@ -1449,7 +1449,9 @@ async fn initial_stream_window_update_follows_complete_header_block() {
     builder.initial_stream_window_size(1024 * 1024);
     let (mut send_request, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
 
-    let mut request = Request::builder().uri("https://example.com/large");
+    let mut request = Request::builder()
+        .uri("https://example.com/large")
+        .extension(h2::ext::HeadersPriority::new(StreamId::zero(), 219, true));
     for (name, value) in build_large_headers() {
         request = request.header(name, value);
     }
@@ -1489,6 +1491,8 @@ async fn initial_stream_window_update_follows_complete_header_block() {
     assert_eq!(frames[0].kind, 1);
     assert_eq!(frames[0].stream_id, 1);
     assert_eq!(frames[0].flags & 0x4, 0);
+    assert_eq!(frames[0].flags & 0x21, 0x21);
+    assert_eq!(&request_wire[9..14], &[0x80, 0, 0, 0, 219]);
 
     let first_update = frames
         .iter()
@@ -1497,8 +1501,9 @@ async fn initial_stream_window_update_follows_complete_header_block() {
     assert!(first_update > 1);
     assert!(frames[1..first_update]
         .iter()
-        .all(|frame| frame.kind == 9 && frame.stream_id == 1));
+        .all(|frame| frame.kind == 9 && frame.stream_id == 1 && frame.flags & 0x21 == 0));
     assert_ne!(frames[first_update - 1].flags & 0x4, 0);
+    assert_eq!(frames[first_update + 1].flags & 0x20, 0);
     assert_eq!(
         frames[first_update + 1..]
             .iter()
