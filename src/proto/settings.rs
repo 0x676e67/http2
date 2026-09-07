@@ -157,6 +157,7 @@ impl Settings {
                 // Buffer the settings frame
                 dst.buffer(settings.clone().into())
                     .expect("invalid settings frame");
+                streams.sent_local_settings(settings);
                 tracing::trace!("local settings sent; waiting for ack: {:?}", settings);
 
                 self.local = Local::WaitingAck(settings.clone());

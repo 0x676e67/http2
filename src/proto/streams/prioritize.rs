@@ -505,6 +505,7 @@ impl Prioritize {
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
         counts: &mut Counts,
+        recv: &mut Recv,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> io::Result<BufferStatus>
     where
@@ -524,12 +525,21 @@ impl Prioritize {
                 return Ok(BufferStatus::CodecFull);
             }
 
+            while let Some(mut stream) = self.pending_open.pop_if(store, |stream| {
+                stream.initial_window == Some(stream::InitialWindow::Pending)
+                    && (stream.state.is_reset() || stream.state.is_scheduled_reset())
+            }) {
+                let is_pending_reset = stream.is_pending_reset_expiration();
+                self.discard_unopened_request(buffer, &mut stream, counts);
+                counts.transition_after(stream, is_pending_reset);
+            }
+
             if let Some(mut stream) = self.pop_pending_open(store, counts) {
                 self.pending_send.push_front(&mut stream);
                 self.try_assign_capacity(&mut stream);
             }
 
-            match self.pop_frame(buffer, store, max_frame_len, counts) {
+            match self.pop_frame(buffer, store, max_frame_len, counts, recv)? {
                 Some(frame) => {
                     tracing::trace!(?frame, "writing");
 
@@ -699,14 +709,17 @@ impl Prioritize {
         store: &mut Store,
         max_len: usize,
         counts: &mut Counts,
-    ) -> Option<Frame<Prioritized<B>>>
+        recv: &mut Recv,
+    ) -> io::Result<Option<Frame<Prioritized<B>>>>
     where
         B: Buf,
     {
         let _span = tracing::trace_span!("pop_frame");
 
         loop {
-            let mut stream = self.pending_send.pop(store)?;
+            let Some(mut stream) = self.pending_send.pop(store) else {
+                return Ok(None);
+            };
             let _span = tracing::trace_span!("popped", ?stream.id, ?stream.state);
 
             // It's possible that this stream, besides having data to send,
@@ -718,7 +731,19 @@ impl Prioritize {
 
             tracing::trace!(is_pending_reset);
 
+            if stream.initial_window == Some(stream::InitialWindow::Pending)
+                && (stream.state.is_reset() || stream.state.is_scheduled_reset())
+            {
+                self.discard_unopened_request(buffer, &mut stream, counts);
+                counts.transition_after(stream, is_pending_reset);
+                continue;
+            }
+
             let frame = match stream.pending_send.pop_front(buffer) {
+                Some(Frame::Headers(mut headers)) => {
+                    recv.prepare_initial_stream_window_update(&mut stream, &mut headers)?;
+                    Frame::Headers(headers)
+                }
                 Some(Frame::Data(mut frame)) => {
                     if let Some(reason) = stream.state.get_scheduled_reset() {
                         // If a reset is scheduled due to cancellation or
@@ -890,7 +915,7 @@ impl Prioritize {
 
             counts.transition_after(stream, is_pending_reset);
 
-            return Some(frame);
+            return Ok(Some(frame));
         }
     }
 
@@ -912,6 +937,23 @@ impl Prioritize {
         }
 
         None
+    }
+
+    fn discard_unopened_request<B>(
+        &mut self,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        tracing::trace!(?stream.id, "discarding cancelled request before initial HEADERS");
+        self.clear_queue(buffer, stream);
+        if let Some(reason) = stream.state.get_scheduled_reset() {
+            stream.set_reset(reason, Initiator::Library);
+        }
+        // poll_ready may have registered after an explicit reset but before
+        // removal from pending_open. Removing it makes that sender ready.
+        stream.notify_send();
+        self.reclaim_all_capacity(stream, counts);
     }
 }
 

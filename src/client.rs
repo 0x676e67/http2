@@ -772,9 +772,10 @@ impl Builder {
     /// advertised value, the client sends one stream-level `WINDOW_UPDATE`
     /// immediately after the request's complete header block.
     ///
-    /// The target must not be smaller than `SETTINGS_INITIAL_WINDOW_SIZE` and
-    /// must not exceed 2<sup>31</sup> - 1. Invalid combinations cause
-    /// [`handshake`] to return an error before any transport I/O occurs.
+    /// A target at or below `SETTINGS_INITIAL_WINDOW_SIZE` sends no initial
+    /// update and does not reduce the advertised window. Targets above
+    /// 2<sup>31</sup> - 1 cause [`handshake`] to return an error before any
+    /// transport I/O occurs.
     ///
     /// The default is unset, preserving the normal SETTINGS-based stream
     /// receive window behavior.
@@ -1491,7 +1492,7 @@ where
                     .initial_window_size()
                     .unwrap_or(crate::frame::DEFAULT_INITIAL_WINDOW_SIZE);
 
-                if target > proto::MAX_WINDOW_SIZE || target < advertised {
+                if target > proto::MAX_WINDOW_SIZE {
                     return Err(UserError::InvalidInitialStreamWindowSize);
                 }
 
@@ -1592,8 +1593,8 @@ where
     /// Returns an error if a previous call is still pending acknowledgement
     /// from the remote endpoint. When [`Builder::initial_stream_window_size`]
     /// is configured, dynamically increasing the stream baseline is also
-    /// rejected because a queued request may already contain a `WINDOW_UPDATE`
-    /// calculated from the old value.
+    /// rejected because it could overflow an already-open stream's target
+    /// window before the acknowledgement arrives.
     pub fn set_initial_window_size(&mut self, size: u32) -> Result<(), crate::Error> {
         assert!(size <= proto::MAX_WINDOW_SIZE);
         self.inner.set_client_initial_window_size(size)?;

@@ -1076,6 +1076,8 @@ async fn initial_stream_window_update_follows_each_request() {
     const STREAM_INCREMENT: u32 = TARGET_WINDOW - SETTINGS_WINDOW;
 
     for (target, expected_stream_updates) in [
+        (0, Vec::new()),
+        (SETTINGS_WINDOW / 2, Vec::new()),
         (SETTINGS_WINDOW, Vec::new()),
         (
             TARGET_WINDOW,
@@ -1193,11 +1195,18 @@ async fn initial_stream_window_update_follows_each_request() {
                 true,
             )
             .unwrap();
-        let pending = (!cancel_pending).then_some(pending);
-
-        let waker = Waker::from(Arc::new(WakeCounter(AtomicUsize::new(0))));
+        let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = Waker::from(wake_counter.clone());
         let mut cx = Context::from_waker(&waker);
         assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+        let wake_count = wake_counter.0.load(Ordering::SeqCst);
+        let _keep_connection = send_request.clone();
+        drop(send_request);
+        let pending = (!cancel_pending).then_some(pending);
+        if cancel_pending {
+            assert!(wake_counter.0.load(Ordering::SeqCst) > wake_count);
+            assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+        }
 
         let wire = calls
             .lock()
@@ -1214,10 +1223,8 @@ async fn initial_stream_window_update_follows_each_request() {
         drop(pending);
     }
 
-    // Upstream keeps a canceled pending-open request in the queue. Once the
-    // peer grants a stream slot, its complete request item is followed by the
-    // reset; the companion update must neither precede HEADERS nor become an
-    // orphaned frame.
+    // Cancelling before initial HEADERS reaches the codec leaves the stream
+    // idle at the peer, even if a stream slot becomes available afterwards.
     let (io, calls, _write_blocked, _blocked_waker) = recording_io(
         WriteMode::Complete,
         Bytes::from_static(PEER_SETTINGS_MAX_CONCURRENT_ONE),
@@ -1239,11 +1246,19 @@ async fn initial_stream_window_update_follows_each_request() {
     send_stream.send_reset(h2::Reason::CANCEL);
     drop((response, send_stream));
 
-    let waker = Waker::from(Arc::new(WakeCounter(AtomicUsize::new(0))));
+    let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    let waker = Waker::from(wake_counter.clone());
     let mut cx = Context::from_waker(&waker);
+    assert!(send_request.poll_ready(&mut cx).is_pending());
+    let before_cleanup = wake_counter.0.load(Ordering::SeqCst);
     for _ in 0..3 {
         assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
     }
+    assert!(wake_counter.0.load(Ordering::SeqCst) > before_cleanup);
+    assert!(matches!(
+        send_request.poll_ready(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
 
     let wire = calls
         .lock()
@@ -1260,7 +1275,168 @@ async fn initial_stream_window_update_follows_each_request() {
         .filter(|frame| frame.stream_id != 0)
         .map(|frame| (frame.kind, frame.stream_id))
         .collect::<Vec<_>>();
-    assert_eq!(request_layout, [(1, 1), (8, 1), (3, 1)]);
+    assert!(request_layout.is_empty());
+}
+
+#[tokio::test]
+async fn initial_stream_window_update_precedes_request_data() {
+    h2_support::trace_init!();
+
+    const TARGET_WINDOW: u32 = 1024 * 1024;
+    const BODY: &[u8] = b"request body";
+    for (method, uri) in [
+        ("GET", "https://example.com/get"),
+        ("POST", "https://example.com/post"),
+        ("CONNECT", "example.com:443"),
+    ] {
+        let (io, calls, _write_blocked, _blocked_waker) =
+            recording_io(WriteMode::Complete, Bytes::new());
+        let mut builder = client::Builder::new();
+        builder.initial_stream_window_size(TARGET_WINDOW);
+        let (mut send_request, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
+        let mut request = Request::builder().method(method).uri(uri);
+        if method == "POST" {
+            for (name, value) in build_large_headers() {
+                request = request.header(name, value);
+            }
+        }
+        let has_body = method != "GET";
+        let (response, mut send_stream) = send_request
+            .send_request(request.body(()).unwrap(), !has_body)
+            .unwrap();
+        if has_body {
+            send_stream
+                .send_data(Bytes::from_static(BODY), true)
+                .unwrap();
+        }
+
+        let waker = Waker::from(Arc::new(WakeCounter(AtomicUsize::new(0))));
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+        let calls = calls.lock().unwrap();
+        let wire = calls.iter().fold(Vec::new(), |mut wire, call| {
+            if let IoCall::Write(buf) = call {
+                wire.extend_from_slice(buf);
+            }
+            wire
+        });
+        let frames = wire_frames(&wire)
+            .into_iter()
+            .filter(|frame| frame.stream_id == 1)
+            .collect::<Vec<_>>();
+        assert_eq!(frames[0].kind, 1);
+        assert_eq!(frames[0].flags & 0x1 != 0, !has_body);
+        let update_index = frames.iter().position(|frame| frame.kind == 8).unwrap();
+        assert!(frames[1..update_index].iter().all(|frame| frame.kind == 9));
+        assert!(frames[..update_index - 1]
+            .iter()
+            .all(|frame| frame.flags & 0x4 == 0));
+        assert_ne!(frames[update_index - 1].flags & 0x4, 0);
+        if method == "POST" {
+            assert!(
+                update_index > 1,
+                "POST headers did not require CONTINUATION"
+            );
+        }
+        assert_eq!(
+            u32::from_be_bytes(
+                frame_payload(&wire, &frames[update_index])
+                    .try_into()
+                    .unwrap()
+            ),
+            TARGET_WINDOW - h2::frame::DEFAULT_INITIAL_WINDOW_SIZE
+        );
+        if has_body {
+            assert_eq!(frames.len(), update_index + 2);
+            let data = &frames[update_index + 1];
+            assert_eq!((data.kind, data.flags), (0, 0x1));
+            assert_eq!(frame_payload(&wire, data), BODY);
+        } else {
+            assert_eq!(frames.len(), update_index + 1);
+        }
+        drop((response, send_stream));
+    }
+}
+
+#[tokio::test]
+async fn initial_stream_window_cancel_before_headers_releases_stream_slot() {
+    h2_support::trace_init!();
+
+    for initial_slots in [0, 1] {
+        for explicit_reset in [false, true] {
+            let (io, calls, _write_blocked, _blocked_waker) = recording_io(
+                WriteMode::Complete,
+                Bytes::from_static(PEER_SETTINGS_MAX_CONCURRENT_ONE),
+            );
+            let mut builder = client::Builder::new();
+            builder
+                .initial_max_send_streams(initial_slots)
+                .initial_stream_window_size(1024 * 1024);
+            let (mut send_request, mut connection) =
+                builder.handshake::<_, Bytes>(io).await.unwrap();
+            let (response, mut body) = send_request
+                .send_request(
+                    Request::post("https://example.com/cancelled")
+                        .body(())
+                        .unwrap(),
+                    false,
+                )
+                .unwrap();
+            body.send_data(Bytes::from_static(b"discard this body"), false)
+                .unwrap();
+            if explicit_reset {
+                body.send_reset(h2::Reason::CANCEL);
+            }
+            drop((response, body));
+            // SendRequest retains a reference to a pending-open request.
+            // Drop that handle too so implicit cancellation releases every
+            // reference; its clone can submit the next request independently.
+            let next_sender = send_request.clone();
+            drop(send_request);
+            let send_request = next_sender;
+
+            let waker = Waker::from(Arc::new(WakeCounter(AtomicUsize::new(0))));
+            let mut cx = Context::from_waker(&waker);
+            assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+            let mut send_request = send_request.ready().now_or_never().unwrap().unwrap();
+            let request = send_request
+                .send_request(
+                    Request::post("https://example.com/live").body(()).unwrap(),
+                    false,
+                )
+                .unwrap();
+            let (response, mut body) = request;
+            // All reserved connection send capacity must have been returned.
+            body.send_data(Bytes::from(vec![b'x'; 65_535]), true)
+                .unwrap();
+            assert!(Pin::new(&mut connection).poll(&mut cx).is_pending());
+
+            let calls = calls.lock().unwrap();
+            let wire = calls.iter().fold(Vec::new(), |mut wire, call| {
+                if let IoCall::Write(buf) = call {
+                    wire.extend_from_slice(buf);
+                }
+                wire
+            });
+            let frames = wire_frames(&wire)
+                .into_iter()
+                .filter(|frame| frame.stream_id != 0)
+                .collect::<Vec<_>>();
+            assert!(frames.iter().all(|frame| frame.stream_id == 3));
+            assert_eq!((frames[0].kind, frames[1].kind), (1, 8));
+            assert!(frames[2..].iter().all(|frame| frame.kind == 0));
+            assert_eq!(
+                frames[2..]
+                    .iter()
+                    .map(|frame| frame.payload_len)
+                    .sum::<usize>(),
+                65_535
+            );
+            assert_eq!(frames.last().unwrap().flags & 1, 1);
+            drop(calls);
+            drop((response, body));
+        }
+    }
 }
 
 #[tokio::test]
@@ -1476,7 +1652,7 @@ async fn initial_stream_window_update_follows_complete_header_block() {
 async fn invalid_initial_stream_window_fails_before_io() {
     h2_support::trace_init!();
 
-    for (advertised, target) in [(131_072, 65_535), (65_535, u32::MAX)] {
+    for (advertised, target) in [(65_535, 1_u32 << 31), (65_535, u32::MAX)] {
         let (io, calls, _write_blocked, _blocked_waker) =
             recording_io(WriteMode::Complete, Bytes::new());
         let mut builder = client::Builder::new();
@@ -1532,6 +1708,144 @@ async fn dynamic_initial_window_cannot_outgrow_pending_stream_update() {
     connection.set_initial_window_size(65_535).unwrap();
 
     drop(request);
+}
+
+#[tokio::test]
+async fn initial_stream_window_uses_sent_settings_baseline() {
+    use h2_support::util::yield_once;
+    use tokio::sync::oneshot;
+
+    h2_support::trace_init!();
+
+    const URI: &str = "https://example.com/window";
+    const RESPONSE_BYTES: usize = 32;
+    for (advertised, lowered, target) in [(65_535, 0, i32::MAX as u32), (16, 4, 32)] {
+        let (io, mut server) = mock::new();
+        let (handshake_tx, handshake_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let (consumed_tx, consumed_rx) = oneshot::channel();
+        let (reset_tx, reset_rx) = oneshot::channel();
+        let check_overflow = target == RESPONSE_BYTES as u32;
+
+        let server = async move {
+            let settings = server
+                .assert_client_handshake_with_settings(frames::settings().max_concurrent_streams(0))
+                .await;
+            assert_eq!(settings.initial_window_size(), Some(advertised));
+            handshake_tx.send(()).unwrap();
+            server
+                .recv_frame(frames::settings().initial_window_size(lowered))
+                .await;
+
+            // Hold the ACK until both requests have opened under the new
+            // SETTINGS. No response DATA is sent before that ACK.
+            server
+                .send_frame(frames::settings().max_concurrent_streams(3))
+                .await;
+            server.recv_frame(frames::settings_ack()).await;
+            for stream_id in [1, 3] {
+                server
+                    .recv_frame(frames::headers(stream_id).request("GET", URI).eos())
+                    .await;
+                server
+                    .recv_frame(frames::window_update(stream_id, target - lowered))
+                    .await;
+            }
+            server.send_frame(frames::settings_ack()).await;
+            ack_tx.send(()).unwrap();
+            server
+                .recv_frame(frames::headers(5).request("GET", URI).eos())
+                .await;
+            server
+                .recv_frame(frames::window_update(5, target - lowered))
+                .await;
+
+            for stream_id in [1, 3, 5] {
+                server
+                    .send_frame(frames::headers(stream_id).response(200))
+                    .await;
+                let frame = frames::data(stream_id, vec![b'x'; RESPONSE_BYTES]);
+                if stream_id == 5 && check_overflow {
+                    server.send_frame(frame).await;
+                } else {
+                    server.send_frame(frame.eos()).await;
+                }
+            }
+            if check_overflow {
+                consumed_rx.await.unwrap();
+                server.send_frame(frames::data(5, b"!")).await;
+                server.recv_frame(frames::reset(5).flow_control()).await;
+                reset_tx.send(()).unwrap();
+            }
+        };
+
+        let client = async move {
+            let mut builder = client::Builder::new();
+            builder
+                .initial_window_size(advertised)
+                .initial_stream_window_size(target)
+                .initial_max_send_streams(0);
+            let (mut send_request, mut connection) =
+                builder.handshake::<_, Bytes>(io).await.unwrap();
+            let (first, _first_send) = send_request
+                .send_request(Request::get(URI).body(()).unwrap(), true)
+                .unwrap();
+            connection
+                .drive(async {
+                    handshake_rx.await.unwrap();
+                    yield_once().await;
+                })
+                .await;
+            connection.set_initial_window_size(lowered).unwrap();
+            let mut send_request = connection.drive(send_request.ready()).await.unwrap();
+            let (before_ack, _before_ack_send) = send_request
+                .send_request(Request::get(URI).body(()).unwrap(), true)
+                .unwrap();
+            connection
+                .drive(async {
+                    ack_rx.await.unwrap();
+                    yield_once().await;
+                })
+                .await;
+            let (after_ack, _after_ack_send) = send_request
+                .send_request(Request::get(URI).body(()).unwrap(), true)
+                .unwrap();
+
+            connection
+                .drive(async move {
+                    for response in [first, before_ack] {
+                        let mut body = response.await.unwrap().into_body();
+                        assert_eq!(body.data().await.unwrap().unwrap().len(), RESPONSE_BYTES);
+                        assert_eq!(
+                            body.flow_control().available_capacity(),
+                            (target - RESPONSE_BYTES as u32) as isize
+                        );
+                        assert!(body.data().await.is_none());
+                    }
+                    let mut body = after_ack.await.unwrap().into_body();
+                    assert_eq!(body.data().await.unwrap().unwrap().len(), RESPONSE_BYTES);
+                    assert_eq!(
+                        body.flow_control().available_capacity(),
+                        (target - RESPONSE_BYTES as u32) as isize
+                    );
+                    if check_overflow {
+                        // Reading the body does not return capacity. One byte
+                        // beyond this stream's target must still be rejected.
+                        consumed_tx.send(()).unwrap();
+                        let err = body.data().await.unwrap().unwrap_err();
+                        assert_eq!(err.reason(), Some(h2::Reason::FLOW_CONTROL_ERROR));
+                        reset_rx.await.unwrap();
+                    } else {
+                        assert!(body.data().await.is_none());
+                    }
+                })
+                .await;
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), join(server, client))
+            .await
+            .expect("dynamic initial stream window exchange stalled");
+    }
 }
 
 #[tokio::test]

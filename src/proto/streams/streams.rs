@@ -355,7 +355,7 @@ where
         }
 
         // Convert the message
-        let mut headers = client::Peer::convert_send_message(
+        let headers = client::Peer::convert_send_message(
             stream_id,
             request,
             protocol,
@@ -364,9 +364,7 @@ where
             me.headers_stream_dependency,
         )?;
 
-        me.actions
-            .recv
-            .prepare_initial_stream_window_update(&mut stream, &mut headers)?;
+        me.actions.recv.init_request_window(&mut stream);
 
         let mut stream = me.store.insert(stream.id, stream);
 
@@ -1047,11 +1045,13 @@ impl Inner {
         }
 
         // Send any other pending frames
-        if self
-            .actions
-            .send
-            .buffer_pending(send_buffer, &mut self.store, &mut self.counts, dst)?
-            == BufferStatus::CodecFull
+        if self.actions.send.buffer_pending(
+            send_buffer,
+            &mut self.store,
+            &mut self.counts,
+            &mut self.actions.recv,
+            dst,
+        )? == BufferStatus::CodecFull
         {
             return Ok(BufferStatus::CodecFull);
         }
@@ -1120,6 +1120,15 @@ impl Inner {
             &mut self.counts,
             send_buffer,
         )
+    }
+}
+
+impl<B, P> Streams<B, P>
+where
+    P: Peer,
+{
+    pub(crate) fn sent_local_settings(&mut self, settings: &frame::Settings) {
+        self.inner.lock().actions.recv.sent_local_settings(settings);
     }
 }
 
