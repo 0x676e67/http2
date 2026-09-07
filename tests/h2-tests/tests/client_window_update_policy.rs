@@ -27,6 +27,7 @@ struct Peer {
     write_budget: Option<usize>,
     flush_blocked: bool,
     waker: Option<Waker>,
+    eof: bool,
 }
 
 struct RecordingIo(Arc<Mutex<Peer>>);
@@ -39,6 +40,9 @@ impl AsyncRead for RecordingIo {
     ) -> Poll<io::Result<()>> {
         let mut peer = self.0.lock().unwrap();
         let Some((label, mut bytes)) = peer.input.pop_front() else {
+            if peer.eof {
+                return Poll::Ready(Ok(()));
+            }
             peer.waker = Some(cx.waker().clone());
             return Poll::Pending;
         };
@@ -523,6 +527,166 @@ async fn receive_updates_try_each_flush_without_blocking_later_data_or_fin() {
         harness.poll();
         assert_eq!(harness.updates(), expected);
     }
+}
+
+#[tokio::test]
+async fn data_headers_grant_credit_before_payload_without_exposing_release_capacity() {
+    let padded = [2, b'a', b'b', b'c', 0, 0];
+    for (flags, wire_payload, payload, prefix) in [
+        (0, b"abcd".as_slice(), "abcd", 9),
+        (8, padded.as_slice(), "abc", 9),
+        (8, padded.as_slice(), "abc", 10),
+    ] {
+        let mut harness = Harness::new(Some(2 * WINDOW)).await;
+        let (response, _send) = harness.request();
+        harness.feed("response", frame(1, 4, 1, &[0x88]));
+        harness.poll();
+        let mut body = response.now_or_never().unwrap().unwrap().into_body();
+        let data = frame(0, flags, 1, wire_payload);
+        harness.feed("data header", data.slice(..prefix));
+        harness.poll();
+        let prefix = if flags == 8 && prefix == 9 {
+            assert!(harness.updates().is_empty());
+            assert_eq!(body.flow_control().used_capacity(), 0);
+            harness.feed("pad length", data.slice(9..10));
+            harness.poll();
+            10
+        } else {
+            prefix
+        };
+        let size = wire_payload.len() as u32;
+        let expected = vec![(1, size), (0, size)];
+        assert_eq!(harness.updates(), expected);
+        assert_eq!(body.flow_control().used_capacity(), 0);
+        assert!(body.flow_control().release_capacity(1).is_err());
+        assert!(body.data().now_or_never().is_none());
+        harness.poll();
+        assert_eq!(harness.updates(), expected);
+
+        harness.feed("data payload", data.slice(prefix..));
+        harness.poll();
+        assert_eq!(body.flow_control().used_capacity(), payload.len());
+        assert_eq!(body.data().await.unwrap().unwrap(), payload);
+        body.flow_control().release_capacity(payload.len()).unwrap();
+        harness.poll();
+        assert_eq!(body.flow_control().used_capacity(), 0);
+        assert_eq!(harness.updates(), expected);
+    }
+}
+
+#[tokio::test]
+async fn unfinished_data_reservations_handle_cancel_eof_and_fin() {
+    for reset in [false, true] {
+        let mut harness = Harness::new(Some(WINDOW)).await;
+        let (response, mut send) = harness.request();
+        harness.feed("response", frame(1, 4, 1, &[0x88]));
+        harness.poll();
+        let body = response.now_or_never().unwrap().unwrap().into_body();
+        let data = frame(0, 0, 1, &[b'x'; 1024]);
+        harness.feed("data header", data.slice(..9));
+        harness.poll();
+        assert_eq!(harness.updates(), vec![(1, 1024)]);
+        if reset {
+            send.send_reset(h2::Reason::CANCEL);
+        }
+        drop(body);
+        harness.poll();
+        // The decoder may still buffer these bytes even after cancellation.
+        assert_eq!(harness.updates(), vec![(1, 1024)]);
+        harness.feed("discarded payload", data.slice(9..));
+        harness.poll();
+        assert_eq!(harness.updates(), vec![(1, 1024), (0, 1024)]);
+    }
+
+    let mut harness = Harness::new(Some(2 * WINDOW)).await;
+    let (response, _send) = harness.request();
+    harness.feed("response", frame(1, 4, 1, &[0x88]));
+    harness.poll();
+    let mut body = response.now_or_never().unwrap().unwrap().into_body();
+    let data = frame(0, 0, 1, b"abcd");
+    harness.feed("partial data", data.slice(..10));
+    harness.poll();
+    assert_eq!(body.flow_control().used_capacity(), 0);
+    assert_eq!(harness.updates(), vec![(1, 4), (0, 4)]);
+    harness.peer.lock().unwrap().eof = true;
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let error = match Pin::new(&mut harness.connection).poll(&mut cx) {
+        Poll::Ready(Err(error)) => error,
+        result => panic!("expected incomplete DATA EOF error, got {:?}", result),
+    };
+    assert!(error.is_io());
+    assert_eq!(body.flow_control().used_capacity(), 0);
+    assert!(body.flow_control().release_capacity(1).is_err());
+
+    let mut harness = Harness::new(Some(2 * WINDOW)).await;
+    let (response, _send) = harness.request();
+    harness.feed("response", frame(1, 4, 1, &[0x88]));
+    harness.feed("old data", frame(0, 0, 1, b"abcd"));
+    harness.poll();
+    let mut body = response.now_or_never().unwrap().unwrap().into_body();
+    let data = frame(0, 1, 1, b"efgh");
+    harness.feed("final data header", data.slice(..9));
+    harness.poll();
+    let expected = vec![(1, 4), (0, 4), (0, 4)];
+    assert_eq!(harness.updates(), expected);
+    body.flow_control().release_capacity(4).unwrap();
+    assert_eq!(body.data().await.unwrap().unwrap(), "abcd");
+    // Releasing old DATA must not grant stream credit after the FIN header,
+    // nor may the body report EOF until that final payload is complete.
+    harness.poll();
+    assert_eq!(harness.updates(), expected);
+    assert!(body.data().now_or_never().is_none());
+    harness.feed("final data payload", data.slice(9..));
+    harness.poll();
+    assert_eq!(body.data().await.unwrap().unwrap(), "efgh");
+    assert!(body.data().await.is_none());
+    body.flow_control().release_capacity(4).unwrap();
+    harness.poll();
+    assert_eq!(harness.updates(), expected);
+}
+
+#[tokio::test]
+async fn incomplete_payload_reserves_budget_across_target_changes_and_backpressure() {
+    let mut harness = Harness::new(Some(WINDOW)).await;
+    let (response, _send) = harness.request();
+    harness.feed("response", frame(1, 4, 1, &[0x88]));
+    harness.feed("old data", frame(0, 0, 1, &[b'x'; 1024]));
+    harness.poll();
+    let mut body = response.now_or_never().unwrap().unwrap().into_body();
+    body.flow_control().release_capacity(1024).unwrap();
+    harness.peer.lock().unwrap().write_budget = Some(0);
+
+    let data = frame(0, 0, 1, &[b'y'; 2048]);
+    harness.feed("data header", data.slice(..9));
+    harness.poll();
+    assert_eq!(body.flow_control().used_capacity(), 0);
+    harness.connection.set_target_window_size(2 * WINDOW);
+    harness.poll();
+    assert_eq!(harness.updates(), vec![(1, 1024)]);
+    assert_eq!(body.data().await.unwrap().unwrap().len(), 1024);
+    harness.poll();
+    harness.feed("data payload", data.slice(9..));
+    harness.poll();
+    assert_eq!(body.flow_control().used_capacity(), 2048);
+    {
+        let mut peer = harness.peer.lock().unwrap();
+        assert!(peer.events.contains(&IoEvent::Read("data payload")));
+        peer.write_budget = None;
+        peer.waker.take().unwrap().wake();
+    }
+    harness.poll();
+    let expected = vec![(1, 1024), (1, 2048), (0, 1024)];
+    assert_eq!(harness.updates(), expected);
+    body.flow_control().release_capacity(2048).unwrap();
+    harness.poll();
+    assert_eq!(harness.updates(), expected);
+    assert_eq!(body.data().await.unwrap().unwrap().len(), 2048);
+    harness.poll();
+    assert_eq!(
+        harness.updates(),
+        vec![(1, 1024), (1, 2048), (0, 1024), (0, 2048)]
+    );
 }
 
 struct ObserveBlockedWrite {

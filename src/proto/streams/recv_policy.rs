@@ -1,4 +1,5 @@
 use super::{FlowControl, WindowSize};
+use crate::codec::DataHead;
 use crate::frame::WindowUpdate;
 use crate::proto::MAX_WINDOW_SIZE;
 use std::collections::VecDeque;
@@ -11,6 +12,15 @@ pub(super) struct ReceiveDriven {
     pub(super) max_buffered_data: WindowSize,
     pub(super) queued_data: WindowSize,
     pub(super) pending: VecDeque<WindowUpdate>,
+    pub(super) incoming: Option<IncomingData>,
+}
+
+/// Only the current wire frame can be incomplete. Its reservation is not
+/// application-owned capacity and must survive cancellation of its stream.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct IncomingData {
+    pub(super) head: DataHead,
+    pub(super) stream_reserved: bool,
 }
 
 impl ReceiveDriven {
@@ -19,6 +29,7 @@ impl ReceiveDriven {
             max_buffered_data,
             queued_data: 0,
             pending: VecDeque::new(),
+            incoming: None,
         }
     }
 
@@ -34,14 +45,16 @@ impl ReceiveDriven {
         let headroom = self
             .max_buffered_data
             .saturating_sub(self.queued_data.max(in_flight))
+            .saturating_sub(self.incoming.map_or(0, |incoming| incoming.head.flow_len))
             .saturating_sub(flow.window_size());
         let increment = increment.min(headroom);
         (increment != 0).then_some(increment)
     }
 }
 
-/// `additional` is the current payload after padding has been released, or
-/// all in-flight DATA for connection credit. Zero uses consumed capacity only.
+/// `additional` accounts for in-flight connection DATA or a complete stream
+/// payload. A DATA head has already reduced only the peer window, so zero
+/// also includes its reservation until the payload completes.
 pub(super) fn update_increment(flow: &FlowControl, additional: WindowSize) -> Option<WindowSize> {
     // Window stores i32, so widening its existing isize conversion is lossless.
     let available = isize::from(flow.available()) as i64;

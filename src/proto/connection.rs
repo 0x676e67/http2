@@ -1,4 +1,4 @@
-use crate::codec::UserError;
+use crate::codec::{ReadEvent, UserError};
 use crate::frame::{Priorities, Priority, PseudoOrder, Reason, StreamDependency, StreamId};
 use crate::{client, server, tracing};
 
@@ -514,11 +514,22 @@ where
             }
             ready!(self.poll_ready(cx))?;
 
-            match self
-                .inner
-                .as_dyn()
-                .recv_frame(ready!(Pin::new(&mut self.codec).poll_next(cx)?))?
-            {
+            let frame = if self.receive_driven_window_updates {
+                match ready!(self.codec.poll_next_event(cx)).transpose()? {
+                    Some(ReadEvent::DataHead(head)) => {
+                        self.inner.streams.recv_data_head(head)?;
+                        self.inner
+                            .streams
+                            .try_flush_recv_window_updates(cx, &mut self.codec)?;
+                        continue;
+                    }
+                    Some(ReadEvent::Frame(frame)) => Some(frame),
+                    None => None,
+                }
+            } else {
+                ready!(Pin::new(&mut self.codec).poll_next(cx)?)
+            };
+            match self.inner.as_dyn().recv_frame(frame)? {
                 ReceivedFrame::Settings(frame) => {
                     self.inner.settings.recv_settings(
                         frame,
@@ -527,13 +538,6 @@ where
                     )?;
                 }
                 ReceivedFrame::Continue => (),
-                ReceivedFrame::Data => {
-                    if self.receive_driven_window_updates {
-                        self.inner
-                            .streams
-                            .try_flush_recv_window_updates(cx, &mut self.codec)?;
-                    }
-                }
                 ReceivedFrame::Done => {
                     return Poll::Ready(Ok(()));
                 }
@@ -700,7 +704,6 @@ where
             Some(Data(frame)) => {
                 tracing::trace!(?frame, "recv DATA");
                 self.streams.recv_data(frame)?;
-                return Ok(ReceivedFrame::Data);
             }
             Some(Reset(frame)) => {
                 tracing::trace!(?frame, "recv RST_STREAM");
@@ -758,7 +761,6 @@ enum ReceivedFrame {
     Settings(frame::Settings),
     Continue,
     Done,
-    Data,
 }
 
 impl<T, B> Connection<T, client::Peer, B>
@@ -793,6 +795,9 @@ where
     pub(crate) fn set_window_update_policy(&mut self, policy: client::WindowUpdatePolicy) {
         self.receive_driven_window_updates =
             matches!(policy, client::WindowUpdatePolicy::ReceiveDriven { .. });
+        if self.receive_driven_window_updates {
+            self.codec.enable_data_head_events();
+        }
         self.inner.streams.set_window_update_policy(policy);
     }
 }

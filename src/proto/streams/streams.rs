@@ -1256,6 +1256,28 @@ where
     B: Buf,
     P: Peer,
 {
+    pub(crate) fn recv_data_head(&mut self, head: crate::codec::DataHead) -> Result<(), Error> {
+        let mut me = self.inner.lock();
+        let me = &mut *me;
+        let id = head.stream_id;
+        let peer = P::r#dyn();
+        let Some(stream) = me.store.find_mut(&id) else {
+            if id > me.actions.recv.max_stream_id() {
+                return me.actions.recv.recv_data_head(head, None);
+            }
+            if me.actions.may_have_forgotten_stream(peer, id) {
+                me.actions.recv.recv_data_head(head, None)?;
+                return Err(Error::library_reset(id, Reason::STREAM_CLOSED));
+            }
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        };
+        let actions = &mut me.actions;
+        me.counts.transition(stream, |counts, stream| {
+            let result = actions.recv.recv_data_head(head, Some(stream));
+            actions.reset_on_recv_stream_err_deferred(&self.send_buffer, stream, counts, result)
+        })
+    }
+
     pub(crate) fn try_flush_recv_window_updates<T>(
         &mut self,
         cx: &mut Context,

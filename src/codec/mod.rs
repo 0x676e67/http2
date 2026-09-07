@@ -7,6 +7,8 @@ pub use self::error::{SendError, UserError};
 use self::framed_read::FramedRead;
 use self::framed_write::FramedWrite;
 
+pub(crate) use self::framed_read::{DataHead, ReadEvent};
+
 use crate::frame::{self, Data, Frame};
 use crate::proto::Error;
 
@@ -222,5 +224,23 @@ where
 {
     fn from(src: T) -> Self {
         Self::new(src)
+    }
+}
+
+impl<T, B> Codec<T, B> {
+    pub(crate) fn enable_data_head_events(&mut self) {
+        self.inner.enable_data_head_events();
+    }
+}
+
+impl<T, B> Codec<T, B>
+where
+    T: AsyncRead + Unpin,
+{
+    pub(crate) fn poll_next_event(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<ReadEvent, Error>>> {
+        self.inner.poll_next_event(cx)
     }
 }

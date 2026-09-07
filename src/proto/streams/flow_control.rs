@@ -192,6 +192,16 @@ impl FlowControl {
     pub(super) fn raw_window_size(&self) -> i32 {
         self.window_size.0
     }
+
+    /// Reserve a DATA frame before its payload is available to the consumer.
+    /// The full payload, including padding, consumes peer credit (RFC 9113 §6.1).
+    /// https://www.rfc-editor.org/rfc/rfc9113.html#section-6.1
+    pub(super) fn reserve_recv_window(&mut self, size: WindowSize) -> Result<(), Reason> {
+        if size > self.window_size() {
+            return Err(Reason::FLOW_CONTROL_ERROR);
+        }
+        self.window_size.decrease_by(size)
+    }
 }
 
 /// The current capacity of a flow-controlled Window.

@@ -376,13 +376,8 @@ pub struct Builder {
 }
 
 /// Controls when the client replenishes HTTP/2 receive windows.
-///
-/// This is independent of [`Builder::initial_stream_window_size`], which
-/// controls the initial update following each request's header block.
-/// See [RFC 9113 section 5.2] and [section 6.9] for flow-control requirements.
-///
-/// [RFC 9113 section 5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2
-/// [section 6.9]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9
+/// Defaults to application-driven updates, independently of initial windows.
+/// See [`Builder::window_update_policy`] for configuration and limits.
 #[derive(Default, Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum WindowUpdatePolicy {
@@ -390,27 +385,13 @@ pub enum WindowUpdatePolicy {
     #[default]
     Default,
 
-    /// Replenishes connection capacity as DATA arrives. Stream updates account
-    /// for capacity released by the application and the DATA currently being
-    /// processed, subject to the receive-buffer limit.
-    ///
-    /// An update is eligible when some capacity can be returned and either
-    /// that amount reaches 4 MiB or the peer's remaining window is at most
-    /// 96 KiB. The receive-buffer limit can reduce or defer that update.
-    /// DATA-triggered updates are queued in order and flushed without waiting
-    /// for application consumption. A blocked write does not stop receiving,
-    /// and updates already queued remain valid if their stream closes.
+    /// Checks receive windows at each DATA header without waiting for its payload.
+    /// Eligible updates attempt a flush without waiting for consumption.
+    /// See [`Builder::window_update_policy`] for thresholds and buffer limits.
     ReceiveDriven {
-        /// Connection-wide receive budget, in bytes. The limit applies separately
-        /// to payload queued inside the library and received flow-control
-        /// capacity that the application has not released. It does not track
-        /// `Bytes` copies retained by the application.
-        /// Pending WINDOW_UPDATE frames have a separate byte budget of the
-        /// same size; exhausting it closes the connection with
-        /// `ENHANCE_YOUR_CALM` instead of retaining an unbounded output queue.
-        ///
-        /// Reaching either limit stops new credit. Taking queued DATA or
-        /// releasing capacity lets updates resume; existing credit remains valid.
+        /// Connection-wide receive and pending-update budgets, in bytes.
+        /// Includes incomplete DATA; excludes application-retained `Bytes` copies.
+        /// See [`Builder::window_update_policy`] for accounting and valid values.
         max_buffered_data: u32,
     },
 }
@@ -811,20 +792,13 @@ impl Builder {
 
     /// Sets the initial receive window target for each locally initiated stream.
     ///
-    /// This differs from [`initial_window_size`], which advertises
-    /// `SETTINGS_INITIAL_WINDOW_SIZE`. When this target is larger than that
-    /// advertised value, the client sends one stream-level `WINDOW_UPDATE`
-    /// immediately after the request's complete header block.
+    /// Targets above the `SETTINGS_INITIAL_WINDOW_SIZE` advertised by
+    /// [`initial_window_size`] add one stream `WINDOW_UPDATE` immediately after
+    /// the complete request header block. Lower or equal targets do not shrink
+    /// the window or send an update; leaving this unset preserves normal behavior.
     ///
-    /// A target at or below `SETTINGS_INITIAL_WINDOW_SIZE` sends no initial
-    /// update and does not reduce the advertised window. Targets above
-    /// 2<sup>31</sup> - 1 cause [`handshake`] to return an error before any
-    /// transport I/O occurs.
-    ///
-    /// The default is unset, preserving the normal SETTINGS-based stream
-    /// receive window behavior.
-    ///
-    /// See [RFC 9113 section 6.9] for HTTP/2 flow-control requirements.
+    /// Targets above 2<sup>31</sup> - 1 fail [`handshake`] before transport I/O.
+    /// See [RFC 9113 section 6.9] for flow-control requirements.
     ///
     /// [`initial_window_size`]: Self::initial_window_size
     /// [`handshake`]: Self::handshake
@@ -1460,14 +1434,32 @@ impl Builder {
 
     /// Selects the policy for replenishing receive windows after DATA arrives.
     ///
-    /// [`WindowUpdatePolicy::ReceiveDriven`] must be enabled explicitly. It does
-    /// not change the initial stream target configured by
-    /// [`initial_stream_window_size`](Self::initial_stream_window_size).
+    /// The default is application-driven. [`WindowUpdatePolicy::ReceiveDriven`]
+    /// is opt-in and independent of [`initial_stream_window_size`](Self::initial_stream_window_size).
+    /// Applications must still call [`crate::FlowControl::release_capacity`]
+    /// after consumption; this never grants the same credit twice.
     ///
-    /// Its buffer limit must cover the initial connection window, including
-    /// the protocol's initial allowance of 65,535 bytes, and must not exceed
-    /// 2<sup>31</sup> - 1. [`handshake`](Self::handshake) rejects an invalid
-    /// limit before any transport I/O.
+    /// Receive-driven checks run at the DATA header and Pad Length when present.
+    /// Stream credit counts released capacity plus the current DATA; connection
+    /// credit counts all received DATA. An update needs positive credit and
+    /// either at least 4 MiB to return or a peer window of at most 96 KiB.
+    /// Eligible updates queue stream first, then connection, and immediately
+    /// attempt a flush. Blocked writes do not stop reads; stream closure does
+    /// not retract queued updates. See [RFC 9113 section 5.2] and [section 6.9].
+    ///
+    /// `max_buffered_data` separately caps queued payload and unreleased capacity,
+    /// reserving incomplete DATA against both without making it releasable.
+    /// Application-retained `Bytes` copies are excluded. Limited space reduces
+    /// or defers new credit until DATA is taken or capacity released; existing
+    /// credit stays valid. Pending WINDOW_UPDATE bytes have a separate budget
+    /// of the same size; exhaustion closes the connection with `ENHANCE_YOUR_CALM`.
+    ///
+    /// The limit must cover both 65,535 bytes and the initial connection target,
+    /// and not exceed 2<sup>31</sup> - 1. [`handshake`](Self::handshake) rejects
+    /// invalid limits before transport I/O.
+    ///
+    /// [RFC 9113 section 5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2
+    /// [section 6.9]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9
     ///
     /// # Examples
     ///
