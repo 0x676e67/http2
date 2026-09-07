@@ -25,6 +25,9 @@ where
     codec: Codec<T, Prioritized<B>>,
 
     inner: ConnectionInner<P, B>,
+
+    /// Whether each received DATA needs an opportunistic write attempt.
+    receive_driven_window_updates: bool,
 }
 
 // Extracted part of `Connection` which does not depend on `T`. Reduces the amount of duplicated
@@ -204,6 +207,7 @@ where
                 span,
                 _phantom: PhantomData,
             },
+            receive_driven_window_updates: false,
         }
     }
 
@@ -523,6 +527,13 @@ where
                     )?;
                 }
                 ReceivedFrame::Continue => (),
+                ReceivedFrame::Data => {
+                    if self.receive_driven_window_updates {
+                        self.inner
+                            .streams
+                            .try_flush_recv_window_updates(cx, &mut self.codec)?;
+                    }
+                }
                 ReceivedFrame::Done => {
                     return Poll::Ready(Ok(()));
                 }
@@ -689,6 +700,7 @@ where
             Some(Data(frame)) => {
                 tracing::trace!(?frame, "recv DATA");
                 self.streams.recv_data(frame)?;
+                return Ok(ReceivedFrame::Data);
             }
             Some(Reset(frame)) => {
                 tracing::trace!(?frame, "recv RST_STREAM");
@@ -746,6 +758,7 @@ enum ReceivedFrame {
     Settings(frame::Settings),
     Continue,
     Done,
+    Data,
 }
 
 impl<T, B> Connection<T, client::Peer, B>
@@ -775,6 +788,12 @@ where
         self.inner
             .streams
             .set_initial_stream_window_size(target, advertised);
+    }
+
+    pub(crate) fn set_window_update_policy(&mut self, policy: client::WindowUpdatePolicy) {
+        self.receive_driven_window_updates =
+            matches!(policy, client::WindowUpdatePolicy::ReceiveDriven { .. });
+        self.inner.streams.set_window_update_policy(policy);
     }
 }
 

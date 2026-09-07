@@ -187,6 +187,11 @@ impl FlowControl {
         }
         Ok(())
     }
+
+    /// Returns the peer-known window without clamping SETTINGS reductions.
+    pub(super) fn raw_window_size(&self) -> i32 {
+        self.window_size.0
+    }
 }
 
 /// The current capacity of a flow-controlled Window.

@@ -67,6 +67,9 @@ pub(super) struct Recv {
 
     /// Latest local SETTINGS baseline queued before new request HEADERS.
     sent_initial_window_sz: WindowSize,
+
+    /// Explicit client receive policy; absent for the default and server paths.
+    receive_driven: Option<recv_policy::ReceiveDriven>,
 }
 
 #[derive(Debug)]
@@ -124,6 +127,7 @@ impl Recv {
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
             initial_target_stream_window_sz: None,
             sent_initial_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
+            receive_driven: None,
         }
     }
 
@@ -529,7 +533,7 @@ impl Recv {
         let _res = self.flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
 
-        if self.flow.unclaimed_capacity().is_some() {
+        if self.connection_window_update_ready() {
             if let Some(task) = task.take() {
                 task.wake();
             }
@@ -559,7 +563,14 @@ impl Recv {
         let _res = stream.recv_flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
 
-        if stream.recv_flow.unclaimed_capacity().is_some() {
+        let update_ready = if self.receive_driven.is_some() {
+            stream.is_recv
+                && stream.state.is_recv_streaming()
+                && recv_policy::update_increment(&stream.recv_flow, 0).is_some()
+        } else {
+            stream.recv_flow.unclaimed_capacity().is_some()
+        };
+        if update_ready {
             // Queue the stream for sending the WINDOW_UPDATE frame.
             self.pending_window_updates.push(stream);
 
@@ -637,7 +648,7 @@ impl Recv {
         // If changing the target capacity means we gained a bunch of capacity,
         // enough that we went over the update threshold, then schedule sending
         // a connection WINDOW_UPDATE.
-        if self.flow.unclaimed_capacity().is_some() {
+        if self.connection_window_update_ready() {
             if let Some(task) = task.take() {
                 task.wake();
             }
@@ -815,6 +826,8 @@ impl Recv {
                 stream.id,
             );
             self.release_connection_capacity(sz, &mut None);
+            self.queue_receive_driven_updates(None, 0)
+                .map_err(Error::library_go_away)?;
             return Ok(());
         }
 
@@ -839,6 +852,21 @@ impl Recv {
             let _res = self.release_capacity(padding, stream, &mut None);
             // cannot fail, we JUST added more in_flight data above.
             debug_assert!(_res.is_ok());
+        }
+
+        if self.receive_driven.is_some() {
+            // Padding is already released, so only add the current payload
+            // when excluding previously unconsumed DATA (RFC 9113 §6.1).
+            // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.1
+            if let Some(policy) = &mut self.receive_driven {
+                policy.queued_data = policy
+                    .queued_data
+                    .checked_add(frame.payload().len() as WindowSize)
+                    .filter(|queued| *queued <= policy.max_buffered_data)
+                    .ok_or_else(|| Error::library_go_away(Reason::FLOW_CONTROL_ERROR))?;
+            }
+            self.queue_receive_driven_updates(Some(stream), frame.payload().len() as WindowSize)
+                .map_err(Error::library_go_away)?;
         }
 
         // An empty DATA frame without END_STREAM has no effect on the HTTP
@@ -874,6 +902,8 @@ impl Recv {
         // the capacity as available to be reclaimed. When the available
         // capacity meets a threshold, a WINDOW_UPDATE is then sent.
         self.release_connection_capacity(sz, &mut None);
+        self.queue_receive_driven_updates(None, 0)
+            .map_err(Error::library_go_away)?;
         Ok(())
     }
 
@@ -1044,6 +1074,7 @@ impl Recv {
         let mut to_release: WindowSize = 0;
         while let Some(event) = stream.pending_recv.pop_front(&mut self.buffer) {
             if let Event::Data(data) = &event {
+                self.release_queued_data(data.payload.len() as WindowSize, task);
                 if data.is_budgeted {
                     counts.release_data_frame(data.payload.len());
                 }
@@ -1173,6 +1204,9 @@ impl Recv {
         store: &mut Store,
         counts: &mut Counts,
     ) {
+        if let Some(policy) = &mut self.receive_driven {
+            policy.pending.clear();
+        }
         self.clear_stream_window_update_queue(store, counts);
         self.clear_all_reset_streams(store, counts);
 
@@ -1212,6 +1246,9 @@ impl Recv {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
+        if self.receive_driven.is_some() {
+            return self.buffer_receive_driven_window_updates(store, counts, dst);
+        }
         // Send any pending connection level window updates
         if self.send_connection_window_update(dst)? == BufferStatus::CodecFull {
             return Ok(BufferStatus::CodecFull);
@@ -1234,7 +1271,7 @@ impl Recv {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        if let Some(incr) = self.flow.unclaimed_capacity() {
+        if let Some(incr) = self.connection_window_update_increment() {
             let frame = frame::WindowUpdate::new(StreamId::zero(), incr);
 
             // Ensure the codec has capacity
@@ -1319,9 +1356,13 @@ impl Recv {
         &mut self,
         cx: &Context,
         stream: &mut Stream,
+        task: &mut Option<Waker>,
     ) -> Poll<Option<Result<DataEvent, proto::Error>>> {
         match stream.pending_recv.pop_front(&mut self.buffer) {
-            Some(Event::Data(data)) => Poll::Ready(Some(Ok(data))),
+            Some(Event::Data(data)) => {
+                self.release_queued_data(data.payload.len() as WindowSize, task);
+                Poll::Ready(Some(Ok(data)))
+            }
             Some(event) => {
                 // Frame is trailer
                 stream.pending_recv.push_front(&mut self.buffer, event);
@@ -1415,6 +1456,134 @@ impl Recv {
             }
         }
         Ok(true)
+    }
+}
+
+impl Recv {
+    pub(crate) fn set_window_update_policy(&mut self, policy: crate::client::WindowUpdatePolicy) {
+        self.receive_driven = match policy {
+            crate::client::WindowUpdatePolicy::Default => None,
+            crate::client::WindowUpdatePolicy::ReceiveDriven { max_buffered_data } => {
+                Some(recv_policy::ReceiveDriven::new(max_buffered_data))
+            }
+        };
+    }
+
+    fn connection_window_update_ready(&self) -> bool {
+        self.connection_window_update_increment().is_some()
+    }
+
+    fn connection_window_update_increment(&self) -> Option<WindowSize> {
+        match &self.receive_driven {
+            Some(policy) => policy.increment(&self.flow, self.in_flight_data),
+            None => self.flow.unclaimed_capacity(),
+        }
+    }
+
+    fn queue_receive_driven_updates(
+        &mut self,
+        stream: Option<&mut Stream>,
+        current_payload: WindowSize,
+    ) -> Result<(), Reason> {
+        let Some(policy) = &mut self.receive_driven else {
+            return Ok(());
+        };
+        let stream_update = stream.and_then(|stream| {
+            (stream.is_recv && stream.state.is_recv_streaming())
+                .then(|| recv_policy::update_increment(&stream.recv_flow, current_payload))
+                .flatten()
+                .map(|increment| (stream, increment))
+        });
+        let connection_update = policy.increment(&self.flow, self.in_flight_data);
+        let frames =
+            usize::from(stream_update.is_some()) + usize::from(connection_update.is_some());
+        // A blocked writer must not permit unlimited control-frame buffering.
+        // Check both frames before granting any credit (RFC 9113 §10.5).
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-10.5
+        if policy.pending.len().saturating_add(frames) > policy.max_buffered_data as usize / 13 {
+            return Err(Reason::ENHANCE_YOUR_CALM);
+        }
+        // Queue immutable updates and commit their credit once. Later FIN or
+        // reset must not cancel an update already ordered for transmission.
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
+        if let Some((stream, increment)) = stream_update {
+            stream.recv_flow.inc_window(increment)?;
+            policy
+                .pending
+                .push_back(frame::WindowUpdate::new(stream.id, increment));
+        }
+        if let Some(increment) = connection_update {
+            self.flow.inc_window(increment)?;
+            policy
+                .pending
+                .push_back(frame::WindowUpdate::new(StreamId::ZERO, increment));
+        }
+        Ok(())
+    }
+
+    fn release_queued_data(&mut self, size: WindowSize, task: &mut Option<Waker>) {
+        if let Some(policy) = &mut self.receive_driven {
+            policy.queued_data = policy.queued_data.saturating_sub(size);
+            if self.connection_window_update_ready() {
+                if let Some(task) = task.take() {
+                    task.wake();
+                }
+            }
+        }
+    }
+
+    fn buffer_receive_driven_window_updates<T, B>(
+        &mut self,
+        store: &mut Store,
+        counts: &mut Counts,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> io::Result<BufferStatus>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let Some(policy) = &mut self.receive_driven {
+            while let Some(frame) = policy.pending.front().copied() {
+                if !dst.has_send_capacity() {
+                    return Ok(BufferStatus::CodecFull);
+                }
+                dst.buffer(frame.into()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid WINDOW_UPDATE")
+                })?;
+                policy.pending.pop_front();
+            }
+        }
+
+        // Application releases only mark streams dirty. Recompute after the
+        // DATA-triggered FIFO has drained, since it already committed credit.
+        while !self.pending_window_updates.is_empty() {
+            if !dst.has_send_capacity() {
+                return Ok(BufferStatus::CodecFull);
+            }
+            let Some(stream) = self.pending_window_updates.pop(store) else {
+                break;
+            };
+            counts.transition(stream, |_, stream| {
+                if !stream.is_recv || !stream.state.is_recv_streaming() {
+                    return Ok(());
+                }
+                let Some(increment) = recv_policy::update_increment(&stream.recv_flow, 0) else {
+                    return Ok(());
+                };
+                let mut flow = stream.recv_flow;
+                flow.inc_window(increment).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "stream receive window overflow")
+                })?;
+                dst.buffer(frame::WindowUpdate::new(stream.id, increment).into())
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid WINDOW_UPDATE")
+                    })?;
+                stream.recv_flow = flow;
+                Ok::<_, io::Error>(())
+            })?;
+        }
+
+        self.send_connection_window_update(dst)
     }
 }
 

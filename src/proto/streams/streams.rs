@@ -1238,6 +1238,61 @@ where
     }
 }
 
+impl<B> Streams<B, client::Peer>
+where
+    B: Buf,
+{
+    pub(crate) fn set_window_update_policy(&mut self, policy: client::WindowUpdatePolicy) {
+        self.inner
+            .lock()
+            .actions
+            .recv
+            .set_window_update_policy(policy);
+    }
+}
+
+impl<B, P> Streams<B, P>
+where
+    B: Buf,
+    P: Peer,
+{
+    pub(crate) fn try_flush_recv_window_updates<T>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin,
+    {
+        loop {
+            let status = {
+                let mut me = self.inner.lock();
+                let me = &mut *me;
+                let status = me
+                    .actions
+                    .recv
+                    .buffer_pending(&mut me.store, &mut me.counts, dst)?;
+                me.actions.task = Some(cx.waker().clone());
+                status
+            };
+
+            // Try immediately, but never make receiving depend on a blocked
+            // write. The codec and receive FIFO retain all unsent frames.
+            // https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2.2
+            match dst.flush(cx) {
+                Poll::Pending => return Ok(()),
+                Poll::Ready(result) => result?,
+            }
+            self.inner
+                .lock()
+                .reclaim_written_frame(&self.send_buffer, dst);
+            if status == BufferStatus::Complete {
+                return Ok(());
+            }
+        }
+    }
+}
+
 // no derive because we don't need B and P to be Clone.
 impl<B, P> Clone for Streams<B, P>
 where
@@ -1610,7 +1665,7 @@ impl OpaqueStreamRef {
 
         me.actions
             .recv
-            .poll_data(cx, &mut stream)
+            .poll_data(cx, &mut stream, &mut me.actions.task)
             .map(|result| match result {
                 Some(Ok(data)) => {
                     if data.is_budgeted {

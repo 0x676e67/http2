@@ -370,6 +370,49 @@ pub struct Builder {
 
     /// Initial target receive window size for locally initiated streams.
     initial_target_stream_window_size: Option<u32>,
+
+    /// Policy for replenishing receive windows after DATA arrives.
+    window_update_policy: WindowUpdatePolicy,
+}
+
+/// Controls when the client replenishes HTTP/2 receive windows.
+///
+/// This is independent of [`Builder::initial_stream_window_size`], which
+/// controls the initial update following each request's header block.
+/// See [RFC 9113 section 5.2] and [section 6.9] for flow-control requirements.
+///
+/// [RFC 9113 section 5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2
+/// [section 6.9]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum WindowUpdatePolicy {
+    /// Keeps the normal application-driven capacity release behavior.
+    #[default]
+    Default,
+
+    /// Replenishes connection capacity as DATA arrives. Stream updates account
+    /// for capacity released by the application and the DATA currently being
+    /// processed, subject to the receive-buffer limit.
+    ///
+    /// An update is eligible when some capacity can be returned and either
+    /// that amount reaches 4 MiB or the peer's remaining window is at most
+    /// 96 KiB. The receive-buffer limit can reduce or defer that update.
+    /// DATA-triggered updates are queued in order and flushed without waiting
+    /// for application consumption. A blocked write does not stop receiving,
+    /// and updates already queued remain valid if their stream closes.
+    ReceiveDriven {
+        /// Connection-wide receive budget, in bytes. The limit applies separately
+        /// to payload queued inside the library and received flow-control
+        /// capacity that the application has not released. It does not track
+        /// `Bytes` copies retained by the application.
+        /// Pending WINDOW_UPDATE frames have a separate byte budget of the
+        /// same size; exhausting it closes the connection with
+        /// `ENHANCE_YOUR_CALM` instead of retaining an unbounded output queue.
+        ///
+        /// Reaching either limit stops new credit. Taking queued DATA or
+        /// releasing capacity lets updates resume; existing credit remains valid.
+        max_buffered_data: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -694,6 +737,7 @@ impl Builder {
             headers_stream_dependency: None,
             priorities: None,
             initial_target_stream_window_size: None,
+            window_update_policy: WindowUpdatePolicy::Default,
         }
     }
 
@@ -1413,6 +1457,32 @@ impl Builder {
     {
         Connection::handshake2(io, self.clone())
     }
+
+    /// Selects the policy for replenishing receive windows after DATA arrives.
+    ///
+    /// [`WindowUpdatePolicy::ReceiveDriven`] must be enabled explicitly. It does
+    /// not change the initial stream target configured by
+    /// [`initial_stream_window_size`](Self::initial_stream_window_size).
+    ///
+    /// Its buffer limit must cover the initial connection window, including
+    /// the protocol's initial allowance of 65,535 bytes, and must not exceed
+    /// 2<sup>31</sup> - 1. [`handshake`](Self::handshake) rejects an invalid
+    /// limit before any transport I/O.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http2::client::{Builder, WindowUpdatePolicy};
+    ///
+    /// let mut builder = Builder::new();
+    /// builder.window_update_policy(WindowUpdatePolicy::ReceiveDriven {
+    ///     max_buffered_data: 16 * 1024 * 1024,
+    /// });
+    /// ```
+    pub fn window_update_policy(&mut self, policy: WindowUpdatePolicy) -> &mut Self {
+        self.window_update_policy = policy;
+        self
+    }
 }
 
 impl Default for Builder {
@@ -1484,6 +1554,19 @@ where
     ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
         tracing::debug!("preparing client connection preface");
 
+        let window_update_policy = builder.window_update_policy;
+        if let WindowUpdatePolicy::ReceiveDriven { max_buffered_data } = window_update_policy {
+            let initial_connection_window = builder
+                .initial_target_connection_window_size
+                .unwrap_or(crate::frame::DEFAULT_INITIAL_WINDOW_SIZE)
+                .max(crate::frame::DEFAULT_INITIAL_WINDOW_SIZE);
+            if max_buffered_data < initial_connection_window
+                || max_buffered_data > proto::MAX_WINDOW_SIZE
+            {
+                return Err(UserError::InvalidReceiveBufferLimit.into());
+            }
+        }
+
         let initial_stream_window = builder
             .initial_target_stream_window_size
             .map(|target| {
@@ -1553,6 +1636,9 @@ where
         if let Some(sz) = builder.initial_target_connection_window_size {
             connection.set_target_window_size(sz);
         }
+        connection
+            .inner
+            .set_window_update_policy(window_update_policy);
 
         Ok((send_request, connection))
     }
@@ -1567,6 +1653,9 @@ where
     /// immediately. However, as window capacity is released by
     /// [`FlowControl`] instances, no `WINDOW_UPDATE` frames will be sent
     /// out until the number of "in flight" bytes drops below `size`.
+    ///
+    /// With [`WindowUpdatePolicy::ReceiveDriven`], the receive-buffer limit caps
+    /// new credit even when this target is larger than that limit.
     ///
     /// The default value is 65,535.
     ///
