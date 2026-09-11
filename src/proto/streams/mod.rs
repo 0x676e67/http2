@@ -3,7 +3,6 @@ mod counts;
 mod flow_control;
 mod prioritize;
 mod recv;
-mod recv_policy;
 mod send;
 mod state;
 mod store;

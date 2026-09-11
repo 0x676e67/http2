@@ -429,64 +429,6 @@ where
         let me = self.inner.lock();
         me.counts.max_recv_streams()
     }
-
-    pub(crate) fn recv_data_head(&mut self, head: crate::codec::DataHead) -> Result<(), Error> {
-        let mut me = self.inner.lock();
-        let me = &mut *me;
-        let id = head.stream_id;
-        let peer = P::r#dyn();
-        let Some(stream) = me.store.find_mut(&id) else {
-            if id > me.actions.recv.max_stream_id() {
-                return me.actions.recv.recv_data_head(head, None);
-            }
-            if me.actions.may_have_forgotten_stream(peer, id) {
-                me.actions.recv.recv_data_head(head, None)?;
-                return Err(Error::library_reset(id, Reason::STREAM_CLOSED));
-            }
-            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
-        };
-        let actions = &mut me.actions;
-        me.counts.transition(stream, |counts, stream| {
-            let result = actions.recv.recv_data_head(head, Some(stream));
-            actions.reset_on_recv_stream_err_deferred(&self.send_buffer, stream, counts, result)
-        })
-    }
-
-    pub(crate) fn try_flush_recv_window_updates<T>(
-        &mut self,
-        cx: &mut Context,
-        dst: &mut Codec<T, Prioritized<B>>,
-    ) -> io::Result<()>
-    where
-        T: AsyncWrite + Unpin,
-    {
-        loop {
-            let status = {
-                let mut me = self.inner.lock();
-                let me = &mut *me;
-                let status = me
-                    .actions
-                    .recv
-                    .buffer_pending(&mut me.store, &mut me.counts, dst)?;
-                me.actions.task = Some(cx.waker().clone());
-                status
-            };
-
-            // Try immediately, but never make receiving depend on a blocked
-            // write. The codec and receive FIFO retain all unsent frames.
-            // https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2.2
-            match dst.flush(cx) {
-                Poll::Pending => return Ok(()),
-                Poll::Ready(result) => result?,
-            }
-            self.inner
-                .lock()
-                .reclaim_written_frame(&self.send_buffer, dst);
-            if status == BufferStatus::Complete {
-                return Ok(());
-            }
-        }
-    }
 }
 
 impl<B> DynStreams<'_, B> {
@@ -1239,14 +1181,6 @@ where
             .recv
             .set_initial_stream_window_target(target, advertised);
     }
-
-    pub(crate) fn set_window_update_policy(&mut self, policy: client::WindowUpdatePolicy) {
-        self.inner
-            .lock()
-            .actions
-            .recv
-            .set_window_update_policy(policy);
-    }
 }
 
 impl<B, P> Streams<B, P>
@@ -1681,7 +1615,7 @@ impl OpaqueStreamRef {
 
         me.actions
             .recv
-            .poll_data(cx, &mut stream, &mut me.actions.task)
+            .poll_data(cx, &mut stream)
             .map(|result| match result {
                 Some(Ok(data)) => {
                     if data.is_budgeted {

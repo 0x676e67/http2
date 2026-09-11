@@ -7,8 +7,6 @@ pub use self::error::{SendError, UserError};
 use self::framed_read::FramedRead;
 use self::framed_write::FramedWrite;
 
-pub(crate) use self::framed_read::{DataHead, ReadEvent};
-
 use crate::frame::{self, Data, Frame};
 use crate::proto::Error;
 
@@ -134,20 +132,6 @@ impl<T, B> Codec<T, B> {
 
     fn framed_write(&mut self) -> &mut FramedWrite<T, B> {
         self.inner.get_mut()
-    }
-
-    pub(crate) fn enable_data_head_events(&mut self) {
-        self.inner.enable_data_head_events();
-    }
-
-    pub(crate) fn poll_next_event(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<ReadEvent, Error>>>
-    where
-        T: AsyncRead + Unpin,
-    {
-        self.inner.poll_next_event(cx)
     }
 }
 

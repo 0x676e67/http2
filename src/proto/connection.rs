@@ -1,4 +1,4 @@
-use crate::codec::{ReadEvent, UserError};
+use crate::codec::UserError;
 use crate::frame::{Priorities, Priority, PseudoOrder, Reason, StreamDependency, StreamId};
 use crate::{client, server, tracing};
 
@@ -25,9 +25,6 @@ where
     codec: Codec<T, Prioritized<B>>,
 
     inner: ConnectionInner<P, B>,
-
-    /// Whether each received DATA needs an opportunistic write attempt.
-    receive_driven_window_updates: bool,
 }
 
 // Extracted part of `Connection` which does not depend on `T`. Reduces the amount of duplicated
@@ -207,7 +204,6 @@ where
                 span,
                 _phantom: PhantomData,
             },
-            receive_driven_window_updates: false,
         }
     }
 
@@ -514,22 +510,11 @@ where
             }
             ready!(self.poll_ready(cx))?;
 
-            let frame = if self.receive_driven_window_updates {
-                match ready!(self.codec.poll_next_event(cx)).transpose()? {
-                    Some(ReadEvent::DataHead(head)) => {
-                        self.inner.streams.recv_data_head(head)?;
-                        self.inner
-                            .streams
-                            .try_flush_recv_window_updates(cx, &mut self.codec)?;
-                        continue;
-                    }
-                    Some(ReadEvent::Frame(frame)) => Some(frame),
-                    None => None,
-                }
-            } else {
-                ready!(Pin::new(&mut self.codec).poll_next(cx)?)
-            };
-            match self.inner.as_dyn().recv_frame(frame)? {
+            match self
+                .inner
+                .as_dyn()
+                .recv_frame(ready!(Pin::new(&mut self.codec).poll_next(cx)?))?
+            {
                 ReceivedFrame::Settings(frame) => {
                     self.inner.settings.recv_settings(
                         frame,
@@ -795,18 +780,6 @@ where
         self.inner
             .streams
             .set_initial_stream_window_size(target, advertised);
-    }
-
-    pub(crate) fn set_window_update_policy(&mut self, policy: client::WindowUpdatePolicy)
-    where
-        T: Unpin,
-    {
-        self.receive_driven_window_updates =
-            matches!(policy, client::WindowUpdatePolicy::ReceiveDriven { .. });
-        if self.receive_driven_window_updates {
-            self.codec.enable_data_head_events();
-        }
-        self.inner.streams.set_window_update_policy(policy);
     }
 }
 

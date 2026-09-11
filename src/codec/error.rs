@@ -55,9 +55,6 @@ pub enum UserError {
 
     /// The configured per-stream receive window target is invalid.
     InvalidInitialStreamWindowSize,
-
-    /// The configured receive-buffer limit is outside the supported range.
-    InvalidReceiveBufferLimit,
 }
 
 // ===== impl SendError =====
@@ -108,7 +105,6 @@ impl fmt::Display for UserError {
             PeerDisabledServerPush => "sending PUSH_PROMISE to peer who disabled server push",
             InvalidInformationalStatusCode => "invalid informational status code",
             InvalidInitialStreamWindowSize => "invalid initial stream window size",
-            InvalidReceiveBufferLimit => "invalid receive buffer limit",
         })
     }
 }

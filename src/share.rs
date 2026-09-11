@@ -144,14 +144,6 @@ pub struct RecvStream {
 /// This type allows the caller to manage inbound data [flow control]. The
 /// caller is expected to call [`release_capacity`] after dropping data frames.
 ///
-/// The behavior below describes the default policy. An explicitly configured
-/// [`crate::client::WindowUpdatePolicy::ReceiveDriven`] can grant peer credit before
-/// application consumption. The caller must still release consumed capacity;
-/// this reduces outstanding data without granting the same credit twice.
-/// HTTP/2 leaves update scheduling to the receiver ([RFC 9113 section 5.2.1]).
-///
-/// [RFC 9113 section 5.2.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2.1
-///
 /// # Overview
 ///
 /// Each stream has a window size. This window size is the maximum amount of
@@ -510,10 +502,6 @@ impl FlowControl {
     }
 
     /// Get the current available capacity of data this stream *could* receive.
-    ///
-    /// With a receive-driven policy, this is the local capacity remaining
-    /// after unreleased data, not the peer's advertised window. It can be
-    /// negative when credit was granted before the application consumed DATA.
     pub fn available_capacity(&self) -> isize {
         self.inner.available_recv_capacity()
     }
@@ -527,9 +515,8 @@ impl FlowControl {
 
     /// Release window capacity back to remote stream.
     ///
-    /// This releases `sz` bytes from the stream and connection's outstanding
-    /// data. The configured policy determines when to send WINDOW_UPDATE;
-    /// credit granted before consumption is not granted again.
+    /// This releases capacity back to the stream level and the connection level
+    /// windows. Both window sizes will be increased by `sz`.
     ///
     /// See [struct level] documentation for more details.
     ///

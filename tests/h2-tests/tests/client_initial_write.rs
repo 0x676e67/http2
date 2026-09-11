@@ -1076,11 +1076,12 @@ async fn initial_stream_window_update_follows_each_request() {
     const STREAM_INCREMENT: u32 = TARGET_WINDOW - SETTINGS_WINDOW;
 
     for (target, expected_stream_updates) in [
-        (0, Vec::new()),
-        (SETTINGS_WINDOW / 2, Vec::new()),
-        (SETTINGS_WINDOW, Vec::new()),
+        (None, Vec::new()),
+        (Some(0), Vec::new()),
+        (Some(SETTINGS_WINDOW / 2), Vec::new()),
+        (Some(SETTINGS_WINDOW), Vec::new()),
         (
-            TARGET_WINDOW,
+            Some(TARGET_WINDOW),
             vec![(3, STREAM_INCREMENT), (5, STREAM_INCREMENT)],
         ),
     ] {
@@ -1090,8 +1091,10 @@ async fn initial_stream_window_update_follows_each_request() {
         builder
             .initial_window_size(SETTINGS_WINDOW)
             .initial_connection_window_size(TARGET_WINDOW)
-            .initial_stream_window_size(target)
             .initial_stream_id(3);
+        if let Some(target) = target {
+            builder.initial_stream_window_size(target);
+        }
 
         let (mut send_request, mut connection) = builder
             .handshake::<_, Bytes>(io)
