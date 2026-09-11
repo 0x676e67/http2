@@ -367,6 +367,9 @@ pub struct Builder {
 
     /// Priority stream list
     priorities: Option<Priorities>,
+
+    /// Initial target receive window size for locally initiated streams.
+    initial_target_stream_window_size: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -690,6 +693,7 @@ impl Builder {
             headers_pseudo_order: None,
             headers_stream_dependency: None,
             priorities: None,
+            initial_target_stream_window_size: None,
         }
     }
 
@@ -1371,6 +1375,41 @@ impl Builder {
     {
         Connection::handshake2(io, self.clone())
     }
+
+    /// Sets the initial receive window target for each locally initiated stream.
+    ///
+    /// Targets above the `SETTINGS_INITIAL_WINDOW_SIZE` advertised by
+    /// [`initial_window_size`] add one stream `WINDOW_UPDATE` immediately after
+    /// the complete request header block. Lower or equal targets do not shrink
+    /// the window or send an update; leaving this unset preserves normal behavior.
+    ///
+    /// Targets above 2<sup>31</sup> - 1 fail [`handshake`] before transport I/O.
+    /// See [RFC 9113 section 6.9] for flow-control requirements.
+    ///
+    /// [`initial_window_size`]: Self::initial_window_size
+    /// [`handshake`]: Self::handshake
+    /// [RFC 9113 section 6.9]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use bytes::Bytes;
+    /// # use http2::client::*;
+    /// # use tokio::io::{AsyncRead, AsyncWrite};
+    /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
+    /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
+    /// # {
+    /// let client_fut = Builder::new()
+    ///     .initial_window_size(131_072)
+    ///     .initial_stream_window_size(12 * 1024 * 1024)
+    ///     .handshake(my_io);
+    /// # client_fut.await
+    /// # }
+    /// ```
+    pub fn initial_stream_window_size(&mut self, target: u32) -> &mut Self {
+        self.initial_target_stream_window_size = Some(target);
+        self
+    }
 }
 
 impl Default for Builder {
@@ -1442,6 +1481,22 @@ where
     ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
         tracing::debug!("preparing client connection preface");
 
+        let initial_stream_window = builder
+            .initial_target_stream_window_size
+            .map(|target| {
+                let advertised = builder
+                    .settings
+                    .initial_window_size()
+                    .unwrap_or(crate::frame::DEFAULT_INITIAL_WINDOW_SIZE);
+
+                if target > proto::MAX_WINDOW_SIZE {
+                    return Err(UserError::InvalidInitialStreamWindowSize);
+                }
+
+                Ok((target, advertised))
+            })
+            .transpose()?;
+
         // RFC 9113 section 3.4 requires the client magic to be followed by
         // SETTINGS. Both are prepared without I/O; the connection driver writes
         // this item before it advances the separate request frame queue.
@@ -1489,6 +1544,9 @@ where
         };
 
         let mut connection = Connection { inner };
+        if let Some((target, advertised)) = initial_stream_window {
+            connection.set_initial_stream_window_size(target, advertised);
+        }
         if let Some(sz) = builder.initial_target_connection_window_size {
             connection.set_target_window_size(sz);
         }
@@ -1530,10 +1588,13 @@ where
     /// # Errors
     ///
     /// Returns an error if a previous call is still pending acknowledgement
-    /// from the remote endpoint.
+    /// from the remote endpoint. When [`Builder::initial_stream_window_size`]
+    /// is configured, dynamically increasing the stream baseline is also
+    /// rejected because it could overflow an already-open stream's target
+    /// window before the acknowledgement arrives.
     pub fn set_initial_window_size(&mut self, size: u32) -> Result<(), crate::Error> {
         assert!(size <= proto::MAX_WINDOW_SIZE);
-        self.inner.set_initial_window_size(size)?;
+        self.inner.set_client_initial_window_size(size)?;
         Ok(())
     }
 
@@ -1571,6 +1632,11 @@ where
     /// [2]: ../struct.Builder.html#method.max_concurrent_streams
     pub fn max_concurrent_recv_streams(&self) -> usize {
         self.inner.max_recv_streams()
+    }
+
+    fn set_initial_stream_window_size(&mut self, target: u32, advertised: u32) {
+        self.inner
+            .set_initial_stream_window_size(target, advertised);
     }
 }
 
