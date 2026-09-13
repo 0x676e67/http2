@@ -1,6 +1,6 @@
 use super::{
-    Buffer, BufferStatus, Codec, Config, Counts, Frame, Prioritize, Prioritized, Store, Stream,
-    StreamId, StreamIdOverflow, WindowSize, store,
+    Buffer, BufferStatus, Codec, Config, Counts, Frame, Prioritize, Prioritized, Recv, Store,
+    Stream, StreamId, StreamIdOverflow, WindowSize, store, stream,
 };
 use crate::codec::UserError;
 use crate::frame::{self, Reason};
@@ -246,6 +246,18 @@ impl Send {
         // Transition the state to reset no matter what.
         stream.set_reset(reason, initiator);
 
+        if stream.initial_window == Some(stream::InitialWindow::Pending) {
+            // No request bytes have entered the codec. Leave the peer's stream
+            // idle instead of opening it just to cancel it (RFC 9113 §5.1).
+            // https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1
+            self.prioritize.clear_queue(buffer, stream);
+            self.prioritize.reclaim_all_capacity(stream, counts);
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+            return;
+        }
+
         // If closed AND the send queue is flushed, then the stream cannot be
         // reset explicitly, either. Implicit resets can still be queued.
         if is_closed && is_empty {
@@ -298,6 +310,12 @@ impl Send {
 
         self.prioritize.reclaim_reserved_capacity(stream, counts);
         self.prioritize.schedule_send(stream, task);
+        if stream.initial_window == Some(stream::InitialWindow::Pending) {
+            // Unopened requests can now be discarded without a stream slot.
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
     }
 
     pub fn send_data<B>(
@@ -355,13 +373,15 @@ impl Send {
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
         counts: &mut Counts,
+        recv: &mut Recv,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> io::Result<BufferStatus>
     where
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        self.prioritize.buffer_pending(buffer, store, counts, dst)
+        self.prioritize
+            .buffer_pending(buffer, store, counts, recv, dst)
     }
 
     pub fn reclaim_written_frame<T, B>(

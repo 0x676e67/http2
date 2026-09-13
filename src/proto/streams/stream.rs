@@ -114,6 +114,16 @@ pub(super) struct Stream {
 
     /// Validate content-length headers
     pub content_length: ContentLength,
+
+    /// Initial request window state, only for clients using a stream target.
+    pub initial_window: Option<InitialWindow>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InitialWindow {
+    Pending,
+    /// SETTINGS baseline already included in this stream's receive window.
+    Sent(WindowSize),
 }
 
 /// State related to validating a stream's content-length
@@ -194,6 +204,7 @@ impl Stream {
             push_task: None,
             pending_push_promises: store::Queue::new(),
             content_length: ContentLength::Omitted,
+            initial_window: None,
         }
     }
 

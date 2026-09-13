@@ -374,6 +374,8 @@ where
             request_headers_stream_dependency.or(me.headers_stream_dependency),
         )?;
 
+        me.actions.recv.init_request_window(&mut stream);
+
         let mut stream = me.store.insert(stream.id, stream);
 
         let sent = me.actions.send.send_headers(
@@ -1053,11 +1055,13 @@ impl Inner {
         }
 
         // Send any other pending frames
-        if self
-            .actions
-            .send
-            .buffer_pending(send_buffer, &mut self.store, &mut self.counts, dst)?
-            == BufferStatus::CodecFull
+        if self.actions.send.buffer_pending(
+            send_buffer,
+            &mut self.store,
+            &mut self.counts,
+            &mut self.actions.recv,
+            dst,
+        )? == BufferStatus::CodecFull
         {
             return Ok(BufferStatus::CodecFull);
         }
@@ -1154,6 +1158,29 @@ where
         }
         Poll::Ready(Ok(()))
     }
+
+    pub(crate) fn validate_initial_stream_window_size_update(
+        &self,
+        size: WindowSize,
+    ) -> Result<(), UserError> {
+        self.inner
+            .lock()
+            .actions
+            .recv
+            .validate_initial_stream_window_size_update(size)
+    }
+
+    pub(crate) fn set_initial_stream_window_size(
+        &mut self,
+        target: WindowSize,
+        advertised: WindowSize,
+    ) {
+        self.inner
+            .lock()
+            .actions
+            .recv
+            .set_initial_stream_window_target(target, advertised);
+    }
 }
 
 impl<B, P> Streams<B, P>
@@ -1209,6 +1236,10 @@ where
     pub fn num_wired_streams(&self) -> usize {
         let me = self.inner.lock();
         me.store.num_wired_streams()
+    }
+
+    pub(crate) fn sent_local_settings(&mut self, settings: &frame::Settings) {
+        self.inner.lock().actions.recv.sent_local_settings(settings);
     }
 }
 

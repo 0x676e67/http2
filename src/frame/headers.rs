@@ -1,4 +1,4 @@
-use super::{StreamDependency, StreamId, util};
+use super::{StreamDependency, StreamId, WindowUpdate, util};
 use crate::ext::Protocol;
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 
 use std::fmt;
 use std::io::Cursor;
+use std::num::NonZeroU32;
 use std::ops::ControlFlow;
 
 type EncodeBuf<'a> = bytes::buf::Limit<&'a mut BytesMut>;
@@ -34,6 +35,10 @@ pub struct Headers {
 
     /// The associated flags
     flags: HeadersFlag,
+
+    /// Client-only one-shot companion encoded as a separate frame after the
+    /// complete initial request header block.
+    initial_stream_window_update: Option<NonZeroU32>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -62,7 +67,11 @@ pub struct Continuation {
     /// Stream ID of continuation frame
     stream_id: StreamId,
 
+    /// The encoding header block fragment
     header_block: EncodingHeaderBlock,
+
+    /// Carries the client-only companion to the final END_HEADERS fragment.
+    initial_stream_window_update: Option<NonZeroU32>,
 }
 
 // TODO: These fields shouldn't be `pub`
@@ -233,6 +242,7 @@ impl Headers {
                 pseudo,
             },
             flags: HeadersFlag::default(),
+            initial_stream_window_update: None,
         }
     }
 
@@ -250,6 +260,7 @@ impl Headers {
                 pseudo: Pseudo::default(),
             },
             flags,
+            initial_stream_window_update: None,
         }
     }
 
@@ -315,6 +326,7 @@ impl Headers {
                 pseudo: Pseudo::default(),
             },
             flags,
+            initial_stream_window_update: None,
         };
 
         Ok((headers, src))
@@ -405,7 +417,7 @@ impl Headers {
     }
 
     pub fn encode(
-        self,
+        mut self,
         encoder: &mut hpack::Encoder,
         dst: &mut EncodeBuf<'_>,
     ) -> Option<Continuation> {
@@ -415,18 +427,40 @@ impl Headers {
         // Get the HEADERS frame head
         let head = self.head();
 
-        self.header_block
-            .into_encoding(encoder)
-            .encode(&head, dst, Some(encoder), |dst| {
-                if let Some(ref stream_dep) = self.stream_dep {
-                    // write 5 bytes for the stream dependency
-                    stream_dep.encode(dst);
-                }
-            })
+        let initial_stream_window_update = self.initial_stream_window_update.take();
+
+        let continuation =
+            self.header_block
+                .into_encoding(encoder)
+                .encode(&head, dst, Some(encoder), |dst| {
+                    if let Some(ref stream_dep) = self.stream_dep {
+                        // write 5 bytes for the stream dependency
+                        stream_dep.encode(dst);
+                    }
+                });
+
+        match continuation {
+            Some(mut continuation) => {
+                continuation.initial_stream_window_update = initial_stream_window_update;
+                Some(continuation)
+            }
+            None => {
+                encode_initial_stream_window_update(
+                    self.stream_id,
+                    initial_stream_window_update,
+                    dst,
+                );
+                None
+            }
+        }
     }
 
     fn head(&self) -> Head {
         Head::new(Kind::Headers, self.flags.into(), self.stream_id)
+    }
+
+    pub(crate) fn set_initial_stream_window_update(&mut self, increment: NonZeroU32) {
+        self.initial_stream_window_update = Some(increment);
     }
 }
 
@@ -685,9 +719,43 @@ impl Continuation {
     pub fn encode(self, dst: &mut EncodeBuf<'_>) -> Option<Continuation> {
         // Get the CONTINUATION frame head
         let head = self.head();
+        let initial_stream_window_update = self.initial_stream_window_update;
+        let continuation = self.header_block.encode(&head, dst, None, |_| {});
 
-        self.header_block.encode(&head, dst, None, |_| {})
+        match continuation {
+            Some(mut continuation) => {
+                continuation.initial_stream_window_update = initial_stream_window_update;
+                Some(continuation)
+            }
+            None => {
+                encode_initial_stream_window_update(
+                    self.stream_id,
+                    initial_stream_window_update,
+                    dst,
+                );
+                None
+            }
+        }
     }
+}
+
+fn encode_initial_stream_window_update(
+    stream_id: StreamId,
+    increment: Option<NonZeroU32>,
+    dst: &mut EncodeBuf<'_>,
+) {
+    let Some(increment) = increment else {
+        return;
+    };
+
+    // RFC 9113 §6.10 forbids interleaving another frame inside a header
+    // block. This runs only after END_HEADERS has been encoded. The Limit is
+    // scoped to the header fragment, so append the separate WINDOW_UPDATE to
+    // its underlying buffer rather than counting it as header payload.
+    // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.10
+    let update = WindowUpdate::new(stream_id, increment.get());
+    tracing::debug!(frame = ?update, "send");
+    update.encode(&mut **dst.get_mut());
 }
 
 // ===== impl Pseudo =====
@@ -816,6 +884,7 @@ impl EncodingHeaderBlock {
             Some(Continuation {
                 stream_id: head.stream_id(),
                 header_block: self,
+                initial_stream_window_update: None,
             })
         } else {
             dst.put_slice(&self.hpack);
