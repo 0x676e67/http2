@@ -1727,6 +1727,11 @@ impl proto::Peer for Peer {
 
         if let Some(status) = pseudo.status {
             b = b.status(status);
+        } else {
+            // Every response must include :status (RFC 9113, section 8.3.2).
+            // https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.2
+            proto_err!(stream: "missing :status; stream={:?}", stream_id);
+            return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
         }
 
         let mut response = match b.body(()) {
