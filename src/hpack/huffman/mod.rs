@@ -11,7 +11,7 @@ mod test {
 
     use bytes::BytesMut;
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     fn decode(src: &[u8]) -> BytesMut {
         let mut buf = BytesMut::new();
@@ -91,7 +91,7 @@ mod test {
         let mut rng = StdRng::seed_from_u64(0x123456789abcdef);
 
         for len in 0..600 {
-            let src: Vec<u8> = (0..len).map(|_| rng.r#gen()).collect();
+            let src: Vec<u8> = (0..len).map(|_| rng.random()).collect();
             let mut encoded = BytesMut::new();
             encode(&src, &mut encoded);
             assert_eq!(&decode(&encoded)[..], &src[..], "len={}", len);

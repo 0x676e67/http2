@@ -68,7 +68,7 @@ h2 = { version = "0.4" }
 
 # Fuzzing
 quickcheck = { version = "1.0.3", default-features = false }
-rand = "0.8.4"
+rand = "0.10.2"
 
 # HPACK fixtures
 hex = "0.4.3"
