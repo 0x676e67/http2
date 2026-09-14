@@ -211,7 +211,7 @@ mod test {
 
     use bytes::BufMut;
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     fn decode(src: &[u8]) -> Result<BytesMut, DecoderError> {
         let mut buf = BytesMut::new();
@@ -272,15 +272,15 @@ mod test {
         let mut rng = StdRng::seed_from_u64(0xdeadbeefcafe);
 
         for _ in 0..10_000 {
-            let len = rng.gen_range(0..40);
-            let src: Vec<u8> = (0..len).map(|_| rng.r#gen()).collect();
+            let len = rng.random_range(0..40);
+            let src: Vec<u8> = (0..len).map(|_| rng.random()).collect();
             assert_eq!(reference_decode(&src), decode(&src), "src={:?}", src);
         }
 
         // Bias toward high bytes to exercise long codes and EOS prefixes.
         for _ in 0..10_000 {
-            let len = rng.gen_range(0..40);
-            let src: Vec<u8> = (0..len).map(|_| rng.r#gen::<u8>() | 0xe0).collect();
+            let len = rng.random_range(0..40);
+            let src: Vec<u8> = (0..len).map(|_| rng.random::<u8>() | 0xe0).collect();
             assert_eq!(reference_decode(&src), decode(&src), "src={:?}", src);
         }
     }
