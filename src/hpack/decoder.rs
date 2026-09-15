@@ -381,10 +381,15 @@ impl Decoder {
                 LiteralNeverIndexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
                     self.table_size.on_header()?;
-                    let entry = self.decode_literal(src, false)?;
+                    let mut entry = self.decode_literal(src, false)?;
                     consume(src);
 
-                    // TODO: Track that this should never be indexed
+                    // Preserve the representation when a received field is
+                    // forwarded, as required by RFC 7541 section 6.2.3.
+                    // https://www.rfc-editor.org/rfc/rfc7541.html#section-6.2.3
+                    if let TableEntry::Header(Header::Field { value, .. }) = &mut entry {
+                        value.set_sensitive(true);
+                    }
 
                     if self.emit(entry, &mut f) {
                         break;

@@ -280,6 +280,7 @@ impl Headers {
     pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
         let flags = HeadersFlag(head.flag());
         let mut pad = 0;
+        let mut is_malformed = false;
 
         tracing::trace!("loading headers; flags={:?}", flags);
 
@@ -306,7 +307,11 @@ impl Headers {
             let stream_dep = StreamDependency::load(&src[..5])?;
 
             if stream_dep.dependency_id() == head.stream_id() {
-                return Err(Error::InvalidDependencyId);
+                // RFC 9113 section 4.3 requires decoding the complete field
+                // block before rejecting only this stream, to keep HPACK in sync.
+                // https://www.rfc-editor.org/rfc/rfc9113.html#section-4.3
+                tracing::trace!("invalid HEADERS dependency ID; draining field block");
+                is_malformed = true;
             }
 
             // Drop the next 5 bytes
@@ -334,7 +339,7 @@ impl Headers {
                 is_over_size: false,
                 pseudo: Pseudo::default(),
                 decoded_size: 0,
-                is_malformed: false,
+                is_malformed,
             },
             flags,
             initial_stream_window_update: None,

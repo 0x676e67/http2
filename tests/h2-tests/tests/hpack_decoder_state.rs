@@ -253,3 +253,84 @@ async fn restored_table_limit_does_not_require_redundant_updates() {
         assert!(codec.next().await.unwrap().is_ok());
     }
 }
+
+#[tokio::test]
+async fn self_dependent_headers_preserve_the_compression_context() {
+    for fragmented in [false, true] {
+        // The rejected stream inserts x:a and y:b. Both entries must remain
+        // available to subsequent streams, including across CONTINUATION.
+        let mut payload = vec![0, 0, 0, 1, 15];
+        payload.extend_from_slice(&[0x40, 0x01, b'x', 0x01, b'a']);
+        let tail = [0x40, 0x01, b'y', 0x01, b'b'];
+        let mut input = if fragmented {
+            let mut input = headers(0x20, &payload);
+            input.extend_from_slice(&continuation(0x4, &tail));
+            input
+        } else {
+            payload.extend_from_slice(&tail);
+            headers(0x24, &payload)
+        };
+        input.extend_from_slice(&headers_on_stream(3, 0x4, &[0xbf, 0xbe]));
+        let mut builder = mock_io::Builder::new();
+        builder.read(&input);
+        let mut codec = Codec::new(builder.build());
+
+        assert_stream_protocol_error(codec.next().await.unwrap().unwrap_err(), 1);
+        let headers = assert_headers!(codec.next().await.unwrap().unwrap());
+        assert_eq!(headers.stream_id(), 3);
+        assert_eq!(headers.fields()["x"], "a");
+        assert_eq!(headers.fields()["y"], "b");
+    }
+
+    // A stream error must not hide a compression error in the same block.
+    let payload = [0, 0, 0, 1, 15, 0xbe];
+    assert_compression_error(&headers(0x24, &payload), &[]).await;
+    let mut input = headers(0x20, &payload[..5]);
+    input.extend_from_slice(&continuation(0x4, &payload[5..]));
+    assert_compression_error(&input, &[]).await;
+}
+
+#[tokio::test]
+async fn never_indexed_fields_retain_sensitivity_without_changing_the_table() {
+    let input = headers(
+        0x4,
+        &[
+            0x40, 0x01, b'x', 0x01, b'a', // indexed literal, dynamic entry 62
+            0x10, 0x01, b'x', 0x01, b'b', // never indexed, literal name
+            0x1f, 0x2f, 0x01, b'c', // never indexed, dynamic name 62
+            0x1f, 0x08, 0x01, b'd', // never indexed, static authorization name
+            0xbe, // entry 62 is still x:a, and is not sensitive
+        ],
+    );
+    let mut builder = mock_io::Builder::new();
+    builder.read(&input);
+    let mut codec = Codec::new(builder.build());
+    let headers = assert_headers!(codec.next().await.unwrap().unwrap());
+    let values: Vec<_> = headers.fields().get_all("x").iter().collect();
+    assert_eq!(
+        values.iter().map(|v| v.as_bytes()).collect::<Vec<_>>(),
+        vec![&b"a"[..], &b"b"[..], &b"c"[..], &b"a"[..]]
+    );
+    assert_eq!(
+        values.iter().map(|v| v.is_sensitive()).collect::<Vec<_>>(),
+        vec![false, true, true, false]
+    );
+    assert!(headers.fields()["authorization"].is_sensitive());
+
+    // Forward the received HeaderValue unchanged. The wire representation
+    // must remain never-indexed (0001), not merely avoid this insertion.
+    let mut fields = HeaderMap::new();
+    fields.insert("x", values[1].clone());
+    let outgoing = frame::Headers::new(3.into(), frame::Pseudo::default(), fields);
+    let expected = headers_on_stream(3, 0x4, &[0x10, 0x81, 0xf3, 0x81, 0x8f]);
+    let mut builder = mock_io::Builder::new();
+    builder.write(&expected);
+    let mut codec = Codec::new(builder.build());
+    futures::future::poll_fn(|cx| codec.poll_ready(cx))
+        .await
+        .unwrap();
+    codec.buffer(outgoing.into()).unwrap();
+    futures::future::poll_fn(|cx| codec.flush(cx))
+        .await
+        .unwrap();
+}
