@@ -238,15 +238,14 @@ const ALL: u8 = END_STREAM | END_HEADERS | PADDED | PRIORITY;
 impl Headers {
     /// Create a new HEADERS frame
     pub fn new(stream_id: StreamId, pseudo: Pseudo, fields: HeaderMap) -> Self {
-        let decoded_size = calculate_header_list_size(&pseudo, &fields);
         Headers {
             stream_id,
             stream_dep: None,
             header_block: HeaderBlock {
+                decoded_size: calculate_header_list_size(&pseudo, &fields),
                 fields,
                 is_over_size: false,
                 pseudo,
-                decoded_size,
                 is_malformed: false,
             },
             flags: HeadersFlag::default(),
@@ -550,14 +549,13 @@ impl PushPromise {
         pseudo: Pseudo,
         fields: HeaderMap,
     ) -> Self {
-        let decoded_size = calculate_header_list_size(&pseudo, &fields);
         PushPromise {
             flags: PushPromiseFlag::default(),
             header_block: HeaderBlock {
+                decoded_size: calculate_header_list_size(&pseudo, &fields),
                 fields,
                 is_over_size: false,
                 pseudo,
-                decoded_size,
                 is_malformed: false,
             },
             promised_id,
