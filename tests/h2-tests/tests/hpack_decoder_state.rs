@@ -94,6 +94,28 @@ async fn decoder_requires_a_size_update_after_the_limit_is_lowered() {
     assert_compression_error(&headers(0x4, &[0x88]), &[128]).await;
     assert_compression_error(&headers(0x4, &[]), &[128]).await;
 
+    // RFC 7541 section 4.2 requires the lowest capacity to be signaled even
+    // if the final SETTINGS restores the old limit and the table is empty.
+    // https://www.rfc-editor.org/rfc/rfc7541.html#section-4.2
+    assert_compression_error(&headers(0x4, &[0x88]), &[128, 4096]).await;
+    assert_compression_error(&headers(0x4, &[]), &[128, 4096]).await;
+    assert_compression_error(&headers(0x4, &[0x3f, 0xe1, 0x1f, 0x88]), &[128, 4096]).await;
+
+    // A table occupying only 34 bytes must still signal the temporary 128
+    // limit: the negotiated capacity, not occupancy, controls the update.
+    let mut input = headers(0x4, &[0x40, 0x01, b'x', 0x01, b'a']);
+    input.extend_from_slice(&headers_on_stream(3, 0x4, &[0xbe]));
+    let mut builder = mock_io::Builder::new();
+    builder.read(&input);
+    let mut codec = Codec::new(builder.build());
+    assert!(codec.next().await.unwrap().is_ok());
+    codec.set_recv_header_table_size(128);
+    codec.set_recv_header_table_size(4096);
+    assert!(matches!(
+        codec.next().await.unwrap(),
+        Err(proto::Error::GoAway(_, Reason::COMPRESSION_ERROR, _))
+    ));
+
     let mut push_payload = vec![0, 0, 0, 2];
     push_payload.push(0x82);
     assert_compression_error(&frame(5, 0x4, &push_payload), &[128]).await;
@@ -208,4 +230,26 @@ async fn malformed_continuation_is_drained_before_the_next_block() {
     let headers = assert_headers!(frame);
     assert_eq!(headers.stream_id(), 3);
     assert_eq!(headers.into_parts().0.status, Some(StatusCode::OK));
+}
+
+#[tokio::test]
+async fn restored_table_limit_does_not_require_redundant_updates() {
+    for (initial, next) in [
+        // An encoder already using 64 bytes need not resize for 128 -> 4096.
+        (&[0x3f, 0x21, 0x88][..], &[0x88][..]),
+        // Otherwise it signals 128 then 4096 once, not in every later block.
+        (&[0x88][..], &[0x3f, 0x61, 0x3f, 0xe1, 0x1f, 0x88][..]),
+    ] {
+        let mut input = headers(0x4, initial);
+        input.extend_from_slice(&headers_on_stream(3, 0x4, next));
+        input.extend_from_slice(&headers_on_stream(5, 0x4, &[0x88]));
+        let mut builder = mock_io::Builder::new();
+        builder.read(&input);
+        let mut codec = Codec::new(builder.build());
+        assert!(codec.next().await.unwrap().is_ok());
+        codec.set_recv_header_table_size(128);
+        codec.set_recv_header_table_size(4096);
+        assert!(codec.next().await.unwrap().is_ok());
+        assert!(codec.next().await.unwrap().is_ok());
+    }
 }

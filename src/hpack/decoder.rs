@@ -318,11 +318,8 @@ impl Decoder {
     }
 
     pub(crate) fn begin_header_block(&mut self) -> Result<(), DecoderError> {
-        self.table_size.begin_header_block(
-            self.table.size(),
-            self.table.max_size,
-            HeaderBlockMode::Explicit,
-        )
+        self.table_size
+            .begin_header_block(self.table.max_size, HeaderBlockMode::Explicit)
     }
 
     pub(crate) fn end_header_block(&mut self) -> Result<Option<DecoderError>, DecoderError> {
@@ -339,9 +336,7 @@ impl Decoder {
     {
         use self::Representation::*;
 
-        let implicit_block = self
-            .table_size
-            .ensure_header_block(self.table.size(), self.table.max_size);
+        let implicit_block = self.table_size.ensure_header_block(self.table.max_size);
 
         let _span = tracing::trace_span!("hpack::decode");
 
@@ -456,7 +451,6 @@ impl DecoderTableSize {
 
     fn begin_header_block(
         &mut self,
-        current_size: usize,
         current_limit: usize,
         mode: HeaderBlockMode,
     ) -> Result<(), DecoderError> {
@@ -467,17 +461,20 @@ impl DecoderTableSize {
         self.allow_update = true;
         self.saw_update = false;
         self.semantic_error = None;
-        self.require_update = self.lowest < current_size || self.final_size < current_limit;
+        // RFC 7541 section 4.2 requires the lowest capacity, even when no
+        // entries need eviction and a later SETTINGS restores the limit.
+        // https://www.rfc-editor.org/rfc/rfc7541.html#section-4.2
+        self.require_update = self.lowest < current_limit;
         self.block_mode = Some(mode);
         Ok(())
     }
 
-    fn ensure_header_block(&mut self, current_size: usize, current_limit: usize) -> bool {
+    fn ensure_header_block(&mut self, current_limit: usize) -> bool {
         if self.block_mode.is_none() {
             self.allow_update = true;
             self.saw_update = false;
             self.semantic_error = None;
-            self.require_update = self.lowest < current_size || self.final_size < current_limit;
+            self.require_update = self.lowest < current_limit;
             self.block_mode = Some(HeaderBlockMode::Implicit);
         }
 
@@ -722,6 +719,7 @@ impl Table {
         }
     }
 
+    #[cfg(any(feature = "tracing", test))]
     fn size(&self) -> usize {
         self.size
     }
