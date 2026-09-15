@@ -34,6 +34,11 @@ pub enum Index {
     // Only the value has been inserted (hpack table idx, slots idx)
     InsertedValue(usize, usize),
 
+    // An incremental literal that could not be retained because it is larger
+    // than the current dynamic table. The name index is captured before the
+    // table is cleared, as required by RFC 7541 section 4.4.
+    OversizedIndexedLiteral(Option<usize>, Header),
+
     // The header is not indexed by this table
     NotIndexed(Header),
 }
@@ -53,6 +58,12 @@ struct Pos {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 struct HashValue(usize);
+
+#[derive(Debug, Default, Copy, Clone)]
+struct DynamicLookup {
+    name: Option<usize>,
+    value: Option<usize>,
+}
 
 const MAX_SIZE: usize = 1 << 16;
 const DYN_OFFSET: usize = 62;
@@ -114,6 +125,7 @@ impl Table {
             Name(_, ref h) => h,
             Inserted(idx) => &self.slots[idx].header,
             InsertedValue(_, idx) => &self.slots[idx].header,
+            OversizedIndexedLiteral(_, ref h) => h,
             NotIndexed(ref h) => h,
         }
     }
@@ -126,7 +138,7 @@ impl Table {
             Name(idx, ..) => idx,
             Inserted(idx) => idx + DYN_OFFSET,
             InsertedValue(_name_idx, slot_idx) => slot_idx + DYN_OFFSET,
-            NotIndexed(_) => panic!("cannot resolve index"),
+            OversizedIndexedLiteral(..) | NotIndexed(_) => panic!("cannot resolve index"),
         }
     }
 
@@ -348,12 +360,7 @@ impl Table {
         self.max_size = size;
 
         if size == 0 {
-            self.size = 0;
-
-            self.indices.fill(None);
-
-            self.slots.clear();
-            self.inserted = 0;
+            self.clear();
         } else {
             self.converge(None);
         }
@@ -614,6 +621,115 @@ impl Table {
 
         true
     }
+
+    /// Indexes a field using the client encoding policy.
+    ///
+    /// Sensitive values are handled before any full-value lookup so they are
+    /// never emitted as indexed fields. Other fields first use a complete
+    /// static or dynamic match. Literal pseudo-fields are not inserted except
+    /// for `:authority`; ordinary fields use incremental indexing.
+    pub(super) fn index_header(&mut self, header: Header) -> Index {
+        let statik = lookup_static(&header);
+
+        if header.is_sensitive() {
+            let name_index = statik
+                .map(|(index, _)| index)
+                .or_else(|| self.dynamic_lookup(&header).name);
+            return Self::literal(header, name_index);
+        }
+
+        if let Some((index, true)) = statik {
+            return Index::Indexed(index, header);
+        }
+
+        if !should_index(&header) {
+            let dynamic = self.dynamic_lookup(&header);
+            if let Some(index) = dynamic.value {
+                return Index::Indexed(index, header);
+            }
+
+            let name_index = statik.map(|(index, _)| index).or(dynamic.name);
+            return Self::literal(header, name_index);
+        }
+
+        if header.len() > self.max_size {
+            let dynamic = self.dynamic_lookup(&header);
+            if let Some(index) = dynamic.value {
+                return Index::Indexed(index, header);
+            }
+
+            // RFC 7541 section 4.4 requires an entry larger than the maximum
+            // size to empty the dynamic table. Capture the name first because
+            // the literal is encoded before that eviction in Chromium's route.
+            // https://www.rfc-editor.org/rfc/rfc7541.html#section-4.4
+            let name_index = statik.map(|(index, _)| index).or(dynamic.name);
+            self.clear();
+            return Index::OversizedIndexedLiteral(name_index, header);
+        }
+
+        self.index_dynamic(header, statik)
+    }
+
+    fn literal(header: Header, name_index: Option<usize>) -> Index {
+        match name_index {
+            Some(index) => Index::Name(index, header),
+            None => Index::NotIndexed(header),
+        }
+    }
+
+    fn dynamic_lookup(&self, header: &Header) -> DynamicLookup {
+        if self.indices.is_empty() {
+            return DynamicLookup::default();
+        }
+
+        let hash = hash_header(header);
+        let mut probe = desired_pos(self.mask, hash);
+        let mut distance = 0;
+
+        loop {
+            let Some(pos) = self.indices[probe] else {
+                return DynamicLookup::default();
+            };
+
+            if probe_distance(self.mask, pos.hash, probe) < distance {
+                return DynamicLookup::default();
+            }
+
+            let slot_index = pos.index.wrapping_add(self.inserted);
+            if pos.hash == hash && self.slots[slot_index].header.name() == header.name() {
+                let mut index = pos.index;
+                let mut lookup = DynamicLookup::default();
+
+                loop {
+                    let real_index = index.wrapping_add(self.inserted);
+                    let slot = &self.slots[real_index];
+                    lookup.name = Some(real_index + DYN_OFFSET);
+
+                    if slot.header.value_eq(header) {
+                        lookup.value = Some(real_index + DYN_OFFSET);
+                    }
+
+                    match slot.next {
+                        Some(next) => index = next,
+                        None => return lookup,
+                    }
+                }
+            }
+
+            distance += 1;
+            if distance == self.indices.len() {
+                return DynamicLookup::default();
+            }
+            probe = (probe + 1) & self.mask;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.size = 0;
+        self.indices.fill(None);
+        self.slots.clear();
+        self.inserted = 0;
+    }
 }
 
 #[cfg(test)]
@@ -665,6 +781,23 @@ fn hash_header(header: &Header) -> HashValue {
     let mut h = FnvHasher::default();
     header.name().hash(&mut h);
     HashValue((h.finish() & MASK) as usize)
+}
+
+fn should_index(header: &Header) -> bool {
+    matches!(header, Header::Authority(_) | Header::Field { .. })
+}
+
+/// Checks the static table using the complete name and value match required by
+/// the client route. The shared lookup reports selected non-empty values as
+/// exact matches, while most entries in the HPACK static table have an empty
+/// value.
+/// https://www.rfc-editor.org/rfc/rfc7541.html#appendix-A
+fn lookup_static(header: &Header) -> Option<(usize, bool)> {
+    index_static(header).map(|(index, value_matches)| {
+        let empty_value_matches =
+            header.value_slice().is_empty() && matches!(index, 1 | 15 | 17..=61);
+        (index, value_matches || empty_value_matches)
+    })
 }
 
 /// Checks the static table for the header. If found, returns the index and a

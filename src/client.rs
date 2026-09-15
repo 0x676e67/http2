@@ -1502,6 +1502,7 @@ where
         // this item before it advances the separate request frame queue.
         // https://www.rfc-editor.org/rfc/rfc9113.html#section-3.4
         let mut codec = Codec::new(io);
+        codec.set_hpack_role(crate::hpack::EncodingRole::Client);
         codec.buffer_client_magic(CLIENT_MAGIC);
 
         if let Some(max) = builder.settings.max_frame_size() {
