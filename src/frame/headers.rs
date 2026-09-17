@@ -205,15 +205,21 @@ struct HeaderBlock {
     /// The decoded header fields
     fields: HeaderMap,
 
-    /// Precomputed size of all of our header fields, for perf reasons
-    field_size: usize,
-
     /// Set to true if decoding went over the max header list size.
     is_over_size: bool,
 
     /// Pseudo headers, these are broken out as they must be sent as part of the
     /// headers frame.
     pseudo: Pseudo,
+
+    /// Uncompressed size of every decoded field, including malformed fields.
+    /// RFC 9113 section 6.5.2 counts the name, value, and 32 bytes of overhead.
+    /// https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
+    decoded_size: usize,
+
+    /// Set when a decoded field makes the HTTP message malformed. HPACK
+    /// decoding still continues so the connection-level table stays in sync.
+    is_malformed: bool,
 }
 
 #[derive(Debug)]
@@ -236,10 +242,11 @@ impl Headers {
             stream_id,
             stream_dep: None,
             header_block: HeaderBlock {
-                field_size: calculate_headermap_size(&fields),
+                decoded_size: calculate_header_list_size(&pseudo, &fields),
                 fields,
                 is_over_size: false,
                 pseudo,
+                is_malformed: false,
             },
             flags: HeadersFlag::default(),
             initial_stream_window_update: None,
@@ -247,6 +254,7 @@ impl Headers {
     }
 
     pub fn trailers(stream_id: StreamId, fields: HeaderMap) -> Self {
+        let decoded_size = calculate_headermap_size(&fields);
         let mut flags = HeadersFlag::default();
         flags.set_end_stream();
 
@@ -254,10 +262,11 @@ impl Headers {
             stream_id,
             stream_dep: None,
             header_block: HeaderBlock {
-                field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                decoded_size,
+                is_malformed: false,
             },
             flags,
             initial_stream_window_update: None,
@@ -270,6 +279,7 @@ impl Headers {
     pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
         let flags = HeadersFlag(head.flag());
         let mut pad = 0;
+        let mut is_malformed = false;
 
         tracing::trace!("loading headers; flags={:?}", flags);
 
@@ -296,7 +306,11 @@ impl Headers {
             let stream_dep = StreamDependency::load(&src[..5])?;
 
             if stream_dep.dependency_id() == head.stream_id() {
-                return Err(Error::InvalidDependencyId);
+                // RFC 9113 section 4.3 requires decoding the complete field
+                // block before rejecting only this stream, to keep HPACK in sync.
+                // https://www.rfc-editor.org/rfc/rfc9113.html#section-4.3
+                tracing::trace!("invalid HEADERS dependency ID; draining field block");
+                is_malformed = true;
             }
 
             // Drop the next 5 bytes
@@ -321,9 +335,10 @@ impl Headers {
             stream_dep,
             header_block: HeaderBlock {
                 fields: HeaderMap::new(),
-                field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                decoded_size: 0,
+                is_malformed,
             },
             flags,
             initial_stream_window_update: None,
@@ -462,6 +477,10 @@ impl Headers {
     pub(crate) fn set_initial_stream_window_update(&mut self, increment: NonZeroU32) {
         self.initial_stream_window_update = Some(increment);
     }
+
+    pub(crate) fn is_malformed(&self) -> bool {
+        self.header_block.is_malformed
+    }
 }
 
 impl<T> From<Headers> for Frame<T> {
@@ -533,10 +552,11 @@ impl PushPromise {
         PushPromise {
             flags: PushPromiseFlag::default(),
             header_block: HeaderBlock {
-                field_size: calculate_headermap_size(&fields),
+                decoded_size: calculate_header_list_size(&pseudo, &fields),
                 fields,
                 is_over_size: false,
                 pseudo,
+                is_malformed: false,
             },
             promised_id,
             stream_id,
@@ -625,9 +645,10 @@ impl PushPromise {
             flags,
             header_block: HeaderBlock {
                 fields: HeaderMap::new(),
-                field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                decoded_size: 0,
+                is_malformed: false,
             },
             promised_id,
             stream_id: head.stream_id(),
@@ -689,6 +710,10 @@ impl PushPromise {
     /// Consume `self`, returning the parts of the frame
     pub fn into_parts(self) -> (Pseudo, HeaderMap) {
         (self.header_block.pseudo, self.header_block.fields)
+    }
+
+    pub(crate) fn is_malformed(&self) -> bool {
+        self.header_block.is_malformed
     }
 }
 
@@ -1090,20 +1115,19 @@ impl HeaderBlock {
         decoder: &mut hpack::Decoder,
     ) -> Result<(), Error> {
         let mut reg = !self.fields.is_empty();
-        let mut malformed = false;
+        let mut malformed = self.is_malformed;
         let mut header_list_way_too_large = false;
-        let mut headers_size = self.calculate_header_list_size();
         let max_header_list_abuse_size =
             max_header_list_size.saturating_mul(MAX_HEADER_LIST_ABUSE_MULTIPLIER);
 
         macro_rules! check_size {
             () => {{
-                if headers_size > max_header_list_abuse_size {
+                if self.decoded_size > max_header_list_abuse_size {
                     tracing::trace!("load_hpack; header list size over abuse max");
                     header_list_way_too_large = true;
                     ControlFlow::Break(())
                 } else {
-                    if headers_size >= max_header_list_size && !self.is_over_size {
+                    if self.decoded_size >= max_header_list_size && !self.is_over_size {
                         tracing::trace!("load_hpack; header list size over max");
                         self.is_over_size = true;
                     }
@@ -1122,11 +1146,6 @@ impl HeaderBlock {
                     malformed = true;
                 } else {
                     let __val = $val;
-                    headers_size +=
-                        decoded_header_size(stringify!($field).len() + 1, __val.as_str().len());
-                    if check_size!().is_break() {
-                        return ControlFlow::Break(());
-                    }
                     if !self.is_over_size {
                         self.pseudo.$field = Some(__val);
                     }
@@ -1140,7 +1159,25 @@ impl HeaderBlock {
         // the headers. A malformed header frame is a stream level error, but
         // the hpack state is connection level. In order to maintain correct
         // state for other streams, the hpack decoding process must complete.
-        let res = decoder.decode(&mut cursor, |header| {
+        let res = decoder.decode_with_meta(&mut cursor, |decoded| {
+            let (header, size) = match decoded {
+                hpack::DecodedHeader::Header(header) => {
+                    let size = header.len();
+                    (Some(header), size)
+                }
+                hpack::DecodedHeader::Malformed { len } => (None, len),
+            };
+
+            self.decoded_size = self.decoded_size.saturating_add(size);
+            if check_size!().is_break() {
+                return ControlFlow::Break(());
+            }
+
+            let Some(header) = header else {
+                malformed = true;
+                return ControlFlow::Continue(());
+            };
+
             use crate::hpack::Header::*;
 
             match header {
@@ -1165,19 +1202,11 @@ impl HeaderBlock {
                     } else {
                         reg = true;
 
-                        let header_size = decoded_header_size(name.as_str().len(), value.len());
-                        headers_size += header_size;
-                        if check_size!().is_break() {
-                            return ControlFlow::Break(());
-                        }
-                        if !self.is_over_size {
-                            self.field_size += header_size;
-                            if self.fields.try_append(name, value).is_err() {
-                                // HeaderMap capacity exceeded — treat as over-size
-                                // so the stream is rejected downstream (RST_STREAM / 431)
-                                // instead of panicking on the 24,577th unique header.
-                                self.is_over_size = true;
-                            }
+                        if !self.is_over_size && self.fields.try_append(name, value).is_err() {
+                            // HeaderMap capacity exceeded — treat as over-size
+                            // so the stream is rejected downstream (RST_STREAM / 431)
+                            // instead of panicking on the 24,577th unique header.
+                            self.is_over_size = true;
                         }
                     }
                 }
@@ -1195,6 +1224,7 @@ impl HeaderBlock {
         match res {
             Ok(()) => {}
             Err(e) => {
+                self.is_malformed = malformed;
                 tracing::trace!("hpack decoding error; err={:?}", e);
                 return Err(e.into());
             }
@@ -1205,10 +1235,7 @@ impl HeaderBlock {
             return Err(Error::HeaderListWayTooLarge);
         }
 
-        if malformed {
-            tracing::trace!("malformed message");
-            return Err(Error::MalformedMessage);
-        }
+        self.is_malformed = malformed;
 
         Ok(())
     }
@@ -1225,42 +1252,39 @@ impl HeaderBlock {
 
         EncodingHeaderBlock { hpack }
     }
-
-    /// Calculates the size of the currently decoded header list.
-    ///
-    /// According to http://httpwg.org/specs/rfc7540.html#SETTINGS_MAX_HEADER_LIST_SIZE
-    ///
-    /// > The value is based on the uncompressed size of header fields,
-    /// > including the length of the name and value in octets plus an
-    /// > overhead of 32 octets for each header field.
-    fn calculate_header_list_size(&self) -> usize {
-        macro_rules! pseudo_size {
-            ($name:ident) => {{
-                self.pseudo
-                    .$name
-                    .as_ref()
-                    .map(|m| decoded_header_size(stringify!($name).len() + 1, m.as_str().len()))
-                    .unwrap_or(0)
-            }};
-        }
-
-        pseudo_size!(method)
-            + pseudo_size!(scheme)
-            + pseudo_size!(status)
-            + pseudo_size!(authority)
-            + pseudo_size!(path)
-            + self.field_size
-    }
 }
 
 fn calculate_headermap_size(map: &HeaderMap) -> usize {
     map.iter()
         .map(|(name, value)| decoded_header_size(name.as_str().len(), value.len()))
-        .sum::<usize>()
+        .fold(0, usize::saturating_add)
+}
+
+fn calculate_header_list_size(pseudo: &Pseudo, fields: &HeaderMap) -> usize {
+    let mut size = calculate_headermap_size(fields);
+
+    macro_rules! add_pseudo_size {
+        ($name:ident) => {
+            if let Some(value) = pseudo.$name.as_ref() {
+                size = size.saturating_add(decoded_header_size(
+                    stringify!($name).len() + 1,
+                    value.as_str().len(),
+                ));
+            }
+        };
+    }
+
+    add_pseudo_size!(method);
+    add_pseudo_size!(scheme);
+    add_pseudo_size!(status);
+    add_pseudo_size!(authority);
+    add_pseudo_size!(path);
+    add_pseudo_size!(protocol);
+    size
 }
 
 fn decoded_header_size(name: usize, value: usize) -> usize {
-    name + value + 32
+    32usize.saturating_add(name).saturating_add(value)
 }
 
 #[cfg(test)]

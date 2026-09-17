@@ -192,6 +192,10 @@ impl Handle {
         let settings = match self.next().await {
             Some(frame) => match frame.unwrap() {
                 Frame::Settings(settings) => {
+                    if let Some(size) = settings.header_table_size() {
+                        self.codec.set_send_header_table_size(size as usize);
+                    }
+
                     // Send the ACK
                     let ack = frame::Settings::ack();
 
@@ -239,6 +243,10 @@ impl Handle {
 
         let frame = self.next().await.expect("unexpected EOF").unwrap();
         let settings = assert_settings!(frame);
+
+        if let Some(size) = settings.header_table_size() {
+            self.codec.set_send_header_table_size(size as usize);
+        }
 
         // Send the ACK
         let ack = frame::Settings::ack();
