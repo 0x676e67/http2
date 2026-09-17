@@ -1164,6 +1164,14 @@ impl Builder {
     /// #
     /// # pub fn main() {}
     /// ```
+    ///
+    /// # Interoperability
+    ///
+    /// Lowering this below the size currently in use obliges the peer to emit a
+    /// dynamic table size update at the start of its next field block, as
+    /// required by RFC 7541 section 4.2. A peer that omits it is rejected with a
+    /// `COMPRESSION_ERROR` connection error. Leaving this setting unset never
+    /// arms that requirement.
     pub fn header_table_size(&mut self, size: u32) -> &mut Self {
         self.settings.set_header_table_size(Some(size));
         self

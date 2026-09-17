@@ -196,7 +196,6 @@ impl Decoder {
     }
 
     /// Applies a SETTINGS_HEADER_TABLE_SIZE value acknowledged by the peer.
-    #[allow(dead_code)]
     pub fn queue_size_update(&mut self, size: usize) {
         self.table_size.apply_setting(size);
     }
@@ -529,10 +528,14 @@ impl DecoderTableSize {
             return Err(DecoderError::InvalidRepresentation);
         }
 
+        // Close the block whatever the outcome. Leaving it open would make
+        // every later `begin_header_block` fail with `InvalidRepresentation`,
+        // masking the real error if this one ever becomes recoverable.
+        self.block_mode = None;
+
         if self.require_update {
             Err(DecoderError::MissingDynamicTableSizeUpdate)
         } else {
-            self.block_mode = None;
             Ok(self.semantic_error.take())
         }
     }
