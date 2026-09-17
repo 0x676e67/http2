@@ -208,6 +208,11 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
                     proto_err!(conn: "failed HPACK decoding; err={:?}", _e);
                     return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
                 },
+                Err(frame::Error::MalformedMessage) => {
+                    let id = $head.stream_id();
+                    proto_err!(stream: "malformed header block; stream={:?}", id);
+                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
+                },
                 Err(frame::Error::HeaderListWayTooLarge) => {
                     proto_err!(conn: "decoded header list size over abuse limit");
                     return Err(Error::library_go_away_data(
@@ -408,6 +413,11 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
                 Err(frame::Error::Hpack(_e)) => {
                     proto_err!(conn: "failed HPACK decoding; err={:?}", _e);
                     return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+                }
+                Err(frame::Error::MalformedMessage) => {
+                    let id = head.stream_id();
+                    proto_err!(stream: "malformed CONTINUATION frame; stream={:?}", id);
+                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
                 }
                 Err(frame::Error::HeaderListWayTooLarge) => {
                     proto_err!(conn: "decoded CONTINUATION header list size over abuse limit");
