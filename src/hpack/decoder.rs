@@ -196,7 +196,6 @@ impl Decoder {
     }
 
     /// Applies a SETTINGS_HEADER_TABLE_SIZE value acknowledged by the peer.
-    #[allow(dead_code)]
     pub fn queue_size_update(&mut self, size: usize) {
         self.table_size.apply_setting(size);
     }
@@ -529,10 +528,14 @@ impl DecoderTableSize {
             return Err(DecoderError::InvalidRepresentation);
         }
 
+        // Close the block whatever the outcome. Leaving it open would make
+        // every later `begin_header_block` fail with `InvalidRepresentation`,
+        // masking the real error if this one ever becomes recoverable.
+        self.block_mode = None;
+
         if self.require_update {
             Err(DecoderError::MissingDynamicTableSizeUpdate)
         } else {
-            self.block_mode = None;
             Ok(self.semantic_error.take())
         }
     }
@@ -1229,5 +1232,27 @@ mod test {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn test_rejected_end_header_block_clears_state() {
+        let mut de = Decoder::new(4096);
+        // The peer acknowledged a smaller table, so the next field block must
+        // open with a dynamic table size update.
+        de.queue_size_update(0);
+
+        de.begin_header_block().unwrap();
+        let mut buf = BytesMut::new();
+        de.decode_with_meta(&mut Cursor::new(&mut buf), |_| ControlFlow::Continue(()))
+            .unwrap();
+
+        // The block carried no size update, so ending it reports the omission.
+        assert_eq!(
+            de.end_header_block().unwrap_err(),
+            DecoderError::MissingDynamicTableSizeUpdate
+        );
+
+        // A rejected block must not leave the decoder unable to start another.
+        de.begin_header_block().unwrap();
     }
 }
