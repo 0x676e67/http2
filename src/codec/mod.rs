@@ -65,6 +65,11 @@ where
     pub(crate) fn buffer_client_magic(&mut self, client_magic: &[u8]) {
         self.inner.get_mut().buffer_client_magic(client_magic);
     }
+
+    /// Sets the HPACK encoding role before the first header block is encoded.
+    pub(crate) fn set_hpack_role(&mut self, role: crate::hpack::EncodingRole) {
+        self.inner.get_mut().set_hpack_role(role);
+    }
 }
 
 impl<T, B> Codec<T, B> {

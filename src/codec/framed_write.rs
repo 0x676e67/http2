@@ -208,6 +208,10 @@ where
         }
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
+
+    pub(super) fn set_hpack_role(&mut self, role: hpack::EncodingRole) {
+        self.encoder.hpack.set_role(role);
+    }
 }
 
 #[must_use]
