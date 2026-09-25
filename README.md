@@ -1,6 +1,6 @@
 # http2
 
-A Tokio aware, HTTP/2 client & server implementation for Rust.
+A [Tokio](https://tokio.rs) aware, HTTP/2 client & server implementation for Rust.
 
 [![CI](https://github.com/0x676e67/http2/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/0x676e67/http2/actions/workflows/CI.yml)
 [![GitHub License](https://img.shields.io/github/license/0x676e67/http2)](https://github.com/0x676e67/http2/blob/main/LICENSE)
@@ -17,9 +17,8 @@ More information about this crate can be found in the [crate documentation][dox]
 - Passes [h2spec](https://github.com/summerwind/h2spec).
 - Focus on performance and correctness.
 - Pseudo-header permutation for headers frame
-- Experimental and permuted settings frame
-- Priority frame (client-side only)
-- Built on [Tokio](https://tokio.rs).
+- Permuted settings frame & Priority frame
+- Carries forward [h2](https://github.com/hyperium/h2)'s implementation.
 
 ## Usage
 
@@ -47,7 +46,3 @@ Licensed under either of Apache License, Version 2.0 ([LICENSE](./LICENSE) or ht
 ## Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the [Apache-2.0](./LICENSE) license, shall be licensed as above, without any additional terms or conditions.
-
-## Accolades
-
-The project is based on a fork of [h2](https://github.com/hyperium/h2).
