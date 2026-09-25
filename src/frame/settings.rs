@@ -378,7 +378,7 @@ impl Settings {
         if flag.is_ack() {
             // Ensure that the payload is empty
             if !payload.is_empty() {
-                return Err(Error::InvalidPayloadLength);
+                return Err(Error::InvalidPayloadAckSettings);
             }
 
             // Return the ACK frame
@@ -388,7 +388,7 @@ impl Settings {
         // Ensure the payload length is correct, each setting is 6 bytes long.
         if payload.len() % 6 != 0 {
             tracing::debug!("invalid settings payload length; len={:?}", payload.len());
-            return Err(Error::InvalidPayloadAckSettings);
+            return Err(Error::InvalidPayloadLength);
         }
 
         let mut settings = Settings::default();
@@ -419,7 +419,7 @@ impl Settings {
                     }
                     SettingId::InitialWindowSize => {
                         if setting.value as usize > MAX_INITIAL_WINDOW_SIZE {
-                            return Err(Error::InvalidSettingValue);
+                            return Err(Error::InvalidInitialWindowSize);
                         } else {
                             settings.initial_window_size = Some(setting.value);
                         }
