@@ -742,6 +742,9 @@ where
     }
 }
 
+// SETTINGS is rare and moved straight to `recv_settings`; boxing it would
+// allocate for every received frame of that type.
+#[allow(clippy::large_enum_variant)]
 enum ReceivedFrame {
     Settings(frame::Settings),
     Continue,

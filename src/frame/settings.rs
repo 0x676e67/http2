@@ -225,6 +225,11 @@ pub struct Settings {
     flags: SettingsFlags,
     // Fields
     header_table_size: Option<u32>,
+    /// Lowest `HEADER_TABLE_SIZE` before a higher final value in the same frame.
+    ///
+    /// The encoder must signal it ahead of the final value, see
+    /// <https://www.rfc-editor.org/rfc/rfc7541.html#section-4.2>.
+    lowest_header_table_size: Option<u32>,
     enable_push: Option<u32>,
     max_concurrent_streams: Option<u32>,
     initial_window_size: Option<u32>,
@@ -340,6 +345,11 @@ impl Settings {
 
     pub fn set_header_table_size(&mut self, size: Option<u32>) {
         self.header_table_size = size;
+        self.lowest_header_table_size = None;
+    }
+
+    pub(crate) fn lowest_header_table_size(&self) -> Option<u32> {
+        self.lowest_header_table_size
     }
 
     pub fn set_no_rfc7540_priorities(&mut self, enable: bool) {
@@ -384,10 +394,16 @@ impl Settings {
         let mut settings = Settings::default();
         debug_assert!(!settings.flags.is_ack());
 
+        let mut lowest_header_table_size = None;
+
         for raw in payload.chunks(6) {
             if let Some(setting) = Setting::load(raw) {
                 match setting.id {
                     SettingId::HeaderTableSize => {
+                        lowest_header_table_size = Some(
+                            lowest_header_table_size
+                                .map_or(setting.value, |lowest: u32| lowest.min(setting.value)),
+                        );
                         settings.header_table_size = Some(setting.value);
                     }
                     SettingId::EnablePush => match setting.value {
@@ -443,6 +459,12 @@ impl Settings {
             }
         }
 
+        // Values take effect in order, so a lower value before the final one is
+        // a real table size change, see
+        // <https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.3>.
+        settings.lowest_header_table_size = lowest_header_table_size
+            .filter(|&lowest| settings.header_table_size.is_some_and(|last| lowest < last));
+
         Ok(settings)
     }
 
@@ -472,7 +494,8 @@ impl Settings {
         for id in &self.settings_order {
             match id {
                 SettingId::HeaderTableSize => {
-                    if let Some(v) = self.header_table_size {
+                    let lowest = self.lowest_header_table_size.into_iter();
+                    for v in lowest.chain(self.header_table_size) {
                         if let Some(setting) = Setting::from_id(*id, v) {
                             f(setting);
                         }
@@ -735,5 +758,39 @@ mod tests {
             .push(Setting::from_id(SettingId::Unknown(15), 84))
             .build();
         assert_eq!(unknown.settings.len(), 1);
+    }
+
+    #[test]
+    fn test_repeated_header_table_size() {
+        fn load(values: &[u32]) -> Settings {
+            let payload: Vec<u8> = values
+                .iter()
+                .flat_map(|&v| {
+                    let mut raw = vec![0, 1];
+                    raw.extend_from_slice(&v.to_be_bytes());
+                    raw
+                })
+                .collect();
+            let head = Head::new(Kind::Settings, 0, StreamId::zero());
+            Settings::load(head, &payload).unwrap()
+        }
+
+        // A lower value before the final one is kept and re-encoded first.
+        let settings = load(&[100, 8192, 4096]);
+        assert_eq!(settings.lowest_header_table_size(), Some(100));
+        assert_eq!(settings.header_table_size(), Some(4096));
+        let mut dst = BytesMut::new();
+        settings.encode(&mut dst);
+        assert_eq!(&dst[9..], [0, 1, 0, 0, 0, 100, 0, 1, 0, 0, 0x10, 0]);
+
+        // Replacing the size drops the loaded transition.
+        let mut settings = settings;
+        settings.set_header_table_size(Some(8192));
+        assert_eq!(settings.lowest_header_table_size(), None);
+
+        // Only the final value matters when it is also the lowest.
+        let settings = load(&[4096, 0]);
+        assert_eq!(settings.lowest_header_table_size(), None);
+        assert_eq!(settings.header_table_size(), Some(0));
     }
 }
