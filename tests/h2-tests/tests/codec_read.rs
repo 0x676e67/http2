@@ -378,7 +378,7 @@ async fn read_frame_load_error_codes() {
             (Some(id), proto::Error::Reset(actual_id, actual, _)) => {
                 assert_eq!((actual_id, actual), (StreamId::from(id), reason), "{name}")
             }
-            (_, other) => panic!("{name}: unexpected error {other:?}"),
+            (_, other) => panic!("{}: unexpected error {:?}", name, other),
         }
     }
 }
