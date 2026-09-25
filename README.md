@@ -16,9 +16,9 @@ More information about this crate can be found in the [crate documentation][dox]
 - Implements the full HTTP/2 specification.
 - Passes [h2spec](https://github.com/summerwind/h2spec).
 - Focus on performance and correctness.
-- Pseudo-header permutation for headers frame
-- Permuted settings frame & Priority frame
-- Carries forward [h2](https://github.com/hyperium/h2)'s implementation.
+- Pseudo header permutation for headers frame.
+- Permuted settings frame & Priority frame.
+- Continues the [h2](https://github.com/hyperium/h2) codebase, tracking upstream changes.
 
 ## Usage
 
