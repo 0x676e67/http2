@@ -4,6 +4,7 @@ mod table;
 
 pub use self::decode::decode;
 pub use self::encode::encode;
+pub(super) use self::encode::encoded_len;
 
 #[cfg(test)]
 mod test {
@@ -69,6 +70,7 @@ mod test {
         let src: Vec<_> = (0..=u8::MAX).collect();
         let mut encoded = BytesMut::new();
         encode(&src, &mut encoded);
+        assert_eq!(encoded_len(&src), Some(encoded.len()));
         assert_eq!(decode(&encoded), src);
     }
 
