@@ -742,6 +742,9 @@ impl Prioritize {
             let frame = match stream.pending_send.pop_front(buffer) {
                 Some(Frame::Headers(mut headers)) => {
                     recv.prepare_initial_stream_window_update(&mut stream, &mut headers)?;
+                    if let Some(dependency) = counts.attach_chain(&mut stream) {
+                        headers.set_stream_dependency(dependency);
+                    }
                     Frame::Headers(headers)
                 }
                 Some(Frame::Data(mut frame)) => {

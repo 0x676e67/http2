@@ -1566,7 +1566,7 @@ where
                                 .builder
                                 .data_frame_budget
                                 .resolve(self.builder.initial_target_connection_window_size),
-                            headers_stream_dependency: None,
+                            headers_priority: None,
                             headers_pseudo_order: None,
                             priorities: None,
                         },

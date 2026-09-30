@@ -1,4 +1,5 @@
 use super::*;
+use crate::frame::StreamDependency;
 use crate::tracing;
 
 #[derive(Debug)]
@@ -71,6 +72,9 @@ pub(super) struct Counts {
     /// connection-level budget for DATA framing overhead.
     data_frame_budget: Budget,
 
+    /// Open requests offered as `HEADERS` chain parents.
+    chain_parents: ChainParents,
+
     /// Number of empty, non-final DATA frames received over the lifetime of
     /// the connection.
     num_recv_empty_data_frames: usize,
@@ -92,6 +96,7 @@ impl Counts {
             max_local_error_reset_streams: config.local_max_error_reset_streams,
             num_local_error_reset_streams: 0,
             data_frame_budget: Budget::new(config.data_frame_budget),
+            chain_parents: ChainParents::default(),
             num_recv_empty_data_frames: 0,
         }
     }
@@ -275,6 +280,12 @@ impl Counts {
         ret
     }
 
+    /// Chooses the `HEADERS` chain parent as a request's initial `HEADERS` is
+    /// written, and registers the request as a candidate.
+    pub fn attach_chain(&mut self, stream: &mut Stream) -> Option<StreamDependency> {
+        self.chain_parents.attach(stream)
+    }
+
     // TODO: move this to macro?
     pub fn transition_after(&mut self, mut stream: store::Ptr, is_reset_counted: bool) {
         tracing::trace!(
@@ -289,6 +300,13 @@ impl Counts {
             self.num_recv_streams,
             self.num_send_streams
         );
+
+        // A reset stream stops being a parent at once, even while RST_STREAM
+        // is queued. A gracefully closed one stays until its final frame is
+        // flushed, since the peer still sees it open until then.
+        if stream.state.is_reset() || stream.is_closed() {
+            self.chain_parents.detach(&mut stream);
+        }
 
         if stream.is_closed() {
             if !stream.is_pending_reset_expiration() {
@@ -374,7 +392,8 @@ mod tests {
                 remote_max_initiated: None,
                 local_max_error_reset_streams: None,
                 data_frame_budget: DEFAULT_DATA_FRAME_BUDGET,
-                headers_stream_dependency: None,
+                headers_priority: None,
+                priority_stream_ids: Vec::new(),
                 headers_pseudo_order: None,
             },
         )

@@ -22,6 +22,7 @@ macro_rules! define_enum_with_values {
                 $(#[$variant_meta])*
                 $variant = $value,
             )*
+            /// An identifier outside the listed values.
             Unknown(u16),
         }
 

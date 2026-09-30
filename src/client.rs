@@ -136,15 +136,17 @@
 //! [`Error`]: ../struct.Error.html
 
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::Protocol;
+use crate::ext::{HeadersDependency, HeadersPriority, Protocol};
 #[cfg(feature = "unstable")]
 use crate::frame::ExperimentalSettings;
-use crate::frame::{
-    Headers, Priorities, Pseudo, PseudoOrder, Reason, Settings, SettingsOrder, StreamDependency,
-    StreamId,
-};
+use crate::frame::{Headers, Pseudo, Reason, Settings, StreamId};
 use crate::proto::{self, Error};
 use crate::{FlowControl, PingPong, RecvStream, SendStream, tracing};
+
+pub use crate::frame::{
+    Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, PseudoOrderBuilder, SettingId,
+    SettingsOrder, SettingsOrderBuilder, StreamDependency,
+};
 
 #[cfg(feature = "tracing")]
 use ::tracing::Instrument;
@@ -362,8 +364,8 @@ pub struct Builder {
     /// The headers frame pseudo order
     headers_pseudo_order: Option<PseudoOrder>,
 
-    /// The headers frame stream dependency
-    headers_stream_dependency: Option<StreamDependency>,
+    /// Default priority fields of request `HEADERS` frames
+    headers_priority: Option<HeadersPriority>,
 
     /// Priority stream list
     priorities: Option<Priorities>,
@@ -691,7 +693,7 @@ impl Builder {
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             data_frame_budget: proto::DataFrameBudget::Auto,
             headers_pseudo_order: None,
-            headers_stream_dependency: None,
+            headers_priority: None,
             priorities: None,
             initial_target_stream_window_size: None,
         }
@@ -1231,8 +1233,17 @@ impl Builder {
         self
     }
 
-    /// Sets the first stream ID to something other than 1.
-    #[cfg(feature = "unstable")]
+    /// Sets the ID of the first request stream, which defaults to 1.
+    ///
+    /// Requests never use a lower ID, so [`Builder::priorities`] can declare
+    /// lower streams as dependency parents without a later request opening them.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if `stream_id` is even, since clients only open
+    /// odd streams ([RFC 9113 §5.1.1]).
+    ///
+    /// [RFC 9113 §5.1.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1.1
     pub fn initial_stream_id(&mut self, stream_id: u32) -> &mut Self {
         self.stream_id = stream_id.into();
         assert!(
@@ -1261,17 +1272,18 @@ impl Builder {
         self
     }
 
-    /// Sets the default dependency, weight, and exclusive flag for outgoing
-    /// request `HEADERS` frames.
+    /// Sets the default priority fields of outgoing request `HEADERS` frames.
     ///
-    /// Each new request uses this value unless it carries a `HeadersPriority`
-    /// extension, which is available with the `unstable` feature.
+    /// A request carrying its own [`HeadersPriority`] extension replaces this
+    /// default. The handshake fails if a [`HeadersDependency::Declared`] parent
+    /// is missing from [`Builder::priorities`] or could be a later request's
+    /// own stream.
     ///
     /// These priority fields are deprecated by [RFC 9113 §5.3.2].
     ///
     /// [RFC 9113 §5.3.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.3.2
-    pub fn headers_stream_dependency(&mut self, stream_dependency: StreamDependency) -> &mut Self {
-        self.headers_stream_dependency = Some(stream_dependency);
+    pub fn headers_priority(&mut self, priority: HeadersPriority) -> &mut Self {
+        self.headers_priority = Some(priority);
         self
     }
 
@@ -1282,10 +1294,10 @@ impl Builder {
     /// PRIORITY frames that will be sent independently of the request queue. This can be useful
     /// for pre-configuring dependency nodes without replaying them for every request.
     ///
-    /// Each `Priority` in the list must have a valid (non-zero) stream ID. Any priority with a
+    /// Each [`Priority`] in the list must have a valid (non-zero) stream ID. Any priority with a
     /// stream ID of zero or a dependency on the same stream will be ignored.
     /// PRIORITY does not reserve stream IDs. Profiles that start requests later
-    /// can configure `initial_stream_id` when the `unstable` feature is enabled.
+    /// can configure [`Builder::initial_stream_id`].
     /// If `no_rfc7540_priorities(true)` is also configured, a conforming server
     /// ignores these legacy priority signals as required by
     /// [RFC 9218 section 2.1](https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1).
@@ -1505,6 +1517,24 @@ where
             })
             .transpose()?;
 
+        if let Some(HeadersPriority {
+            dependency: HeadersDependency::Declared(id),
+            ..
+        }) = builder.headers_priority
+        {
+            let id = StreamId::from(id);
+            let is_declared = builder
+                .priorities
+                .as_ref()
+                .is_some_and(|priorities| priorities.stream_ids().any(|declared| declared == id));
+            // A client-initiated ID at or above the first request stream would
+            // eventually depend on itself (RFC 7540 section 5.3.1).
+            // https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3.1
+            if !is_declared || (id.is_client_initiated() && id >= builder.stream_id) {
+                return Err(UserError::InvalidHeadersDependency.into());
+            }
+        }
+
         // RFC 9113 section 3.4 requires the client magic to be followed by
         // SETTINGS. Both are prepared without I/O; the connection driver writes
         // this item before it advances the separate request frame queue.
@@ -1542,7 +1572,7 @@ where
                     .data_frame_budget
                     .resolve(builder.initial_target_connection_window_size),
                 headers_pseudo_order: builder.headers_pseudo_order,
-                headers_stream_dependency: builder.headers_stream_dependency,
+                headers_priority: builder.headers_priority,
                 priorities: builder.priorities,
             },
         );
@@ -1831,7 +1861,7 @@ impl Peer {
         protocol: Option<Protocol>,
         end_of_stream: bool,
         pseudo_order: Option<PseudoOrder>,
-        headers_stream_dependency: Option<StreamDependency>,
+        stream_dependency: Option<StreamDependency>,
     ) -> Result<Headers, SendError> {
         use http::request::Parts;
 
@@ -1887,7 +1917,7 @@ impl Peer {
 
         // Create the HEADERS frame
         let mut headers_frame = Headers::new(id, pseudo, headers);
-        if let Some(stream_dep) = headers_stream_dependency {
+        if let Some(stream_dep) = stream_dependency {
             headers_frame.set_stream_dependency(stream_dep);
         }
 

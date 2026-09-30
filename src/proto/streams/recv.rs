@@ -1440,7 +1440,8 @@ mod tests {
             remote_max_initiated: None,
             local_max_error_reset_streams: None,
             data_frame_budget: DEFAULT_DATA_FRAME_BUDGET,
-            headers_stream_dependency: None,
+            headers_priority: None,
+            priority_stream_ids: Vec::new(),
             headers_pseudo_order: None,
         };
         let mut recv = Recv::new(peer::Dyn::Server, &config);

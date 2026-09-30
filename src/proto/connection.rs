@@ -1,5 +1,6 @@
 use crate::codec::UserError;
-use crate::frame::{Priorities, Priority, PseudoOrder, Reason, StreamDependency, StreamId};
+use crate::ext::HeadersPriority;
+use crate::frame::{Priorities, Priority, PseudoOrder, Reason, StreamId};
 use crate::{client, server, tracing};
 
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
@@ -87,7 +88,7 @@ pub(crate) struct Config {
     pub settings: frame::Settings,
     pub data_frame_budget: usize,
     pub headers_pseudo_order: Option<PseudoOrder>,
-    pub headers_stream_dependency: Option<StreamDependency>,
+    pub headers_priority: Option<HeadersPriority>,
     pub priorities: Option<Priorities>,
 }
 
@@ -171,10 +172,18 @@ where
                     .map(|max| max as usize),
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
                 data_frame_budget: config.data_frame_budget,
-                headers_stream_dependency: config.headers_stream_dependency,
+                headers_priority: config.headers_priority,
+                priority_stream_ids: config
+                    .priorities
+                    .iter()
+                    .flat_map(Priorities::stream_ids)
+                    .collect(),
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
             }
         }
+        // Built first so the declared PRIORITY stream IDs are read before the
+        // frames are moved into the initial connection item.
+        let streams = Streams::new(streams_config(&config));
         let state = if P::r#dyn().is_server() {
             State::Open
         } else {
@@ -185,7 +194,6 @@ where
                 .map(IntoIterator::into_iter);
             State::ClientInitialSend { pending_priorities }
         };
-        let streams = Streams::new(streams_config(&config));
         #[cfg(feature = "tracing")]
         let span = ::tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         #[cfg(feature = "tracing")]
