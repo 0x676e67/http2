@@ -92,3 +92,20 @@ impl PartialEq<u32> for StreamId {
         self.0 == *other
     }
 }
+
+/// Converts a stream number into the public [`crate::StreamId`].
+///
+/// # Panics
+///
+/// Panics if the reserved most significant bit of `src` is set.
+impl From<u32> for crate::StreamId {
+    fn from(src: u32) -> Self {
+        Self::from_internal(StreamId::from(src))
+    }
+}
+
+impl From<crate::StreamId> for StreamId {
+    fn from(src: crate::StreamId) -> Self {
+        StreamId(src.as_u32())
+    }
+}

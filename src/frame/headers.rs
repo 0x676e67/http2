@@ -99,11 +99,17 @@ define_enum_with_values! {
     /// possible pseudo-header fields and their standard order according to RFC 7540.
     @U8
     pub enum PseudoId {
+        /// The `:method` pseudo-header.
         Method => 0x0001,
+        /// The `:scheme` pseudo-header.
         Scheme => 0x0002,
+        /// The `:authority` pseudo-header.
         Authority => 0x0003,
+        /// The `:path` pseudo-header.
         Path => 0x0004,
+        /// The `:protocol` pseudo-header.
         Protocol => 0x0005,
+        /// The `:status` pseudo-header.
         Status => 0x0006,
     }
 }
@@ -132,6 +138,7 @@ pub struct PseudoOrderBuilder {
 // ===== impl PseudoOrder =====
 
 impl PseudoOrder {
+    /// Creates a new [`PseudoOrderBuilder`].
     #[inline]
     pub fn builder() -> PseudoOrderBuilder {
         PseudoOrderBuilder {
@@ -163,6 +170,7 @@ impl<'a> IntoIterator for &'a PseudoOrder {
 // ===== impl PseudoOrderBuilder =====
 
 impl PseudoOrderBuilder {
+    /// Appends a pseudo-header, ignoring repeats.
     pub fn push(mut self, id: PseudoId) -> Self {
         let mask_id = id.mask_id();
         if mask_id != 0 {
@@ -176,6 +184,7 @@ impl PseudoOrderBuilder {
         self
     }
 
+    /// Appends every pseudo-header, ignoring repeats.
     pub fn extend(mut self, iter: impl IntoIterator<Item = PseudoId>) -> Self {
         for id in iter {
             self = self.push(id);
@@ -183,6 +192,7 @@ impl PseudoOrderBuilder {
         self
     }
 
+    /// Finishes the order, appending any pseudo-header not yet listed.
     pub fn build(mut self) -> PseudoOrder {
         if self.ids.len() != PseudoId::DEFAULT_IDS.len() {
             self = self.extend(PseudoId::DEFAULT_IDS);

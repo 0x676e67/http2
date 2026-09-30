@@ -9,13 +9,13 @@ use http::{HeaderMap, Request, Response};
 use tokio::io::AsyncWrite;
 
 use super::{
-    Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId,
-    frame::{PseudoOrder, StreamDependency},
+    Buffer, BufferStatus, ChainState, Config, Counts, HeadersPriorityConfig, Prioritized, Recv,
+    Send, Stream, StreamId,
+    frame::PseudoOrder,
     recv::RecvHeaderBlockError,
     store::{self, Entry, Resolve, Store},
     sync::Mutex,
 };
-#[cfg(feature = "unstable")]
 use crate::ext::HeadersPriority;
 use crate::{
     client,
@@ -91,8 +91,8 @@ struct Inner {
     /// The number of stream refs to this shared state.
     refs: usize,
 
-    /// Headers stream dependency
-    headers_stream_dependency: Option<StreamDependency>,
+    /// Connection-level request `HEADERS` priority inputs
+    headers_priority: HeadersPriorityConfig,
 
     /// Pseudo order of the headers stream
     headers_pseudo_order: Option<PseudoOrder>,
@@ -309,11 +309,7 @@ where
         use super::stream::ContentLength;
 
         let protocol = request.extensions_mut().remove::<Protocol>();
-        #[cfg(feature = "unstable")]
-        let request_headers_stream_dependency = request
-            .extensions_mut()
-            .remove::<HeadersPriority>()
-            .map(HeadersPriority::into_inner);
+        let request_priority = request.extensions_mut().remove::<HeadersPriority>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -330,7 +326,7 @@ where
         let send_buffer = &mut *send_buffer;
 
         me.actions.ensure_no_conn_error()?;
-        me.actions.send.ensure_next_stream_id()?;
+        let next_stream_id = me.actions.send.ensure_next_stream_id()?;
 
         // The `pending` argument is provided by the `Client`, and holds
         // a store `Key` of a `Stream` that may have been not been opened
@@ -349,13 +345,21 @@ where
             return Err(UserError::UnexpectedFrameType.into());
         }
 
+        let priority = me
+            .headers_priority
+            .select(request_priority, next_stream_id)?;
         let stream_id = me.actions.send.open()?;
+        // A `Chain` parent depends on which streams are still open when the
+        // initial HEADERS is written, which can be later for queued requests.
+        let (stream_dependency, priority_chain) =
+            priority.map_or((None, ChainState::None), ChainState::split);
 
         let mut stream = Stream::new(
             stream_id,
             me.actions.send.init_window_sz(),
             me.actions.recv.init_window_sz(),
         );
+        stream.priority_chain = priority_chain;
 
         if *request.method() == Method::HEAD {
             stream.content_length = ContentLength::Head;
@@ -368,10 +372,7 @@ where
             protocol,
             end_of_stream,
             me.headers_pseudo_order.clone(),
-            #[cfg(not(feature = "unstable"))]
-            me.headers_stream_dependency,
-            #[cfg(feature = "unstable")]
-            request_headers_stream_dependency.or(me.headers_stream_dependency),
+            stream_dependency,
         )?;
 
         me.actions.recv.init_request_window(&mut stream);
@@ -514,7 +515,10 @@ impl Inner {
             },
             store: Store::new(),
             refs: 1,
-            headers_stream_dependency: config.headers_stream_dependency,
+            headers_priority: HeadersPriorityConfig::new(
+                config.headers_priority,
+                config.priority_stream_ids,
+            ),
             headers_pseudo_order: config.headers_pseudo_order,
         }))
     }
@@ -806,30 +810,29 @@ impl Inner {
         } else {
             // The remote may send window updates for streams that the local now
             // considers closed. It's ok...
-            if let Some(mut stream) = self.store.find_mut(&id) {
+            if let Some(stream) = self.store.find_mut(&id) {
                 if stream.is_pending_open {
                     proto_err!(conn: "recv_window_update: received frame on idle stream {:?}", id);
                     return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
 
-                let res = self
-                    .actions
-                    .send
-                    .recv_stream_window_update(
-                        frame.size_increment(),
-                        send_buffer,
-                        &mut stream,
-                        &mut self.counts,
-                        &mut self.actions.task,
-                    )
-                    .map_err(|reason| Error::library_reset(id, reason));
+                // A flow-control reset closes the stream, so run the same
+                // transition bookkeeping as every other reset path.
+                let actions = &mut self.actions;
+                return self.counts.transition(stream, |counts, stream| {
+                    let res = actions
+                        .send
+                        .recv_stream_window_update(
+                            frame.size_increment(),
+                            send_buffer,
+                            stream,
+                            counts,
+                            &mut actions.task,
+                        )
+                        .map_err(|reason| Error::library_reset(id, reason));
 
-                return self.actions.reset_on_recv_stream_err(
-                    send_buffer,
-                    &mut stream,
-                    &mut self.counts,
-                    res,
-                );
+                    actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+                });
             } else {
                 self.actions
                     .ensure_not_idle(self.counts.peer(), id)
