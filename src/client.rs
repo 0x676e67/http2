@@ -1642,6 +1642,19 @@ where
         self.inner.max_recv_streams()
     }
 
+    /// Returns whether the server enabled the [extended CONNECT protocol][1].
+    ///
+    /// Returns `None` until the server's initial SETTINGS frame is applied. The value
+    /// is read from this connection without locking, so the task driving it can
+    /// publish changes. Clients must not send extended CONNECT before this returns
+    /// `Some(true)` ([RFC 8441 §3][2]).
+    ///
+    /// [1]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
+    /// [2]: https://datatracker.ietf.org/doc/html/rfc8441#section-3
+    pub fn extended_connect_protocol(&self) -> Option<bool> {
+        self.inner.remote_extended_connect()
+    }
+
     fn set_initial_stream_window_size(&mut self, target: u32, advertised: u32) {
         self.inner
             .set_initial_stream_window_size(target, advertised);

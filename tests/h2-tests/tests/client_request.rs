@@ -1569,6 +1569,7 @@ async fn extended_connect_protocol_disabled_by_default() {
 
     let h2 = async move {
         let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        assert_eq!(h2.extended_connect_protocol(), None);
 
         // we send a simple req here just to drive the connection so we can
         // receive the server settings.
@@ -1578,6 +1579,7 @@ async fn extended_connect_protocol_disabled_by_default() {
         h2.drive(response).await.unwrap();
 
         assert!(!client.is_extended_connect_protocol_enabled());
+        assert_eq!(h2.extended_connect_protocol(), Some(false));
     };
 
     join(srv, h2).await;
@@ -1605,6 +1607,7 @@ async fn extended_connect_protocol_enabled_during_handshake() {
 
     let h2 = async move {
         let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        assert_eq!(h2.extended_connect_protocol(), None);
 
         // we send a simple req here just to drive the connection so we can
         // receive the server settings.
@@ -1613,6 +1616,7 @@ async fn extended_connect_protocol_enabled_during_handshake() {
         h2.drive(response).await.unwrap();
 
         assert!(client.is_extended_connect_protocol_enabled());
+        assert_eq!(h2.extended_connect_protocol(), Some(true));
     };
 
     join(srv, h2).await;

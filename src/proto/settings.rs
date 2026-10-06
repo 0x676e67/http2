@@ -15,6 +15,8 @@ pub(crate) struct Settings {
     /// Whether the connection has received the initial SETTINGS frame from the
     /// remote peer.
     has_received_remote_initial_settings: bool,
+    /// Latest applied `SETTINGS_ENABLE_CONNECT_PROTOCOL` from the remote peer.
+    remote_extended_connect: bool,
 }
 
 #[derive(Debug)]
@@ -36,6 +38,7 @@ impl Settings {
             local: Local::WaitingAck(local),
             remote: None,
             has_received_remote_initial_settings: false,
+            remote_extended_connect: false,
         }
     }
 
@@ -100,6 +103,12 @@ impl Settings {
         }
     }
 
+    /// Returns the remote extended CONNECT setting, or `None` before its initial SETTINGS.
+    pub(crate) fn remote_extended_connect(&self) -> Option<bool> {
+        self.has_received_remote_initial_settings
+            .then_some(self.remote_extended_connect)
+    }
+
     /// Sets `true` to `self.has_received_remote_initial_settings`.
     /// Returns `true` if this method is called for the first time.
     /// (i.e. it is the initial SETTINGS frame from the remote peer)
@@ -136,6 +145,9 @@ impl Settings {
 
             let is_initial = self.mark_remote_initial_settings_as_received();
             streams.apply_remote_settings(&settings, is_initial)?;
+            if let Some(enabled) = settings.is_extended_connect_protocol_enabled() {
+                self.remote_extended_connect = enabled;
+            }
 
             if let Some(val) = settings.header_table_size() {
                 dst.set_send_header_table_size(val as usize);
