@@ -228,6 +228,11 @@ where
         self.inner.settings.send_settings(settings)
     }
 
+    /// Returns the remote extended CONNECT setting, or `None` before its initial SETTINGS.
+    pub(crate) fn remote_extended_connect(&self) -> Option<bool> {
+        self.inner.settings.remote_extended_connect()
+    }
+
     /// Returns the maximum number of concurrent streams that may be initiated
     /// by this peer.
     pub(crate) fn max_send_streams(&self) -> usize {

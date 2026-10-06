@@ -1569,6 +1569,7 @@ async fn extended_connect_protocol_disabled_by_default() {
 
     let h2 = async move {
         let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        assert_eq!(h2.extended_connect_protocol(), None);
 
         // we send a simple req here just to drive the connection so we can
         // receive the server settings.
@@ -1578,6 +1579,7 @@ async fn extended_connect_protocol_disabled_by_default() {
         h2.drive(response).await.unwrap();
 
         assert!(!client.is_extended_connect_protocol_enabled());
+        assert_eq!(h2.extended_connect_protocol(), Some(false));
     };
 
     join(srv, h2).await;
@@ -1605,6 +1607,7 @@ async fn extended_connect_protocol_enabled_during_handshake() {
 
     let h2 = async move {
         let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        assert_eq!(h2.extended_connect_protocol(), None);
 
         // we send a simple req here just to drive the connection so we can
         // receive the server settings.
@@ -1613,62 +1616,10 @@ async fn extended_connect_protocol_enabled_during_handshake() {
         h2.drive(response).await.unwrap();
 
         assert!(client.is_extended_connect_protocol_enabled());
+        assert_eq!(h2.extended_connect_protocol(), Some(true));
     };
 
     join(srv, h2).await;
-}
-
-#[tokio::test]
-async fn peer_settings_track_initial_settings() {
-    h2_support::trace_init!();
-
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-
-    for (settings, enabled) in [
-        (frames::settings(), false),
-        (frames::settings().enable_connect_protocol(1), true),
-    ] {
-        let (io, mut srv) = mock::new();
-        let (client, h2) = client::handshake(io).await.unwrap();
-        let peer = client.peer_settings();
-        assert_eq!(peer.is_extended_connect_protocol_enabled(), None);
-        assert!(peer.poll_received(&mut cx).is_pending());
-
-        let conn = tokio::spawn(async move {
-            let _ = h2.await;
-        });
-        // `join` re-polls each future only after its own waker fires.
-        join(
-            poll_fn(|cx| peer.poll_received(cx)),
-            srv.assert_client_handshake_with_settings(settings),
-        )
-        .await;
-        assert_eq!(peer.is_extended_connect_protocol_enabled(), Some(enabled));
-
-        drop(client);
-        drop(srv);
-        conn.await.unwrap();
-    }
-
-    // Waiters are released when the connection fails or closes gracefully before
-    // the server's SETTINGS, while the connection is still owned.
-    for graceful in [false, true] {
-        let (io, srv) = mock::new();
-        let (client, mut h2) = client::handshake(io).await.unwrap();
-        let peer = client.peer_settings();
-        join(poll_fn(|cx| peer.poll_received(cx)), async {
-            if graceful {
-                drop(client);
-            } else {
-                drop(srv);
-            }
-            let _ = poll_fn(|cx| Pin::new(&mut h2).poll(cx)).await;
-        })
-        .await;
-        assert_eq!(peer.is_extended_connect_protocol_enabled(), None);
-        drop(h2);
-    }
 }
 
 #[tokio::test]

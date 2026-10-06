@@ -9,7 +9,7 @@ use http::{HeaderMap, Request, Response};
 use tokio::io::AsyncWrite;
 
 use super::{
-    Buffer, BufferStatus, Config, Counts, PeerSettings, Prioritized, Recv, Send, Stream, StreamId,
+    Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId,
     frame::{PseudoOrder, StreamDependency},
     recv::RecvHeaderBlockError,
     store::{self, Entry, Resolve, Store},
@@ -90,9 +90,6 @@ struct Inner {
 
     /// The number of stream refs to this shared state.
     refs: usize,
-
-    /// Remote SETTINGS readable without this lock.
-    peer_settings: Arc<PeerSettings>,
 
     /// Headers stream dependency
     headers_stream_dependency: Option<StreamDependency>,
@@ -291,11 +288,7 @@ where
             &mut me.store,
             &mut me.counts,
             &mut me.actions.task,
-        )?;
-
-        me.peer_settings
-            .apply(me.actions.send.is_extended_connect_protocol_enabled());
-        Ok(())
+        )
     }
 
     pub fn apply_local_settings(&mut self, frame: &frame::Settings) -> Result<(), Error> {
@@ -521,7 +514,6 @@ impl Inner {
             },
             store: Store::new(),
             refs: 1,
-            peer_settings: Arc::new(PeerSettings::new()),
             headers_stream_dependency: config.headers_stream_dependency,
             headers_pseudo_order: config.headers_pseudo_order,
         }))
@@ -864,7 +856,6 @@ impl Inner {
         });
 
         actions.conn_error = Some(err);
-        self.peer_settings.close();
 
         last_processed_id
     }
@@ -1035,7 +1026,6 @@ impl Inner {
         });
 
         actions.clear_queues(clear_pending_accept, &mut self.store, counts);
-        self.peer_settings.close();
         Ok(())
     }
 
@@ -1220,15 +1210,6 @@ where
 
     pub(crate) fn max_send_streams(&self) -> usize {
         self.inner.lock().counts.max_send_streams()
-    }
-
-    pub(crate) fn peer_settings(&self) -> Arc<PeerSettings> {
-        self.inner.lock().peer_settings.clone()
-    }
-
-    /// Releases peer SETTINGS waiters once the connection future has finished.
-    pub(crate) fn close_peer_settings(&self) {
-        self.inner.lock().peer_settings.close();
     }
 
     pub(crate) fn max_recv_streams(&self) -> usize {

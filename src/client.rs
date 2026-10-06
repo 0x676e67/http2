@@ -153,7 +153,6 @@ use http::{HeaderMap, Method, Request, Response, Version, uri};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -187,15 +186,6 @@ const CLIENT_MAGIC: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub struct SendRequest<B: Buf> {
     inner: proto::Streams<B, Peer>,
     pending: Option<proto::OpaqueStreamRef>,
-}
-
-/// Read-only view of the SETTINGS received from the server.
-///
-/// Cloning is cheap and reads do not lock connection state, so the handle can
-/// stay next to request dispatch for the lifetime of the connection.
-#[derive(Clone)]
-pub struct PeerSettings {
-    inner: Arc<proto::PeerSettings>,
 }
 
 /// Returns a `SendRequest` instance once it is ready to send at least one
@@ -585,13 +575,6 @@ where
         self.inner.is_extended_connect_protocol_enabled()
     }
 
-    /// Returns a handle to the SETTINGS received from the server.
-    pub fn peer_settings(&self) -> PeerSettings {
-        PeerSettings {
-            inner: self.inner.peer_settings(),
-        }
-    }
-
     /// Returns the current max send streams
     pub fn current_max_send_streams(&self) -> usize {
         self.inner.current_max_send_streams()
@@ -644,42 +627,6 @@ where
     /// userspace handles pointing to the slot.
     pub fn num_wired_streams(&self) -> usize {
         self.inner.num_wired_streams()
-    }
-}
-
-// ===== impl PeerSettings =====
-
-impl PeerSettings {
-    /// Returns whether the server enabled the [extended CONNECT protocol][1].
-    ///
-    /// Returns `None` until the server's initial SETTINGS frame is applied, and
-    /// keeps returning `None` if the connection ends first. Clients must not
-    /// send extended CONNECT before this returns `Some(true)` ([RFC 8441 §3][2]).
-    ///
-    /// [1]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
-    /// [2]: https://datatracker.ietf.org/doc/html/rfc8441#section-3
-    pub fn is_extended_connect_protocol_enabled(&self) -> Option<bool> {
-        self.inner.is_extended_connect_protocol_enabled()
-    }
-
-    /// Polls until the server's initial SETTINGS frame is applied or the connection ends.
-    ///
-    /// Readiness is permanent and does not imply extended CONNECT is enabled. The
-    /// [`Connection`] must be polled to make progress, and each waiting task's waker
-    /// is kept until then.
-    pub fn poll_received(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.inner.poll_received(cx)
-    }
-}
-
-impl fmt::Debug for PeerSettings {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt.debug_struct("PeerSettings")
-            .field(
-                "extended_connect_protocol",
-                &self.is_extended_connect_protocol_enabled(),
-            )
-            .finish()
     }
 }
 
@@ -1695,6 +1642,19 @@ where
         self.inner.max_recv_streams()
     }
 
+    /// Returns whether the server enabled the [extended CONNECT protocol][1].
+    ///
+    /// Returns `None` until the server's initial SETTINGS frame is applied. The value
+    /// is read from this connection without locking, so the task driving it can
+    /// publish changes. Clients must not send extended CONNECT before this returns
+    /// `Some(true)` ([RFC 8441 §3][2]).
+    ///
+    /// [1]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
+    /// [2]: https://datatracker.ietf.org/doc/html/rfc8441#section-3
+    pub fn extended_connect_protocol(&self) -> Option<bool> {
+        self.inner.remote_extended_connect()
+    }
+
     fn set_initial_stream_window_size(&mut self, target: u32, advertised: u32) {
         self.inner
             .set_initial_stream_window_size(target, advertised);
@@ -1718,14 +1678,12 @@ where
         let result = self.inner.poll(cx).map_err(Into::into);
         // if we had streams/refs, and don't anymore, wake up one more time to
         // ensure proper shutdown
-        if result.is_pending() {
-            if had_streams_or_refs && !self.inner.has_streams_or_other_references() {
-                tracing::trace!("last stream closed during poll, wake again");
-                cx.waker().wake_by_ref();
-            }
-        } else {
-            // Graceful shutdown does not pass through stream error handling.
-            self.inner.streams().close_peer_settings();
+        if result.is_pending()
+            && had_streams_or_refs
+            && !self.inner.has_streams_or_other_references()
+        {
+            tracing::trace!("last stream closed during poll, wake again");
+            cx.waker().wake_by_ref();
         }
         result
     }
