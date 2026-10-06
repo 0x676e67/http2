@@ -1,6 +1,7 @@
 mod buffer;
 mod counts;
 mod flow_control;
+mod peer_settings;
 mod prioritize;
 mod recv;
 mod send;
@@ -11,6 +12,7 @@ mod stream;
 mod streams;
 mod sync;
 
+pub(crate) use self::peer_settings::PeerSettings;
 pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
 pub(crate) use self::send::PollReset;
