@@ -290,7 +290,7 @@ impl Headers {
         // Read the padding length
         if flags.is_padded() {
             if src.is_empty() {
-                return Err(Error::MalformedMessage);
+                return Err(Error::InvalidPayloadLength);
             }
             pad = src[0] as usize;
 
@@ -301,7 +301,7 @@ impl Headers {
         // Read the stream dependency
         let stream_dep = if flags.is_priority() {
             if src.len() < 5 {
-                return Err(Error::MalformedMessage);
+                return Err(Error::InvalidPayloadLength);
             }
             let stream_dep = StreamDependency::load(&src[..5])?;
 
@@ -614,7 +614,7 @@ impl PushPromise {
         // Read the padding length
         if flags.is_padded() {
             if src.is_empty() {
-                return Err(Error::MalformedMessage);
+                return Err(Error::InvalidPayloadLength);
             }
 
             // TODO: Ensure payload is sized correctly
@@ -624,8 +624,9 @@ impl PushPromise {
             src.advance(1);
         }
 
-        if src.len() < 5 {
-            return Err(Error::MalformedMessage);
+        // The Promised Stream ID is the only mandatory field.
+        if src.len() < 4 {
+            return Err(Error::InvalidPayloadLength);
         }
 
         let (promised_id, _) = StreamId::parse(&src[..4]);

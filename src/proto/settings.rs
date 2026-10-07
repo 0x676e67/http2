@@ -150,6 +150,11 @@ impl Settings {
             }
 
             if let Some(val) = settings.header_table_size() {
+                // A frame that lowers and then raises the size needs both
+                // updates in the next field block, lowest first.
+                if let Some(lowest) = settings.lowest_header_table_size() {
+                    dst.set_send_header_table_size(lowest as usize);
+                }
                 dst.set_send_header_table_size(val as usize);
             }
 

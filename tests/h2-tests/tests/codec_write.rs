@@ -100,6 +100,44 @@ async fn client_settings_header_table_size() {
 }
 
 #[tokio::test]
+async fn client_settings_repeated_header_table_size() {
+    // A SETTINGS frame lowers the table size to 0 and restores 4096. The next
+    // header block must signal the lowest and then the final size.
+    h2_support::trace_init!();
+
+    let io = mock_io::Builder::new()
+        .handshake_read_settings(&[
+            0, 0, 12, // len
+            4,  // type
+            0,  // flags
+            0, 0, 0, 0, // stream id
+            0, 0x1, // id = SETTINGS_HEADER_TABLE_SIZE
+            0, 0, 0, 0, // value = 0
+            0, 0x1, // id = SETTINGS_HEADER_TABLE_SIZE
+            0, 0, 0x10, 0, // value = 4096
+        ])
+        .write(frames::SETTINGS_ACK)
+        // Write GET / with size updates 0 and 4096, indexing :authority
+        .write(&[
+            0, 0, 0x14, 1, 5, 0, 0, 0, 1, 0x20, 0x3f, 0xe1, 0x1f, 0x82, 0x87, 0x41, 0x8B, 0x9D,
+            0x29, 0xAC, 0x4B, 0x8F, 0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84,
+        ])
+        .read(&[0, 0, 1, 1, 5, 0, 0, 0, 1, 137])
+        // Write GET / using the indexed :authority
+        .write(&[0, 0, 4, 1, 5, 0, 0, 0, 3, 0x82, 0x87, 0xbe, 0x84])
+        .read(&[0, 0, 1, 1, 5, 0, 0, 0, 3, 137])
+        .build();
+
+    let (mut client, mut conn) = client::handshake(io).await.expect("handshake");
+
+    let req1 = client.get("https://http2.akamai.com");
+    conn.drive(req1).await.expect("req1");
+
+    let req2 = client.get("https://http2.akamai.com");
+    conn.drive(req2).await.expect("req2");
+}
+
+#[tokio::test]
 async fn server_settings_header_table_size() {
     // A client sets the SETTINGS_HEADER_TABLE_SIZE to 0, test that the
     // server doesn't send indexed headers.
