@@ -48,15 +48,15 @@ pub struct StreamDependency {
 
 impl Priority {
     /// Create a new [`Priority`].
-    pub fn new(stream_id: StreamId, dependency: StreamDependency) -> Self {
+    pub fn new<S: Into<StreamId>>(stream_id: S, dependency: StreamDependency) -> Self {
         Priority {
-            stream_id,
+            stream_id: stream_id.into(),
             dependency,
         }
     }
 
     /// Loads the priority frame but doesn't actually do HPACK decoding.
-    pub fn load(head: Head, payload: &[u8]) -> Result<Self, Error> {
+    pub(crate) fn load(head: Head, payload: &[u8]) -> Result<Self, Error> {
         tracing::trace!("loading priority frame; stream_id={:?}", head.stream_id());
 
         let dependency = StreamDependency::load(payload)?;
@@ -71,7 +71,7 @@ impl Priority {
         })
     }
 
-    pub fn encode<B: BufMut>(&self, dst: &mut B) {
+    pub(crate) fn encode<B: BufMut>(&self, dst: &mut B) {
         let head = Head::new(Kind::Priority, 0, self.stream_id);
         head.encode(5, dst);
 
@@ -96,16 +96,16 @@ impl<B> From<Priority> for Frame<B> {
 
 impl StreamDependency {
     /// Create a new [`StreamDependency`]
-    pub fn new(dependency_id: StreamId, weight: u8, is_exclusive: bool) -> Self {
+    pub fn new<S: Into<StreamId>>(dependency_id: S, weight: u8, is_exclusive: bool) -> Self {
         StreamDependency {
-            dependency_id,
+            dependency_id: dependency_id.into(),
             weight,
             is_exclusive,
         }
     }
 
     /// Loads the stream dependency from a buffer
-    pub fn load(src: &[u8]) -> Result<Self, Error> {
+    pub(crate) fn load(src: &[u8]) -> Result<Self, Error> {
         tracing::trace!("loading priority stream dependency; src={:?}", src);
 
         if src.len() != 5 {
@@ -121,12 +121,13 @@ impl StreamDependency {
         Ok(StreamDependency::new(dependency_id, weight, is_exclusive))
     }
 
+    /// Returns the stream this dependency points at.
     #[inline]
     pub fn dependency_id(&self) -> StreamId {
         self.dependency_id
     }
 
-    pub fn encode<T: BufMut>(&self, dst: &mut T) {
+    pub(crate) fn encode<T: BufMut>(&self, dst: &mut T) {
         const STREAM_ID_MASK: u32 = 1 << 31;
         let mut dependency_id = self.dependency_id.into();
         if self.is_exclusive {
@@ -167,6 +168,7 @@ pub struct PrioritiesBuilder {
 // ===== impl Priorities =====
 
 impl Priorities {
+    /// Creates a new [`PrioritiesBuilder`].
     pub fn builder() -> PrioritiesBuilder {
         PrioritiesBuilder {
             priorities: SmallVec::new(),
@@ -177,6 +179,11 @@ impl Priorities {
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.priorities.is_empty()
+    }
+
+    /// Returns the stream IDs that these PRIORITY frames declare.
+    pub(crate) fn stream_ids(&self) -> impl Iterator<Item = StreamId> + '_ {
+        self.priorities.iter().map(|priority| priority.stream_id)
     }
 }
 
@@ -193,6 +200,9 @@ impl IntoIterator for Priorities {
 // ===== impl PrioritiesBuilder =====
 
 impl PrioritiesBuilder {
+    /// Appends a PRIORITY frame.
+    ///
+    /// Frames for stream 0, self-dependencies and repeated stream IDs are ignored.
     pub fn push(mut self, priority: Priority) -> Self {
         if priority.stream_id.is_zero() {
             tracing::warn!("ignoring priority frame with stream ID 0");
@@ -241,6 +251,7 @@ impl PrioritiesBuilder {
         self
     }
 
+    /// Appends every PRIORITY frame with the same rules as [`push`](Self::push).
     pub fn extend(mut self, priorities: impl IntoIterator<Item = Priority>) -> Self {
         for priority in priorities {
             self = self.push(priority);
@@ -248,6 +259,7 @@ impl PrioritiesBuilder {
         self
     }
 
+    /// Finishes the collection.
     pub fn build(self) -> Priorities {
         Priorities {
             priorities: self.priorities,

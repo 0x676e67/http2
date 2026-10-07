@@ -1,6 +1,7 @@
 mod buffer;
 mod counts;
 mod flow_control;
+mod headers_priority;
 mod prioritize;
 mod recv;
 mod send;
@@ -19,6 +20,7 @@ pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, StreamRef, Streams};
 use self::buffer::Buffer;
 use self::counts::Counts;
 use self::flow_control::FlowControl;
+use self::headers_priority::{ChainParents, ChainState, HeadersPriorityConfig};
 use self::prioritize::Prioritize;
 use self::recv::Recv;
 use self::send::Send;
@@ -26,7 +28,8 @@ use self::state::State;
 use self::store::Store;
 use self::stream::Stream;
 
-use crate::frame::{PseudoOrder, StreamDependency, StreamId, StreamIdOverflow};
+use crate::ext::HeadersPriority;
+use crate::frame::{PseudoOrder, StreamId, StreamIdOverflow};
 use crate::proto::*;
 
 use bytes::Bytes;
@@ -86,8 +89,11 @@ pub struct Config {
     /// 25,600 bytes.
     pub data_frame_budget: usize,
 
-    /// Priority of the headers stream
-    pub headers_stream_dependency: Option<StreamDependency>,
+    /// Default `HEADERS` priority for requests without their own.
+    pub headers_priority: Option<HeadersPriority>,
+
+    /// Idle streams declared by the initial PRIORITY frames.
+    pub priority_stream_ids: Vec<StreamId>,
 
     /// Pseudo order of the headers stream
     pub headers_pseudo_order: Option<PseudoOrder>,
