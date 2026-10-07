@@ -1623,6 +1623,56 @@ async fn extended_connect_protocol_enabled_during_handshake() {
 }
 
 #[tokio::test]
+async fn extended_connect_protocol_follows_later_settings() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        for id in [1, 3, 5] {
+            srv.recv_frame(
+                frames::headers(id)
+                    .request("GET", "https://example.com/")
+                    .eos(),
+            )
+            .await;
+            match id {
+                // RFC 8441 §3 only forbids withdrawing the setting; enabling it later is allowed.
+                3 => {
+                    srv.send_frame(frames::settings().enable_connect_protocol(1))
+                        .await
+                }
+                // A later SETTINGS frame without the parameter keeps the previous value.
+                5 => {
+                    srv.send_frame(frames::settings().max_concurrent_streams(10))
+                        .await
+                }
+                _ => {}
+            }
+            if id != 1 {
+                srv.recv_frame(frames::settings_ack()).await;
+            }
+            srv.send_frame(frames::headers(id).response(200).eos())
+                .await;
+        }
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        for expected in [false, true, true] {
+            let request = Request::get("https://example.com/").body(()).unwrap();
+            let (response, _) = client.send_request(request, true).unwrap();
+            h2.drive(response).await.unwrap();
+            assert_eq!(h2.extended_connect_protocol(), Some(expected));
+            assert_eq!(client.is_extended_connect_protocol_enabled(), expected);
+        }
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
 async fn invalid_connect_protocol_enabled_setting() {
     h2_support::trace_init!();
 

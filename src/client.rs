@@ -1642,6 +1642,11 @@ where
         self.inner.max_recv_streams()
     }
 
+    fn set_initial_stream_window_size(&mut self, target: u32, advertised: u32) {
+        self.inner
+            .set_initial_stream_window_size(target, advertised);
+    }
+
     /// Returns whether the server enabled the [extended CONNECT protocol][1].
     ///
     /// Returns `None` until the server's initial SETTINGS frame is applied. The value
@@ -1653,11 +1658,6 @@ where
     /// [2]: https://datatracker.ietf.org/doc/html/rfc8441#section-3
     pub fn extended_connect_protocol(&self) -> Option<bool> {
         self.inner.remote_extended_connect()
-    }
-
-    fn set_initial_stream_window_size(&mut self, target: u32, advertised: u32) {
-        self.inner
-            .set_initial_stream_window_size(target, advertised);
     }
 }
 

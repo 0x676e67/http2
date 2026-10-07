@@ -103,12 +103,6 @@ impl Settings {
         }
     }
 
-    /// Returns the remote extended CONNECT setting, or `None` before its initial SETTINGS.
-    pub(crate) fn remote_extended_connect(&self) -> Option<bool> {
-        self.has_received_remote_initial_settings
-            .then_some(self.remote_extended_connect)
-    }
-
     /// Sets `true` to `self.has_received_remote_initial_settings`.
     /// Returns `true` if this method is called for the first time.
     /// (i.e. it is the initial SETTINGS frame from the remote peer)
@@ -178,5 +172,11 @@ impl Settings {
         }
 
         Poll::Ready(Ok(()))
+    }
+
+    /// Returns the remote extended CONNECT setting, or `None` before its initial SETTINGS.
+    pub(crate) fn remote_extended_connect(&self) -> Option<bool> {
+        self.has_received_remote_initial_settings
+            .then_some(self.remote_extended_connect)
     }
 }
