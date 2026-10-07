@@ -40,6 +40,16 @@ pub fn encode(src: &[u8], dst: &mut BytesMut) {
     }
 }
 
+/// Returns the encoded byte length, or `None` if the bit count overflows.
+pub(crate) fn encoded_len(src: &[u8]) -> Option<usize> {
+    src.iter()
+        .try_fold(0usize, |bits, byte| {
+            bits.checked_add(ENCODE_CODE_LENGTHS[*byte as usize] as usize)
+        })?
+        .checked_add(7)
+        .map(|bits| bits / 8)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

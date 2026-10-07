@@ -10,4 +10,5 @@ mod test;
 pub(crate) use self::decoder::DecodedHeader;
 pub use self::decoder::{Decoder, DecoderError, NeedMore};
 pub use self::encoder::Encoder;
+pub(crate) use self::encoder::EncodingRole;
 pub use self::header::{BytesStr, Header};

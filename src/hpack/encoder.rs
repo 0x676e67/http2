@@ -19,6 +19,13 @@ pub struct Encoder {
     /// across frames instead of being allocated and freed per frame. See
     /// `take_scratch` / `return_scratch`.
     scratch: BytesMut,
+    role: EncodingRole,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum EncodingRole {
+    Server,
+    Client,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -36,6 +43,7 @@ impl Encoder {
             max_allowed_size: DEFAULT_MAX_ALLOWED_SIZE,
             size_update: None,
             scratch: BytesMut::new(),
+            role: EncodingRole::Server,
         }
     }
 
@@ -107,30 +115,86 @@ impl Encoder {
 
         self.encode_size_updates(dst);
 
-        let mut last_index = None;
+        match self.role {
+            EncodingRole::Server => {
+                let mut last_index = None;
 
-        for header in headers {
-            match header.reify() {
-                // The header has an associated name. In which case, try to
-                // index it in the table.
-                Ok(header) => {
-                    let index = self.table.index(header);
-                    self.encode_header(&index, dst);
+                for header in headers {
+                    match header.reify() {
+                        // The header has an associated name. In which case, try to
+                        // index it in the table.
+                        Ok(header) => {
+                            let index = self.table.index(header);
+                            self.encode_header(&index, dst);
 
-                    last_index = Some(index);
+                            last_index = Some(index);
+                        }
+                        // The header does not have an associated name. This means that
+                        // the name is the same as the previously yielded header. In
+                        // which case, we skip table lookup and just use the same index
+                        // as the previous entry.
+                        Err(value) => {
+                            self.encode_header_without_name(
+                                last_index.as_ref().unwrap_or_else(|| {
+                                    panic!("encoding header without name, but no previous index to use for name");
+                                }),
+                                &value,
+                                dst,
+                            );
+                        }
+                    }
                 }
-                // The header does not have an associated name. This means that
-                // the name is the same as the previously yielded header. In
-                // which case, we skip table lookup and just use the same index
-                // as the previous entry.
-                Err(value) => {
-                    self.encode_header_without_name(
-                        last_index.as_ref().unwrap_or_else(|| {
-                            panic!("encoding header without name, but no previous index to use for name");
-                        }),
-                        &value,
-                        dst,
-                    );
+            }
+            EncodingRole::Client => {
+                let mut last_name = None;
+
+                for header in headers {
+                    let header = match header {
+                        Header::Field {
+                            name: Some(name),
+                            value,
+                        } => {
+                            last_name = Some(name.clone());
+                            Header::Field { name, value }
+                        }
+                        Header::Field { name: None, value } => {
+                            let Some(name) = last_name.clone() else {
+                                tracing::debug!("header value is missing its preceding name");
+                                continue;
+                            };
+                            Header::Field { name, value }
+                        }
+                        Header::Authority(value) => {
+                            last_name = None;
+                            Header::Authority(value)
+                        }
+                        Header::Method(value) => {
+                            last_name = None;
+                            Header::Method(value)
+                        }
+                        Header::Scheme(value) => {
+                            last_name = None;
+                            Header::Scheme(value)
+                        }
+                        Header::Path(value) => {
+                            last_name = None;
+                            Header::Path(value)
+                        }
+                        Header::Protocol(value) => {
+                            last_name = None;
+                            Header::Protocol(value)
+                        }
+                        Header::Status(value) => {
+                            last_name = None;
+                            Header::Status(value)
+                        }
+                    };
+
+                    // Preserve field boundaries and values, including Cookie. Its
+                    // optional splitting is left to the caller (RFC 9113 section 8.2.3).
+                    // https://www.rfc-editor.org/rfc/rfc9113.html#section-8.2.3
+                    let index = self.table.index_header(header);
+                    self.encode_header(&index, dst);
                 }
             }
         }
@@ -153,14 +217,20 @@ impl Encoder {
     }
 
     fn encode_header(&mut self, index: &Index, dst: &mut BytesMut) {
-        match *index {
+        match index {
             Index::Indexed(idx, _) => {
-                encode_int(idx, 7, 0x80, dst);
+                encode_int(*idx, 7, 0x80, dst);
             }
             Index::Name(idx, _) => {
                 let header = self.table.resolve(index);
 
-                encode_not_indexed(idx, header.value_slice(), header.is_sensitive(), dst);
+                encode_not_indexed(
+                    *idx,
+                    header.value_slice(),
+                    header.is_sensitive(),
+                    self.role,
+                    dst,
+                );
             }
             Index::Inserted(_) => {
                 let header = self.table.resolve(index);
@@ -169,16 +239,27 @@ impl Encoder {
 
                 dst.put_u8(0b0100_0000);
 
-                encode_str(header.name().as_slice(), dst);
-                encode_str(header.value_slice(), dst);
+                encode_str(header.name().as_slice(), self.role, dst);
+                encode_str(header.value_slice(), self.role, dst);
             }
             Index::InsertedValue(idx, _) => {
                 let header = self.table.resolve(index);
 
                 assert!(!header.is_sensitive());
 
-                encode_int(idx, 6, 0b0100_0000, dst);
-                encode_str(header.value_slice(), dst);
+                encode_int(*idx, 6, 0b0100_0000, dst);
+                encode_str(header.value_slice(), self.role, dst);
+            }
+            Index::OversizedIndexedLiteral(name_index, header) => {
+                debug_assert!(!header.is_sensitive());
+
+                if let Some(name_index) = name_index {
+                    encode_int(*name_index, 6, 0b0100_0000, dst);
+                } else {
+                    dst.put_u8(0b0100_0000);
+                    encode_str(header.name().as_slice(), self.role, dst);
+                }
+                encode_str(header.value_slice(), self.role, dst);
             }
             Index::NotIndexed(_) => {
                 let header = self.table.resolve(index);
@@ -187,6 +268,7 @@ impl Encoder {
                     header.name().as_slice(),
                     header.value_slice(),
                     header.is_sensitive(),
+                    self.role,
                     dst,
                 );
             }
@@ -206,19 +288,28 @@ impl Encoder {
             | Index::InsertedValue(..) => {
                 let idx = self.table.resolve_idx(last);
 
-                encode_not_indexed(idx, value.as_ref(), value.is_sensitive(), dst);
+                encode_not_indexed(idx, value.as_ref(), value.is_sensitive(), self.role, dst);
             }
-            Index::NotIndexed(_) => {
+            Index::OversizedIndexedLiteral(Some(idx), _) => {
+                encode_not_indexed(idx, value.as_ref(), value.is_sensitive(), self.role, dst);
+            }
+            Index::OversizedIndexedLiteral(None, _) | Index::NotIndexed(_) => {
                 let last = self.table.resolve(last);
 
                 encode_not_indexed2(
                     last.name().as_slice(),
                     value.as_ref(),
                     value.is_sensitive(),
+                    self.role,
                     dst,
                 );
             }
         }
+    }
+
+    /// Sets the encoding role before the first header block is encoded.
+    pub(crate) fn set_role(&mut self, role: EncodingRole) {
+        self.role = role;
     }
 }
 
@@ -232,29 +323,58 @@ fn encode_size_update(val: usize, dst: &mut BytesMut) {
     encode_int(val, 5, 0b0010_0000, dst)
 }
 
-fn encode_not_indexed(name: usize, value: &[u8], sensitive: bool, dst: &mut BytesMut) {
+fn encode_not_indexed(
+    name: usize,
+    value: &[u8],
+    sensitive: bool,
+    role: EncodingRole,
+    dst: &mut BytesMut,
+) {
     if sensitive {
         encode_int(name, 4, 0b10000, dst);
     } else {
         encode_int(name, 4, 0, dst);
     }
 
-    encode_str(value, dst);
+    encode_str(value, role, dst);
 }
 
-fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut BytesMut) {
+fn encode_not_indexed2(
+    name: &[u8],
+    value: &[u8],
+    sensitive: bool,
+    role: EncodingRole,
+    dst: &mut BytesMut,
+) {
     if sensitive {
         dst.put_u8(0b10000);
     } else {
         dst.put_u8(0);
     }
 
-    encode_str(name, dst);
-    encode_str(value, dst);
+    encode_str(name, role, dst);
+    encode_str(value, role, dst);
 }
 
-fn encode_str(val: &[u8], dst: &mut BytesMut) {
+fn encode_str(val: &[u8], role: EncodingRole, dst: &mut BytesMut) {
     if !val.is_empty() {
+        // RFC 7541 section 5.2 permits either identity or Huffman coding. The
+        // client route uses Huffman only when it shortens the byte string.
+        // https://www.rfc-editor.org/rfc/rfc7541.html#section-5.2
+        if role == EncodingRole::Client {
+            match huffman::encoded_len(val) {
+                Some(encoded_len) if encoded_len < val.len() => {
+                    encode_int(encoded_len, 7, 0x80, dst);
+                    huffman::encode(val, dst);
+                }
+                _ => {
+                    encode_int(val.len(), 7, 0, dst);
+                    dst.put_slice(val);
+                }
+            }
+            return;
+        }
+
         let idx = position(dst);
 
         // Push a placeholder byte for the length header
@@ -751,10 +871,242 @@ mod test {
         // Not sure what the best way to do this is.
     }
 
+    #[test]
+    fn client_strings_use_huffman_only_when_smaller() {
+        let mut dst = BytesMut::new();
+        encode_str(b"feedbeef", EncodingRole::Client, &mut dst);
+        assert_eq!(&dst[..], &[0x86, 0x94, 0xa5, 0x92, 0x32, 0x96, 0x5f]);
+
+        dst.clear();
+        encode_str(b"@@@@@@", EncodingRole::Client, &mut dst);
+        assert_eq!(&dst[..], b"\x06@@@@@@");
+
+        dst.clear();
+        encode_str(b"a", EncodingRole::Client, &mut dst);
+        assert_eq!(&dst[..], b"\x01a");
+    }
+
+    #[test]
+    fn client_uses_chromium_indexing_policy_and_sensitive_precedence() {
+        let mut encoder = client_encoder(4096);
+
+        let first = encode(&mut encoder, vec![method("PATCH")]);
+        assert_eq!(&first[..], b"\x02\x05PATCH");
+        assert_eq!(encoder.table.len(), 0);
+        assert_eq!(encode(&mut encoder, vec![method("PATCH")]), first);
+
+        let authority: Header<Option<HeaderName>> =
+            Header::Authority(crate::hpack::BytesStr::from("example.com"));
+        let encoded = encode(&mut encoder, vec![authority.clone()]);
+        assert_eq!(encoded[0], 0x41);
+        assert_eq!(encoder.table.len(), 1);
+        assert_eq!(&encode(&mut encoder, vec![authority])[..], &[0xbe]);
+
+        let mut encoder = client_encoder(4096);
+        let encoded = encode(&mut encoder, vec![header("authorization", "secret")]);
+        assert_eq!(encoded[0], 0x57);
+        assert_eq!(encoder.table.len(), 1);
+        assert_eq!(
+            &encode(&mut encoder, vec![header("authorization", "secret")])[..],
+            &[0xbe]
+        );
+
+        let mut value = HeaderValue::from_static("secret");
+        value.set_sensitive(true);
+        let sensitive = Header::Field {
+            name: Some(header::AUTHORIZATION),
+            value,
+        };
+        let encoded = encode(&mut encoder, vec![sensitive]);
+        assert_eq!(&encoded[..2], &[0x1f, 0x08]);
+        assert_eq!(encoder.table.len(), 1);
+
+        let mut encoder = client_encoder(4096);
+        let _ = encode(&mut encoder, vec![header("x-secret", "secret")]);
+        let mut value = HeaderValue::from_static("secret");
+        value.set_sensitive(true);
+        let sensitive = Header::Field {
+            name: Some(HeaderName::from_static("x-secret")),
+            value,
+        };
+        let encoded = encode(&mut encoder, vec![sensitive]);
+        assert_eq!(&encoded[..2], &[0x1f, 0x2f]);
+        assert_eq!(encoder.table.len(), 1);
+
+        // Even an exact static-table match must preserve never-indexed.
+        let mut value = HeaderValue::from_static("");
+        value.set_sensitive(true);
+        let encoded = encode(
+            &mut encoder,
+            vec![Header::Field {
+                name: Some(header::ACCEPT),
+                value,
+            }],
+        );
+        assert_eq!(&encoded[..], &[0x1f, 0x04, 0x00]);
+        assert_eq!(encoder.table.len(), 1);
+    }
+
+    #[test]
+    fn client_rechecks_repeated_values() {
+        let mut encoder = client_encoder(4096);
+        let repeated = encode(
+            &mut encoder,
+            vec![
+                header("x", "a"),
+                Header::Field {
+                    name: None,
+                    value: HeaderValue::from_static("b"),
+                },
+                Header::Field {
+                    name: None,
+                    value: HeaderValue::from_static("a"),
+                },
+            ],
+        );
+        assert_eq!(&repeated[..], b"\x40\x01x\x01a\x7e\x01b\xbf");
+    }
+
+    #[test]
+    fn client_preserves_cookie_values_and_field_boundaries() {
+        let source = ["\t@@=@@; @@=@@\t", "a=1;;  b=2;", "", " \t"];
+        for sensitive in [false, true] {
+            let mut encoder = client_encoder(4096);
+            let headers = source.iter().enumerate().map(|(index, value)| {
+                let mut value = HeaderValue::from_static(value);
+                value.set_sensitive(sensitive);
+                Header::Field {
+                    name: (index == 0).then_some(header::COOKIE),
+                    value,
+                }
+            });
+            let mut encoded = BytesMut::new();
+            encoder.encode(headers, &mut encoded);
+
+            // Huffman is longer for this value. Its raw bytes, including the
+            // semicolon and surrounding tabs, must remain one Cookie field.
+            let mut prefix = if sensitive {
+                vec![0x1f, 0x11]
+            } else {
+                vec![0x60]
+            };
+            prefix.push(source[0].len() as u8);
+            prefix.extend_from_slice(source[0].as_bytes());
+            assert!(encoded.starts_with(&prefix));
+
+            let mut decoder = crate::hpack::Decoder::default();
+            let mut values = Vec::new();
+            decoder
+                .decode(&mut std::io::Cursor::new(&mut encoded), |header| {
+                    let Header::Field { name, value } = header else {
+                        panic!("expected Cookie field");
+                    };
+                    assert_eq!(name, header::COOKIE);
+                    assert_eq!(value.is_sensitive(), sensitive);
+                    values.push(value);
+                    std::ops::ControlFlow::Continue(())
+                })
+                .unwrap();
+            assert_eq!(values.len(), source.len());
+            for (value, expected) in values.iter().zip(source) {
+                assert_eq!(value.as_bytes(), expected.as_bytes());
+            }
+            if sensitive {
+                assert_eq!(encoder.table.len(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn client_fully_matches_empty_static_values() {
+        let mut encoder = client_encoder(4096);
+        assert_eq!(
+            &encode(&mut encoder, vec![header("cookie", "")])[..],
+            &[0xa0]
+        );
+        assert_eq!(encoder.table.len(), 0);
+
+        assert_eq!(
+            &encode(&mut encoder, vec![header("accept", "")])[..],
+            &[0x93]
+        );
+        assert_eq!(encoder.table.len(), 0);
+
+        let authority: Header<Option<HeaderName>> =
+            Header::Authority(crate::hpack::BytesStr::from(""));
+        assert_eq!(&encode(&mut encoder, vec![authority])[..], &[0x81]);
+        assert_eq!(encoder.table.len(), 0);
+
+        // Static index 16 contains "gzip, deflate", so an empty value only
+        // matches its name and must still use incremental indexing.
+        assert_eq!(
+            &encode(&mut encoder, vec![header("accept-encoding", "")])[..],
+            &[0x50, 0x00]
+        );
+        assert_eq!(encoder.table.len(), 1);
+    }
+
+    #[test]
+    fn client_oversized_incremental_literal_captures_name_before_clearing() {
+        let mut encoder = client_encoder(64);
+        let _ = encode(&mut encoder, vec![header("custom", "a")]);
+        assert_eq!(encoder.table.len(), 1);
+
+        let large = "@".repeat(64);
+        let encoded = encode(&mut encoder, vec![header("custom", &large)]);
+        assert_eq!(&encoded[..2], &[0x7e, 0x40]);
+        assert!(encoded[2..].iter().all(|byte| *byte == b'@'));
+        assert_eq!(encoder.table.len(), 0);
+        assert_eq!(encoder.table.size(), 0);
+
+        let encoded = encode(&mut encoder, vec![header("custom", &large)]);
+        assert_eq!(encoded[0], 0x40);
+        assert_eq!(encoder.table.len(), 0);
+        assert_eq!(encoder.table.size(), 0);
+    }
+
+    #[test]
+    fn client_table_size_updates_respect_the_internal_limit() {
+        let mut encoder = client_encoder(4096);
+        encoder.update_max_size(8192);
+        assert_eq!(&encode(&mut encoder, vec![method("GET")])[..], &[0x82]);
+        assert_eq!(encoder.table.max_size(), 4096);
+
+        // The encoder may use less capacity than the peer permits, but must
+        // still signal the smallest intervening size before restoring it.
+        // https://www.rfc-editor.org/rfc/rfc7541.html#section-4.2
+        encoder.update_max_size(128);
+        encoder.update_max_size(8192);
+        assert_eq!(
+            &encode(&mut encoder, vec![method("GET")])[..],
+            &[0x3f, 0x61, 0x3f, 0xe1, 0x1f, 0x82]
+        );
+        assert_eq!(encoder.table.max_size(), 4096);
+
+        encoder.update_max_size(0);
+        assert_eq!(
+            &encode(&mut encoder, vec![header("x", "a")])[..],
+            b"\x20\x40\x01x\x01a"
+        );
+        assert_eq!(encoder.table.size(), 0);
+        encoder.update_max_size(8192);
+        assert_eq!(
+            &encode(&mut encoder, vec![header("x", "a")])[..],
+            b"\x3f\xe1\x1f\x40\x01x\x01a"
+        );
+        assert_eq!(&encode(&mut encoder, vec![header("x", "a")])[..], &[0xbe]);
+    }
+
     fn encode(e: &mut Encoder, hdrs: Vec<Header<Option<HeaderName>>>) -> BytesMut {
         let mut dst = BytesMut::with_capacity(1024);
         e.encode(hdrs, &mut dst);
         dst
+    }
+
+    fn client_encoder(max_size: usize) -> Encoder {
+        let mut encoder = Encoder::new(max_size, 0);
+        encoder.set_role(EncodingRole::Client);
+        encoder
     }
 
     fn method(s: &str) -> Header<Option<HeaderName>> {
