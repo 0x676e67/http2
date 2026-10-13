@@ -84,8 +84,8 @@ pub(super) struct Counts {
     /// Whether the DATA frame budget follows the target connection window.
     data_frame_budget_is_auto: bool,
 
-    /// Number of empty, non-final DATA frames received over the lifetime of
-    /// the connection.
+    /// Number of consecutive empty, non-final DATA frames received since the
+    /// last DATA frame carrying payload.
     num_recv_empty_data_frames: usize,
 }
 
@@ -145,6 +145,11 @@ impl Counts {
             self.data_frame_budget
                 .replenish(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len);
         }
+    }
+
+    /// Ends the current run of empty DATA frames.
+    pub fn reset_empty_data_frames(&mut self) {
+        self.num_recv_empty_data_frames = 0;
     }
 
     /// Returns true when the next opened stream will reach capacity of outbound streams
