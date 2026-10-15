@@ -60,6 +60,16 @@ pub(crate) struct DynStreams<'a, B> {
     peer: peer::Dyn,
 }
 
+/// Outcome of receiving a frame that can open a stream.
+#[derive(Debug)]
+#[must_use = "a refused stream must be reset by the connection"]
+pub(crate) enum RecvOutcome {
+    /// The frame was handled, including any intentional ignoring of it.
+    Processed,
+    /// The connection must send REFUSED_STREAM for this stream ID.
+    Refused(StreamId),
+}
+
 /// Reference to the stream state
 #[derive(Debug)]
 pub(crate) struct StreamRef<B> {
@@ -143,7 +153,9 @@ where
 
         me.actions
             .recv
-            .set_target_connection_window(size, &mut me.actions.task)
+            .set_target_connection_window(size, &mut me.actions.task)?;
+        me.counts.set_target_connection_window_size(size);
+        Ok(())
     }
 
     /// Adds the connection-level WINDOW_UPDATE to the client's initial write.
@@ -192,26 +204,17 @@ where
         })
     }
 
-    pub fn send_pending_refusal<T>(
-        &mut self,
-        cx: &mut Context,
-        dst: &mut Codec<T, Prioritized<B>>,
-    ) -> Poll<io::Result<()>>
-    where
-        T: AsyncWrite + Unpin,
-    {
-        loop {
-            let status = {
-                let mut me = self.inner.lock();
-                let me = &mut *me;
-                me.actions.recv.send_pending_refusal(dst)?
-            };
-
-            match status {
-                BufferStatus::Complete => return Poll::Ready(Ok(())),
-                BufferStatus::CodecFull => ready!(dst.poll_ready(cx))?,
-            }
+    /// Count a refused stream toward the local error reset limit.
+    pub fn count_pending_refusal(&mut self) -> Result<(), Error> {
+        let mut me = self.inner.lock();
+        if !me.counts.can_inc_num_local_error_resets() {
+            return Err(Error::library_go_away_data(
+                Reason::ENHANCE_YOUR_CALM,
+                "too_many_internal_resets",
+            ));
         }
+        me.counts.inc_num_local_error_resets();
+        Ok(())
     }
 
     pub fn clear_expired_reset_streams(&mut self) {
@@ -440,7 +443,8 @@ impl<B> DynStreams<'_, B> {
         self.peer.is_server()
     }
 
-    pub fn recv_headers(&mut self, frame: frame::Headers) -> Result<(), Error> {
+    /// Reports whether the connection must refuse the stream opened by the peer.
+    pub fn recv_headers(&mut self, frame: frame::Headers) -> Result<RecvOutcome, Error> {
         let mut me = self.inner.lock();
 
         me.recv_headers(self.peer, self.send_buffer, frame)
@@ -477,7 +481,8 @@ impl<B> DynStreams<'_, B> {
         me.recv_window_update(self.send_buffer, frame)
     }
 
-    pub fn recv_push_promise(&mut self, frame: frame::PushPromise) -> Result<(), Error> {
+    /// Reports whether the connection must refuse the promised stream.
+    pub fn recv_push_promise(&mut self, frame: frame::PushPromise) -> Result<RecvOutcome, Error> {
         let mut me = self.inner.lock();
         me.recv_push_promise(self.send_buffer, frame)
     }
@@ -524,7 +529,7 @@ impl Inner {
         peer: peer::Dyn,
         send_buffer: &SendBuffer<B>,
         frame: frame::Headers,
-    ) -> Result<(), Error> {
+    ) -> Result<RecvOutcome, Error> {
         let id = frame.stream_id();
 
         // The GOAWAY process has begun. All streams with a greater ID than
@@ -535,7 +540,7 @@ impl Inner {
                 id,
                 self.actions.recv.max_stream_id()
             );
-            return Ok(());
+            return Ok(RecvOutcome::Processed);
         }
 
         let key = match self.store.find_entry(id) {
@@ -572,7 +577,7 @@ impl Inner {
 
                         e.insert(stream)
                     }
-                    None => return Ok(()),
+                    None => return Ok(RecvOutcome::Refused(id)),
                 }
             }
         };
@@ -589,7 +594,7 @@ impl Inner {
             // This is because the remote may have sent trailers before
             // receiving the RST_STREAM frame.
             tracing::trace!("recv_headers; ignoring trailers on {:?}", stream.id);
-            return Ok(());
+            return Ok(RecvOutcome::Processed);
         }
 
         let actions = &mut self.actions;
@@ -652,7 +657,9 @@ impl Inner {
             };
 
             actions.reset_on_recv_stream_err_deferred(send_buffer, stream, counts, res)
-        })
+        })?;
+
+        Ok(RecvOutcome::Processed)
     }
 
     fn recv_data<B>(
@@ -895,7 +902,7 @@ impl Inner {
         &mut self,
         send_buffer: &SendBuffer<B>,
         frame: frame::PushPromise,
-    ) -> Result<(), Error> {
+    ) -> Result<RecvOutcome, Error> {
         let id = frame.stream_id();
         let promised_id = frame.promised_id();
 
@@ -910,7 +917,7 @@ impl Inner {
                         id,
                         self.actions.recv.max_stream_id()
                     );
-                    return Ok(());
+                    return Ok(RecvOutcome::Processed);
                 }
 
                 // The stream must be receive open
@@ -927,10 +934,6 @@ impl Inner {
             }
         };
 
-        // TODO: Streams in the reserved states do not count towards the concurrency
-        // limit. However, it seems like there should be a cap otherwise this
-        // could grow in memory indefinitely.
-
         // Ensure that we can reserve streams
         self.actions.recv.ensure_can_reserve()?;
 
@@ -944,7 +947,7 @@ impl Inner {
             .open(promised_id, Open::PushPromise, &mut self.counts)?
             .is_none()
         {
-            return Ok(());
+            return Ok(RecvOutcome::Refused(promised_id));
         }
 
         // Try to handle the frame and create a corresponding key for the pushed stream
@@ -962,6 +965,13 @@ impl Inner {
             let actions = &mut self.actions;
 
             self.counts.transition(stream, |counts, stream| {
+                // RFC 9113 excludes reserved streams from the concurrent stream
+                // count. Still, account reserved remote streams against the local
+                // receive limit so a peer cannot create an unbounded number of
+                // them by withholding the response HEADERS. `recv_headers` will
+                // see `is_counted` and avoid counting the stream a second time.
+                // https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1.2
+                counts.inc_num_recv_streams(stream);
                 let stream_valid = actions.recv.recv_push_promise(frame, stream);
 
                 match stream_valid {
@@ -990,7 +1000,7 @@ impl Inner {
             parent.notify_push();
         };
 
-        Ok(())
+        Ok(RecvOutcome::Processed)
     }
 
     fn recv_eof<B>(
