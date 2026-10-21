@@ -360,8 +360,10 @@ where
             me.actions.recv.init_window_sz(),
         );
 
-        if *request.method() == Method::HEAD {
-            stream.content_length = ContentLength::Head;
+        match *request.method() {
+            Method::HEAD => stream.content_length = ContentLength::Head,
+            Method::CONNECT => stream.content_length = ContentLength::Connect,
+            _ => {}
         }
 
         // Convert the message
