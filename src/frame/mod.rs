@@ -139,7 +139,7 @@ impl<T> fmt::Debug for Frame<T> {
 /// Errors that can occur during parsing an HTTP/2 frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// A length value other than 8 was set on a PING message.
+    /// A PING, WINDOW_UPDATE or GOAWAY payload has a length its type forbids.
     BadFrameSize,
 
     /// The padding length was larger than the frame-header-specified
@@ -149,6 +149,9 @@ pub enum Error {
     /// An invalid setting value was provided
     InvalidSettingValue,
 
+    /// `SETTINGS_INITIAL_WINDOW_SIZE` exceeds the maximum window of 2^31-1.
+    InvalidInitialWindowSize,
+
     /// An invalid window update value
     InvalidWindowUpdateValue,
 
@@ -156,7 +159,7 @@ pub enum Error {
     /// value necessary for the specific frame type.
     InvalidPayloadLength,
 
-    /// Received a payload with an ACK settings frame
+    /// Received a payload with an ACK settings frame.
     InvalidPayloadAckSettings,
 
     /// An invalid stream identifier was provided.

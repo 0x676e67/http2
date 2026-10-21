@@ -19,9 +19,8 @@ use bytes::{Buf, Bytes};
 pub fn strip_padding(payload: &mut Bytes) -> Result<u8, Error> {
     let payload_len = payload.len();
     if payload_len == 0 {
-        // If this is the case, the frame is invalid as no padding length can be
-        // extracted, even though the frame should be padded.
-        return Err(Error::TooMuchPadding);
+        // A padded frame too short to carry the Pad Length field.
+        return Err(Error::InvalidPayloadLength);
     }
 
     let pad_len = payload[0] as usize;

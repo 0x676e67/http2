@@ -113,6 +113,22 @@ fn calc_max_continuation_frames(header_max: usize, frame_max: usize) -> usize {
     min_frames_for_list.saturating_add(padding).max(5)
 }
 
+/// Returns the connection error code for a frame that failed to load.
+///
+/// A payload whose length its frame type forbids is a `FRAME_SIZE_ERROR`, see
+/// <https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2>. An oversized
+/// `INITIAL_WINDOW_SIZE` is a `FLOW_CONTROL_ERROR`, see
+/// <https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2>.
+fn load_error_reason(error: &frame::Error) -> Reason {
+    match error {
+        frame::Error::BadFrameSize
+        | frame::Error::InvalidPayloadLength
+        | frame::Error::InvalidPayloadAckSettings => Reason::FRAME_SIZE_ERROR,
+        frame::Error::InvalidInitialWindowSize => Reason::FLOW_CONTROL_ERROR,
+        _ => Reason::PROTOCOL_ERROR,
+    }
+}
+
 impl FrameDecoder {
     fn new(max_frame_size: usize) -> Self {
         let max_header_list_size = DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE;
@@ -174,9 +190,9 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
             // Parse the header frame w/o parsing the payload
             let (mut frame, mut payload) = match frame::$frame::load($head, $bytes) {
                 Ok(res) => res,
-                Err(_e) => {
-                    proto_err!(conn: "failed to load frame; err={:?}", _e);
-                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+                Err(e) => {
+                    proto_err!(conn: "failed to load frame; err={:?}", e);
+                    return Err(Error::library_go_away(load_error_reason(&e)));
                 }
             };
 
@@ -251,27 +267,27 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
         Kind::Settings => {
             let res = frame::Settings::load(head, &bytes[frame::HEADER_LEN..]);
 
-            res.map_err(|_e| {
-                proto_err!(conn: "failed to load SETTINGS frame; err={:?}", _e);
-                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load SETTINGS frame; err={:?}", e);
+                Error::library_go_away(load_error_reason(&e))
             })?
             .into()
         }
         Kind::Ping => {
             let res = frame::Ping::load(head, &bytes[frame::HEADER_LEN..]);
 
-            res.map_err(|_e| {
-                proto_err!(conn: "failed to load PING frame; err={:?}", _e);
-                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load PING frame; err={:?}", e);
+                Error::library_go_away(load_error_reason(&e))
             })?
             .into()
         }
         Kind::WindowUpdate => {
             let res = frame::WindowUpdate::load(head, &bytes[frame::HEADER_LEN..]);
 
-            res.map_err(|_e| {
-                proto_err!(conn: "failed to load WINDOW_UPDATE frame; err={:?}", _e);
-                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load WINDOW_UPDATE frame; err={:?}", e);
+                Error::library_go_away(load_error_reason(&e))
             })?
             .into()
         }
@@ -280,26 +296,26 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
             let res = frame::Data::load(head, bytes.freeze());
 
             // TODO: Should this always be connection level? Probably not...
-            res.map_err(|_e| {
-                proto_err!(conn: "failed to load DATA frame; err={:?}", _e);
-                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load DATA frame; err={:?}", e);
+                Error::library_go_away(load_error_reason(&e))
             })?
             .into()
         }
         Kind::Headers => header_block!(Headers, head, bytes),
         Kind::Reset => {
             let res = frame::Reset::load(head, &bytes[frame::HEADER_LEN..]);
-            res.map_err(|_e| {
-                proto_err!(conn: "failed to load RESET frame; err={:?}", _e);
-                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load RESET frame; err={:?}", e);
+                Error::library_go_away(load_error_reason(&e))
             })?
             .into()
         }
         Kind::GoAway => {
             let res = frame::GoAway::load(head, &bytes[frame::HEADER_LEN..]);
-            res.map_err(|_e| {
-                proto_err!(conn: "failed to load GO_AWAY frame; err={:?}", _e);
-                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load GO_AWAY frame; err={:?}", e);
+                Error::library_go_away(load_error_reason(&e))
             })?
             .into()
         }
@@ -320,6 +336,14 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
                     let id = head.stream_id();
                     proto_err!(stream: "PRIORITY invalid dependency ID; stream={:?}", id);
                     return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
+                }
+                Err(frame::Error::InvalidPayloadLength) => {
+                    // A PRIORITY frame with a length other than 5 octets is a
+                    // stream error of type `FRAME_SIZE_ERROR`, see
+                    // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.3
+                    let id = head.stream_id();
+                    proto_err!(stream: "PRIORITY invalid payload length; stream={:?}", id);
+                    return Err(Error::library_reset(id, Reason::FRAME_SIZE_ERROR));
                 }
                 Err(_e) => {
                     proto_err!(conn: "failed to load PRIORITY frame; err={:?};", _e);
