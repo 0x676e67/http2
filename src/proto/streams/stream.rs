@@ -131,9 +131,7 @@ pub(super) enum InitialWindow {
 pub enum ContentLength {
     Omitted,
     Head,
-    /// The request was CONNECT: a 2xx response starts a tunnel instead of having content, and
-    /// the client ignores its content-length.
-    /// <https://www.rfc-editor.org/rfc/rfc9110#section-9.3.6>
+    /// The request was CONNECT; see [`ContentLength::ignores`].
     Connect,
     Remaining(u64),
 }
@@ -607,15 +605,19 @@ impl store::Next for NextResetExpire {
 // ===== impl ContentLength =====
 
 impl ContentLength {
-    /// Whether a response with this `status` has content whose length a content-length counts.
+    pub fn is_head(&self) -> bool {
+        matches!(*self, Self::Head)
+    }
+
+    /// Whether a response with `status` ignores its content-length, even an invalid one.
     ///
-    /// Responses to HEAD and 2xx responses to CONNECT have none; the latter start a tunnel.
-    /// <https://www.rfc-editor.org/rfc/rfc9110#section-6.4.1>
-    pub fn has_content(&self, status: Option<http::StatusCode>) -> bool {
-        match *self {
-            Self::Head => false,
-            Self::Connect => !status.is_some_and(|status| status.is_success()),
-            Self::Omitted | Self::Remaining(_) => true,
-        }
+    /// A server must not send the header on a 1xx, which has no content, and a client ignores
+    /// it on a 2xx to CONNECT, which starts a tunnel instead.
+    /// <https://www.rfc-editor.org/rfc/rfc9110#section-8.6>
+    /// <https://www.rfc-editor.org/rfc/rfc9110#section-9.3.6>
+    pub fn ignores(&self, status: Option<http::StatusCode>) -> bool {
+        status.is_some_and(|status| {
+            status.is_informational() || (matches!(*self, Self::Connect) && status.is_success())
+        })
     }
 }

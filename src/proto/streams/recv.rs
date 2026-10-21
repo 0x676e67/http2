@@ -186,14 +186,8 @@ impl Recv {
             }
         }
 
-        // Ignore Content-Length before parsing it on a successful CONNECT response.
-        // https://www.rfc-editor.org/rfc/rfc9110#section-9.3.6
-        let ignore_content_length = matches!(stream.content_length, ContentLength::Connect)
-            && frame
-                .pseudo()
-                .status
-                .is_some_and(|status| status.is_success());
-        if !ignore_content_length {
+        // Checked before parsing, so a 1xx cannot replace the stream's state either.
+        if !stream.content_length.ignores(frame.pseudo().status) {
             use http::header;
 
             let mut first_content_length = None;
@@ -216,11 +210,9 @@ impl Recv {
                 }
             }
 
-            // A response without content, like a 2xx to CONNECT, ignores its content-length.
-            // https://www.rfc-editor.org/rfc/rfc9113#section-8.1.1
-            // https://www.rfc-editor.org/rfc/rfc9110#section-9.3.6
-            let has_content = stream.content_length.has_content(frame.pseudo().status);
-            if let Some(content_length) = first_content_length.filter(|_| has_content) {
+            if let Some(content_length) =
+                first_content_length.filter(|_| !stream.content_length.is_head())
+            {
                 stream.content_length = ContentLength::Remaining(content_length);
                 // END_STREAM on headers frame with non-zero content-length is malformed.
                 // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1

@@ -1544,6 +1544,59 @@ async fn content_length_validation_outside_connect_2xx() {
 }
 
 #[tokio::test]
+async fn informational_response_ignores_content_length() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        // A 1xx has no content, so its content-length must not bind the final response, nor
+        // replace the CONNECT state that lets the 2xx tunnel ignore its own.
+        let connect = frames::headers(3).pseudo(frame::Pseudo {
+            method: Method::CONNECT.into(),
+            authority: util::byte_str("tunnel.example.com:8443").into(),
+            ..Default::default()
+        });
+        let get = frames::headers(1).request("GET", "https://tunnel.example.com:8443/");
+        for (id, request, length, data) in [(1, get, 0, "body"), (3, connect, 2, "tunneled")] {
+            srv.recv_frame(request.eos()).await;
+            srv.send_frame(
+                frames::headers(id)
+                    .response(103)
+                    .field("content-length", length),
+            )
+            .await;
+            srv.send_frame(frames::headers(id).response(200)).await;
+            srv.send_frame(frames::data(id, data).eos()).await;
+        }
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        tokio::spawn(async {
+            h2.await.expect("connection failed");
+        });
+        for (method, data) in [(Method::GET, "body"), (Method::CONNECT, "tunneled")] {
+            let request = Request::builder()
+                .method(method)
+                .uri("https://tunnel.example.com:8443/")
+                .body(())
+                .unwrap();
+            let (response, _) = client.send_request(request, true).unwrap();
+            let mut body = response.await.unwrap().into_body();
+            assert_eq!(body.data().await.unwrap().unwrap(), data);
+            assert!(body.data().await.is_none());
+        }
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
 async fn reject_none_zero_content_length_header_with_end_stream() {
     h2_support::trace_init!();
     let (io, mut srv) = mock::new();
