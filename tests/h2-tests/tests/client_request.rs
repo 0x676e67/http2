@@ -1438,22 +1438,28 @@ async fn connect_2xx_response_ignores_content_length() {
                 .eos()
         };
         // A 2xx starts a tunnel, so its content-length does not count the tunneled data.
-        for (id, status, length) in [(1, 200, 0), (3, 202, 5)] {
+        for (id, status, lengths) in [
+            (1, 200, &["0"][..]),
+            (3, 202, &["5"][..]),
+            (5, 200, &["18446744073709551616"][..]),
+            (7, 200, &["invalid"][..]),
+            (9, 200, &["0", "5"][..]),
+        ] {
             srv.recv_frame(connect(id)).await;
-            srv.send_frame(
-                frames::headers(id)
-                    .response(status)
-                    .field("content-length", length),
-            )
-            .await;
+            let mut fields = HeaderMap::new();
+            for length in lengths {
+                fields.append("content-length", length.parse().unwrap());
+            }
+            srv.send_frame(frames::headers(id).response(status).fields(fields))
+                .await;
             srv.send_frame(frames::data(id, "tunneled").eos()).await;
         }
         // Any other status keeps the content-length rules.
-        srv.recv_frame(connect(5)).await;
-        srv.send_frame(frames::headers(5).response(407).field("content-length", 2))
+        srv.recv_frame(connect(11)).await;
+        srv.send_frame(frames::headers(11).response(407).field("content-length", 2))
             .await;
-        srv.send_frame(frames::data(5, "tunneled")).await;
-        srv.recv_frame(frames::reset(5).protocol_error()).await;
+        srv.send_frame(frames::data(11, "tunneled")).await;
+        srv.recv_frame(frames::reset(11).protocol_error()).await;
     };
 
     let h2 = async move {
@@ -1471,7 +1477,7 @@ async fn connect_2xx_response_ignores_content_length() {
                 .body(())
                 .unwrap()
         };
-        for _ in 0..2 {
+        for _ in 0..5 {
             let (response, _) = client.send_request(connect(), true).unwrap();
             let mut body = response.await.unwrap().into_body();
             assert_eq!(body.data().await.unwrap().unwrap(), "tunneled");
@@ -1480,6 +1486,58 @@ async fn connect_2xx_response_ignores_content_length() {
         let (response, _) = client.send_request(connect(), true).unwrap();
         let mut body = response.await.unwrap().into_body();
         let _ = body.data().await.unwrap().unwrap_err();
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn content_length_validation_outside_connect_2xx() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        for (id, method, status) in [(1, "GET", 200), (3, "HEAD", 200), (5, "CONNECT", 407)] {
+            let request = if method == "CONNECT" {
+                frames::headers(id).pseudo(frame::Pseudo {
+                    method: Method::CONNECT.into(),
+                    authority: util::byte_str("tunnel.example.com:8443").into(),
+                    ..Default::default()
+                })
+            } else {
+                frames::headers(id).request(method, "https://tunnel.example.com:8443/")
+            };
+            srv.recv_frame(request.eos()).await;
+            srv.send_frame(
+                frames::headers(id)
+                    .response(status)
+                    .field("content-length", "18446744073709551616"),
+            )
+            .await;
+            srv.recv_frame(frames::reset(id).protocol_error()).await;
+        }
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        tokio::spawn(async { h2.await.expect("connection failed") });
+        for method in [Method::GET, Method::HEAD, Method::CONNECT] {
+            let request = Request::builder()
+                .method(method)
+                .uri("https://tunnel.example.com:8443/")
+                .body(())
+                .unwrap();
+            let (response, _) = client.send_request(request, true).unwrap();
+            assert_eq!(
+                response.await.unwrap_err().reason(),
+                Some(Reason::PROTOCOL_ERROR)
+            );
+        }
     };
 
     join(srv, h2).await;

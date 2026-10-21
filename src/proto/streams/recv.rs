@@ -1,3 +1,4 @@
+use super::stream::ContentLength;
 use super::*;
 use crate::codec::UserError;
 use crate::frame::{DEFAULT_INITIAL_WINDOW_SIZE, PushPromiseHeaderError, Reason};
@@ -185,8 +186,14 @@ impl Recv {
             }
         }
 
-        {
-            use super::stream::ContentLength;
+        // Ignore Content-Length before parsing it on a successful CONNECT response.
+        // https://www.rfc-editor.org/rfc/rfc9110#section-9.3.6
+        let ignore_content_length = matches!(stream.content_length, ContentLength::Connect)
+            && frame
+                .pseudo()
+                .status
+                .is_some_and(|status| status.is_success());
+        if !ignore_content_length {
             use http::header;
 
             let mut first_content_length = None;
