@@ -1421,6 +1421,71 @@ async fn allow_empty_data_for_head() {
 }
 
 #[tokio::test]
+async fn connect_2xx_response_ignores_content_length() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        let connect = |id| {
+            frames::headers(id)
+                .pseudo(frame::Pseudo {
+                    method: Method::CONNECT.into(),
+                    authority: util::byte_str("tunnel.example.com:8443").into(),
+                    ..Default::default()
+                })
+                .eos()
+        };
+        // A 2xx starts a tunnel, so its content-length does not count the tunneled data.
+        for (id, status, length) in [(1, 200, 0), (3, 202, 5)] {
+            srv.recv_frame(connect(id)).await;
+            srv.send_frame(
+                frames::headers(id)
+                    .response(status)
+                    .field("content-length", length),
+            )
+            .await;
+            srv.send_frame(frames::data(id, "tunneled").eos()).await;
+        }
+        // Any other status keeps the content-length rules.
+        srv.recv_frame(connect(5)).await;
+        srv.send_frame(frames::headers(5).response(407).field("content-length", 2))
+            .await;
+        srv.send_frame(frames::data(5, "tunneled")).await;
+        srv.recv_frame(frames::reset(5).protocol_error()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        tokio::spawn(async {
+            h2.await.expect("connection failed");
+        });
+        let connect = || {
+            Request::builder()
+                .method(Method::CONNECT)
+                .uri("https://tunnel.example.com:8443/")
+                .body(())
+                .unwrap()
+        };
+        for _ in 0..2 {
+            let (response, _) = client.send_request(connect(), true).unwrap();
+            let mut body = response.await.unwrap().into_body();
+            assert_eq!(body.data().await.unwrap().unwrap(), "tunneled");
+            assert!(body.data().await.is_none());
+        }
+        let (response, _) = client.send_request(connect(), true).unwrap();
+        let mut body = response.await.unwrap().into_body();
+        let _ = body.data().await.unwrap().unwrap_err();
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
 async fn reject_none_zero_content_length_header_with_end_stream() {
     h2_support::trace_init!();
     let (io, mut srv) = mock::new();

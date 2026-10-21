@@ -131,6 +131,10 @@ pub(super) enum InitialWindow {
 pub enum ContentLength {
     Omitted,
     Head,
+    /// The request was CONNECT: a 2xx response starts a tunnel instead of having content, and
+    /// the client ignores its content-length.
+    /// <https://www.rfc-editor.org/rfc/rfc9110#section-9.3.6>
+    Connect,
     Remaining(u64),
 }
 
@@ -603,7 +607,15 @@ impl store::Next for NextResetExpire {
 // ===== impl ContentLength =====
 
 impl ContentLength {
-    pub fn is_head(&self) -> bool {
-        matches!(*self, Self::Head)
+    /// Whether a response with this `status` has content whose length a content-length counts.
+    ///
+    /// Responses to HEAD and 2xx responses to CONNECT have none; the latter start a tunnel.
+    /// <https://www.rfc-editor.org/rfc/rfc9110#section-6.4.1>
+    pub fn has_content(&self, status: Option<http::StatusCode>) -> bool {
+        match *self {
+            Self::Head => false,
+            Self::Connect => !status.is_some_and(|status| status.is_success()),
+            Self::Omitted | Self::Remaining(_) => true,
+        }
     }
 }
