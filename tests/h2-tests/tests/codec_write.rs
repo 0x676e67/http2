@@ -59,8 +59,8 @@ async fn write_continuation_frames() {
 
 #[tokio::test]
 async fn client_settings_header_table_size() {
-    // A server sets the SETTINGS_HEADER_TABLE_SIZE to 0, test that the
-    // client doesn't send indexed headers.
+    // A server sets SETTINGS_HEADER_TABLE_SIZE to 0. Incremental literals are
+    // still valid, but each one clears the table and cannot be retained.
     h2_support::trace_init!();
 
     let io = mock_io::Builder::new()
@@ -76,15 +76,15 @@ async fn client_settings_header_table_size() {
         .write(frames::SETTINGS_ACK)
         // Write GET / (1st, applies the new table size immediately)
         .write(&[
-            0, 0, 0x11, 1, 5, 0, 0, 0, 1, 0x20, 0x82, 0x87, 0x1, 0x8B, 0x9D, 0x29, 0xAC, 0x4B,
+            0, 0, 0x11, 1, 5, 0, 0, 0, 1, 0x20, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B,
             0x8F, 0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84,
         ])
         // Read response
         .read(&[0, 0, 1, 1, 5, 0, 0, 0, 1, 137])
-        // Write GET / (2nd, doesn't use indexed headers)
-        // - Sends :authority as literal instead of indexed
+        // Write GET / (2nd, :authority is still a literal because the first
+        // incremental representation could not remain in a zero-sized table)
         .write(&[
-            0, 0, 0x10, 1, 5, 0, 0, 0, 3, 0x82, 0x87, 0x1, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
+            0, 0, 0x10, 1, 5, 0, 0, 0, 3, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
             0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84,
         ])
         .read(&[0, 0, 1, 1, 5, 0, 0, 0, 3, 137])
