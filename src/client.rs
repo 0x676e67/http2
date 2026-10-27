@@ -851,9 +851,10 @@ impl Builder {
     /// 0. If `max` is set to 0, then the remote will not be permitted to
     /// initiate streams.
     ///
-    /// Note that streams in the reserved state, i.e., push promises that have
-    /// been reserved but the stream has not started, do not count against this
-    /// setting.
+    /// Although the HTTP/2 specification excludes streams in the reserved state
+    /// from this limit, `http2` counts reserved push streams against this setting
+    /// to protect resources. This includes push promises whose response streams
+    /// have not yet started.
     ///
     /// Also note that if the remote *does* exceed the value set here, it is not
     /// a protocol level error. Instead, the `http2` library will immediately reset
@@ -1225,9 +1226,9 @@ impl Builder {
     /// When this budget is exhausted, the connection is closed with
     /// `ENHANCE_YOUR_CALM`.
     ///
-    /// By default, the budget is half the initial connection window, with a
-    /// minimum of 25,600 bytes. Increasing the connection window therefore
-    /// also increases the permitted framing overhead.
+    /// By default, the budget is half the target connection window, with a
+    /// minimum of 25,600 bytes. Changing the target window at runtime also
+    /// updates the permitted framing overhead.
     pub fn data_frame_budget(&mut self, budget: usize) -> &mut Self {
         self.data_frame_budget = proto::DataFrameBudget::Configured(budget);
         self
@@ -1568,9 +1569,7 @@ where
                 remote_reset_stream_max: builder.pending_accept_reset_stream_max,
                 local_error_reset_streams_max: builder.local_max_error_reset_streams,
                 settings: builder.settings,
-                data_frame_budget: builder
-                    .data_frame_budget
-                    .resolve(builder.initial_target_connection_window_size),
+                data_frame_budget: builder.data_frame_budget,
                 headers_pseudo_order: builder.headers_pseudo_order,
                 headers_priority: builder.headers_priority,
                 priorities: builder.priorities,
@@ -1603,7 +1602,8 @@ where
     /// [`FlowControl`] instances, no `WINDOW_UPDATE` frames will be sent
     /// out until the number of "in flight" bytes drops below `size`.
     ///
-    /// The default value is 65,535.
+    /// The default value is 65,535. The automatic small-DATA-frame budget is
+    /// updated to match this target.
     ///
     /// See [`FlowControl`] documentation for more details.
     ///
@@ -1675,6 +1675,19 @@ where
     fn set_initial_stream_window_size(&mut self, target: u32, advertised: u32) {
         self.inner
             .set_initial_stream_window_size(target, advertised);
+    }
+
+    /// Returns whether the server enabled the [extended CONNECT protocol][1].
+    ///
+    /// Returns `None` until the server's initial SETTINGS frame is applied. The value
+    /// is read from this connection without locking, so the task driving it can
+    /// publish changes. Clients must not send extended CONNECT before this returns
+    /// `Some(true)` ([RFC 8441 §3][2]).
+    ///
+    /// [1]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
+    /// [2]: https://datatracker.ietf.org/doc/html/rfc8441#section-3
+    pub fn extended_connect_protocol(&self) -> Option<bool> {
+        self.inner.remote_extended_connect()
     }
 }
 

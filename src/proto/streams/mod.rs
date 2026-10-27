@@ -15,7 +15,7 @@ mod sync;
 pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
 pub(crate) use self::send::PollReset;
-pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, StreamRef, Streams};
+pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, RecvOutcome, StreamRef, Streams};
 
 use self::buffer::Buffer;
 use self::counts::Counts;
@@ -83,11 +83,8 @@ pub struct Config {
     /// When this gets exceeded, we issue GOAWAYs.
     pub local_max_error_reset_streams: Option<usize>,
 
-    /// connection-level budget (in bytes) for DATA framing overhead.
-    ///
-    /// The default is half the initial connection window, with a minimum of
-    /// 25,600 bytes.
-    pub data_frame_budget: usize,
+    /// Connection-level budget policy for DATA framing overhead.
+    pub(crate) data_frame_budget: DataFrameBudget,
 
     /// Default `HEADERS` priority for requests without their own.
     pub headers_priority: Option<HeadersPriority>,
