@@ -151,13 +151,6 @@ where
         self.framed_write().has_capacity()
     }
 
-    /// Returns `Ready` when the codec can buffer a connection control frame.
-    ///
-    /// Unlike `poll_ready`, this does not wait for the upstream flush.
-    pub(crate) fn poll_send_capacity(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        self.framed_write().poll_capacity(cx)
-    }
-
     /// Buffer a frame.
     ///
     /// `poll_ready` or `poll_send_capacity` must be called first to ensure
@@ -181,6 +174,13 @@ where
     /// Shutdown the send half
     pub fn shutdown(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         self.framed_write().shutdown(cx)
+    }
+
+    /// Returns `Ready` when the codec can buffer a connection control frame.
+    ///
+    /// Unlike `poll_ready`, this does not wait for the upstream flush.
+    pub(crate) fn poll_send_capacity(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().poll_capacity(cx)
     }
 }
 

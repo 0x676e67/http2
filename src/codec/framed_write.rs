@@ -130,23 +130,6 @@ where
         Poll::Ready(Ok(()))
     }
 
-    /// Returns `Ready` when `buffer` can accept a frame, writing queued bytes
-    /// without flushing the upstream writer.
-    ///
-    /// Connection control frames use this so a pending upstream flush cannot
-    /// hold them behind the DATA frames that `poll_ready` callers queue next.
-    pub(crate) fn poll_capacity(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        if !self.encoder.has_capacity() {
-            ready!(self.poll_write_buffered(cx))?;
-
-            if !self.encoder.has_capacity() {
-                return Poll::Pending;
-            }
-        }
-
-        Poll::Ready(Ok(()))
-    }
-
     /// Returns whether a frame can be buffered without first flushing the
     /// underlying I/O object.
     pub(crate) fn has_capacity(&self) -> bool {
@@ -224,6 +207,23 @@ where
             self.final_flush_done = true;
         }
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    /// Returns `Ready` when `buffer` can accept a frame, writing queued bytes
+    /// without flushing the upstream writer.
+    ///
+    /// Connection control frames use this so a pending upstream flush cannot
+    /// hold them behind the DATA frames that `poll_ready` callers queue next.
+    pub(crate) fn poll_capacity(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        if !self.encoder.has_capacity() {
+            ready!(self.poll_write_buffered(cx))?;
+
+            if !self.encoder.has_capacity() {
+                return Poll::Pending;
+            }
+        }
+
+        Poll::Ready(Ok(()))
     }
 }
 
