@@ -716,7 +716,7 @@ impl Inner {
             let is_end_stream = frame.is_end_stream();
             let payload_len = frame.payload().len();
             // Only DATA retained for the application contributes to the
-            // buffering budget. Empty frames keep their separate lifetime
+            // buffering budget. Empty frames keep their separate consecutive
             // limit even when the stream is no longer receiving.
             let should_record_data_frame =
                 payload_len == 0 || (stream.is_recv && !stream.state.is_local_error());
@@ -728,6 +728,11 @@ impl Inner {
                     tracing::debug!("too many small DATA frames");
                     Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_data_frames")
                 });
+            }
+            // Any accepted payload ends a run of empty frames, including
+            // payload still in flight after the stream was reset or released.
+            if res.is_ok() && payload_len != 0 {
+                counts.reset_empty_data_frames();
             }
 
             // Any stream error after receiving a DATA frame means
