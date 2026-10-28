@@ -1883,6 +1883,78 @@ async fn client_decrease_initial_window_size() {
 }
 
 #[tokio::test]
+async fn client_decrease_initial_window_size_after_release() {
+    h2_support::trace_init!();
+
+    // Capacity released before the SETTINGS ACK stays below the
+    // WINDOW_UPDATE threshold until the smaller window applies. Cover both
+    // the shared and the per-request stream window baselines.
+    for stream_window in [None, Some(80_000)] {
+        let (io, mut srv) = mock::new();
+
+        let srv = async move {
+            let settings = srv.assert_client_handshake().await;
+            assert_default_settings!(settings);
+            srv.recv_frame(
+                frames::headers(1)
+                    .request("GET", "https://http2.akamai.com/")
+                    .eos(),
+            )
+            .await;
+            if let Some(target) = stream_window {
+                srv.recv_frame(frames::window_update(1, target - 65_535))
+                    .await;
+            }
+            srv.send_frame(frames::headers(1).response(200)).await;
+            srv.send_frame(frames::data(1, vec![b'a'; 16_384])).await;
+            srv.send_frame(frames::data(1, vec![b'b'; 3_616])).await;
+
+            srv.recv_frame(frames::settings().initial_window_size(1))
+                .await;
+            srv.send_frame(frames::settings_ack()).await;
+            // The ACK leaves the stream window negative until this update.
+            srv.recv_frame(frames::window_update(1, 20_000)).await;
+            srv.send_frame(frames::data(1, "c").eos()).await;
+        };
+
+        let client = async move {
+            let mut builder = client::Builder::new();
+            if let Some(target) = stream_window {
+                builder.initial_stream_window_size(target);
+            }
+            let (mut client, mut conn) = builder.handshake::<_, Bytes>(io).await.unwrap();
+
+            let res_fut = client.get("https://http2.akamai.com/");
+            let mut body = conn
+                .drive(async move {
+                    let mut body = res_fut.await.expect("response").into_body();
+                    for _ in 0..2 {
+                        let buf = body.data().await.expect("data").expect("data");
+                        body.flow_control().release_capacity(buf.len()).unwrap();
+                    }
+                    body
+                })
+                .await;
+
+            conn.set_initial_window_size(1).expect("update");
+
+            let eos = async move {
+                let buf = body.data().await.expect("data").expect("data");
+                assert_eq!(buf.len(), 1);
+                assert!(body.data().await.is_none(), "eos");
+            };
+            join(async move { conn.await.expect("client") }, eos).await;
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), join(srv, client))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("stream_window={:?}: WINDOW_UPDATE not sent", stream_window)
+            });
+    }
+}
+
+#[tokio::test]
 async fn server_target_window_size() {
     h2_support::trace_init!();
     let (io, mut client) = mock::new();
