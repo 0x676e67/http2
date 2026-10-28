@@ -276,14 +276,22 @@ impl Send {
         // on idle streams and §6.4 says RST_STREAM on idle is a PROTOCOL_ERROR.
         // Keep the queued HEADERS so the stream opens, then send the reset
         // immediately after.
-        if !stream.is_pending_open {
-            // Otherwise, drop any buffered DATA/HEADERS and only send the
-            // reset.
-            //
-            // Note that we don't call `self.recv_err` because we want to enqueue
-            // the reset frame before transitioning the stream inside
-            // `reclaim_all_capacity`.
-            self.prioritize.clear_queue(buffer, stream);
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1
+        let headers = if stream.is_pending_open {
+            stream.pending_send.pop_front(buffer)
+        } else {
+            None
+        };
+
+        // Drop everything else, including DATA that flow control could hold
+        // ahead of the reset indefinitely.
+        //
+        // Note that we don't call `self.recv_err` because we want to enqueue
+        // the reset frame before transitioning the stream inside
+        // `reclaim_all_capacity`.
+        self.prioritize.clear_queue(buffer, stream);
+        if let Some(headers) = headers {
+            stream.pending_send.push_front(buffer, headers);
         }
 
         let frame = frame::Reset::new(stream.id, reason);

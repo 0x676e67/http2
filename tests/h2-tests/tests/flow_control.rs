@@ -2208,6 +2208,45 @@ async fn scheduled_reset_with_excess_buffered_data_is_cleaned_up() {
 }
 
 #[tokio::test]
+async fn reset_before_open_with_blocked_data_sends_rst() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv
+            .assert_client_handshake_with_settings(frames::settings().initial_window_size(0))
+            .await;
+        assert_default_settings!(settings);
+
+        srv.recv_frame(frames::headers(1).request("POST", "https://example.com/"))
+            .await;
+        // The PING ACK is a barrier: RST_STREAM must already be ahead of it.
+        srv.send_frame(frames::ping([1; 8])).await;
+        srv.recv_frame(frames::reset(1).cancel()).await;
+        srv.recv_frame(frames::ping([1; 8]).pong()).await;
+    };
+
+    let client = async move {
+        let (mut client, conn) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+        let (response, mut stream) = client.send_request(request, false).unwrap();
+        // Reset before the connection opens the stream, with DATA the zero
+        // stream window never lets through.
+        stream.send_data(vec![0u8; 10].into(), false).unwrap();
+        stream.send_reset(Reason::CANCEL);
+        drop(stream);
+        drop(response);
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
 async fn data_padding() {
     h2_support::trace_init!();
     let (io, mut srv) = mock::new();
