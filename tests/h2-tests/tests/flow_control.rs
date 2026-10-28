@@ -2044,6 +2044,230 @@ async fn reset_stream_waiting_for_capacity() {
     join(srv, client).await;
 }
 
+#[tokio::test]
+async fn reset_stream_waiting_for_capacity_is_released() {
+    // A stream reset while queued for connection capacity, with its handles
+    // already dropped, must be released once that queue reaches it.
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let (reset_seen_tx, reset_seen_rx) = oneshot::channel();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(frames::headers(1).request("POST", "https://example.com/"))
+            .await;
+        srv.recv_frame(frames::headers(3).request("POST", "https://example.com/"))
+            .await;
+        srv.recv_frame(frames::data(1, vec![0; 16384])).await;
+        srv.recv_frame(frames::data(1, vec![0; 16384])).await;
+        srv.recv_frame(frames::data(1, vec![0; 16384])).await;
+        srv.recv_frame(frames::data(1, vec![0; 16383]).eos()).await;
+        srv.send_frame(frames::reset(3).refused()).await;
+        reset_seen_rx.await.unwrap();
+        // Stream 3 is popped from the capacity queue here.
+        srv.send_frame(frames::window_update(0, 1)).await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::handshake(io).await.unwrap();
+        let request = || Request::post("https://example.com/").body(()).unwrap();
+        let (resp1, mut send1) = client.send_request(request(), false).unwrap();
+        let (resp3, mut send3) = client.send_request(request(), false).unwrap();
+        // Use up the connection window, then queue stream 3 for more.
+        send1.send_data(vec![0; 65535].into(), true).unwrap();
+        send3.send_data(vec![0; 1].into(), true).unwrap();
+        drop(send1);
+
+        let err = conn.drive(resp3).await.unwrap_err();
+        assert_eq!(err.reason(), Some(Reason::REFUSED_STREAM));
+        drop(send3);
+        reset_seen_tx.send(()).unwrap();
+
+        let resp1 = conn.drive(resp1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+        drop(resp1);
+        assert_eq!(client.num_wired_streams(), 0);
+
+        drop(client);
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn cancel_stream_waiting_for_capacity_sends_reset() {
+    // Cancelling a stream queued for connection capacity hands its capacity
+    // back through that queue, which pops the stream itself. It must stay in
+    // the store until its RST_STREAM is sent.
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(frames::headers(1).request("POST", "https://example.com/"))
+            .await;
+        // Let the stream window exceed the connection window.
+        srv.send_frame(frames::window_update(1, 100_000)).await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.recv_frame(frames::reset(1).cancel()).await;
+    };
+
+    let client = async move {
+        // No reset expiration slot, so the reset stream is releasable at once.
+        let (mut client, mut conn) = client::Builder::new()
+            .max_concurrent_reset_streams(0)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        let request = Request::post("https://example.com/").body(()).unwrap();
+        let (resp, mut stream) = client.send_request(request, false).unwrap();
+        let resp = conn.drive(resp).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Takes the whole connection window and queues for the rest.
+        stream.reserve_capacity(100_000);
+        stream.send_data(vec![0; 10].into(), false).unwrap();
+        drop(stream);
+        drop(resp);
+
+        drop(client);
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn connection_error_pops_reset_stream_waiting_for_capacity() {
+    // Stream 5 is cancelled while queued for connection capacity. Its RST_STREAM
+    // waits behind stream 3's DATA on a blocked socket, so it is still linked
+    // when GOAWAY or EOF hands stream 1's capacity back inside `for_each`.
+    h2_support::trace_init!();
+    for eof in [false, true] {
+        let (io, mut srv) = mock::new();
+        let (ready_tx, ready_rx) = oneshot::channel();
+
+        let srv = async move {
+            let settings = srv.assert_client_handshake().await;
+            assert_default_settings!(settings);
+            for id in [1, 3, 5] {
+                srv.recv_frame(frames::headers(id).request("POST", "https://example.com/"))
+                    .await;
+            }
+            ready_tx.send(()).unwrap();
+            srv.buffer_bytes(1).await;
+            if eof {
+                drop(srv);
+            } else {
+                srv.send_frame(frames::go_away(0)).await;
+                while srv.next().await.is_some() {}
+            }
+        };
+
+        let client = async move {
+            let (mut client, mut conn) = client::Builder::new()
+                .max_concurrent_reset_streams(0)
+                .handshake::<_, Bytes>(io)
+                .await
+                .unwrap();
+            let request = || Request::post("https://example.com/").body(()).unwrap();
+            let (resp1, mut send1) = client.send_request(request(), false).unwrap();
+            let (_resp3, mut send3) = client.send_request(request(), false).unwrap();
+            let (resp5, mut send5) = client.send_request(request(), false).unwrap();
+            conn.drive(ready_rx).await.unwrap();
+
+            send1.reserve_capacity(100);
+            send3.reserve_capacity(65_435);
+            send5.send_data(vec![0; 10].into(), false).unwrap();
+            drop(send5);
+            drop(resp5);
+            send3.send_data(vec![0; 20_000].into(), false).unwrap();
+
+            let _ = conn.drive(resp1).await;
+            drop(send1);
+            drop(send3);
+            drop(client);
+            let _ = conn.await;
+        };
+
+        join(srv, client).await;
+    }
+}
+
+#[tokio::test]
+async fn reused_stream_id_survives_capacity_queue_eviction() {
+    // Stream 3 is reset and unlinked while still queued for connection
+    // capacity. Late HEADERS on id 3 create a new entry to reset them, which
+    // evicting the old entry must not unlink, outside or inside `for_each`.
+    h2_support::trace_init!();
+    for mode in ["window_update", "go_away", "eof"] {
+        let (io, mut srv) = mock::new();
+        let (opened_tx, opened_rx) = oneshot::channel();
+
+        let srv = async move {
+            let settings = srv.assert_client_handshake().await;
+            assert_default_settings!(settings);
+            for id in [1, 3] {
+                srv.recv_frame(frames::headers(id).request("POST", "https://example.com/"))
+                    .await;
+            }
+            opened_tx.send(()).unwrap();
+            srv.recv_frame(frames::reset(3).cancel()).await;
+            srv.send_frame(frames::headers(3).response(200)).await;
+            match mode {
+                "window_update" => {
+                    srv.send_frame(frames::window_update(0, 1)).await;
+                    // Must still hit the new entry, not make another one.
+                    srv.send_frame(frames::data(3, vec![0; 10])).await;
+                    srv.send_frame(frames::headers(1).response(200).eos()).await;
+                    let mut resets = 0;
+                    while let Some(frame) = srv.next().await {
+                        if let h2::frame::Frame::Reset(reset) = frame.unwrap() {
+                            resets += usize::from(reset.stream_id() == 3);
+                        }
+                    }
+                    assert_eq!(resets, 1);
+                }
+                "go_away" => {
+                    srv.send_frame(frames::go_away(0)).await;
+                    while srv.next().await.is_some() {}
+                }
+                _ => drop(srv),
+            }
+        };
+
+        let client = async move {
+            let (mut client, mut conn) = client::Builder::new()
+                .max_concurrent_reset_streams(0)
+                .handshake::<_, Bytes>(io)
+                .await
+                .unwrap();
+            let request = || Request::post("https://example.com/").body(()).unwrap();
+            let (resp1, mut send1) = client.send_request(request(), false).unwrap();
+            let (resp3, mut send3) = client.send_request(request(), false).unwrap();
+            conn.drive(opened_rx).await.unwrap();
+
+            // Stream 1 holds the connection window, stream 3 queues for more.
+            send1.reserve_capacity(65_535);
+            send3.send_data(vec![0; 1].into(), false).unwrap();
+            send3.send_reset(Reason::CANCEL);
+            drop(send3);
+            drop(resp3);
+
+            let _ = conn.drive(resp1).await;
+            drop(send1);
+            drop(client);
+            let _ = conn.await;
+        };
+
+        join(srv, client).await;
+    }
+}
+
 // Regression test for https://github.com/hyperium/h2/pull/893
 #[tokio::test]
 async fn reserve_capacity_then_cancel_does_not_leak() {
