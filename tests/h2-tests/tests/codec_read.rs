@@ -255,3 +255,130 @@ async fn read_goaway_stream_id_not_zero() {
 
     poll_err!(codec);
 }
+
+// ===== Frame load errors =====
+
+#[tokio::test]
+async fn read_frame_load_error_codes() {
+    fn frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len() as u32;
+        let mut frame = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
+        frame.extend_from_slice(&stream_id.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    let cases = [
+        // SETTINGS ACK with a payload, and a length that is not a multiple of 6
+        (
+            "SETTINGS ACK",
+            frame(4, 0x1, 0, &[0, 3, 0, 0, 0, 1]),
+            None,
+            Reason::FRAME_SIZE_ERROR,
+        ),
+        (
+            "SETTINGS",
+            frame(4, 0, 0, &[0, 3, 0, 0, 1]),
+            None,
+            Reason::FRAME_SIZE_ERROR,
+        ),
+        // INITIAL_WINDOW_SIZE = 2^31
+        (
+            "INITIAL_WINDOW_SIZE",
+            frame(4, 0, 0, &[0, 4, 0x80, 0, 0, 0]),
+            None,
+            Reason::FLOW_CONTROL_ERROR,
+        ),
+        // ENABLE_PUSH = 2 keeps PROTOCOL_ERROR
+        (
+            "ENABLE_PUSH",
+            frame(4, 0, 0, &[0, 2, 0, 0, 0, 2]),
+            None,
+            Reason::PROTOCOL_ERROR,
+        ),
+        (
+            "PING",
+            frame(6, 0, 0, &[0; 7]),
+            None,
+            Reason::FRAME_SIZE_ERROR,
+        ),
+        (
+            "WINDOW_UPDATE",
+            frame(8, 0, 0, &[0, 0, 1]),
+            None,
+            Reason::FRAME_SIZE_ERROR,
+        ),
+        // A zero increment keeps PROTOCOL_ERROR
+        (
+            "WINDOW_UPDATE zero",
+            frame(8, 0, 0, &[0; 4]),
+            None,
+            Reason::PROTOCOL_ERROR,
+        ),
+        (
+            "RST_STREAM",
+            frame(3, 0, 1, &[0, 0, 8]),
+            None,
+            Reason::FRAME_SIZE_ERROR,
+        ),
+        (
+            "GOAWAY",
+            frame(7, 0, 0, &[0; 7]),
+            None,
+            Reason::FRAME_SIZE_ERROR,
+        ),
+        // A PRIORITY length error only resets its stream
+        (
+            "PRIORITY",
+            frame(2, 0, 1, &[0, 0, 0, 3]),
+            Some(1),
+            Reason::FRAME_SIZE_ERROR,
+        ),
+        // PADDED without room for the Pad Length field
+        (
+            "DATA",
+            frame(0, 0x8, 1, &[]),
+            None,
+            Reason::FRAME_SIZE_ERROR,
+        ),
+        // Padding longer than the payload keeps PROTOCOL_ERROR
+        (
+            "DATA padding",
+            frame(0, 0x8, 1, &[2, 0]),
+            None,
+            Reason::PROTOCOL_ERROR,
+        ),
+        (
+            "HEADERS",
+            frame(1, 0x8 | 0x4, 1, &[]),
+            None,
+            Reason::FRAME_SIZE_ERROR,
+        ),
+        // PRIORITY flag without the 5 octet stream dependency
+        (
+            "HEADERS priority",
+            frame(1, 0x20 | 0x4, 1, &[0, 0, 0, 3]),
+            None,
+            Reason::FRAME_SIZE_ERROR,
+        ),
+        // Missing the 4 octet Promised Stream ID
+        (
+            "PUSH_PROMISE",
+            frame(5, 0x4, 1, &[0, 0, 2]),
+            None,
+            Reason::FRAME_SIZE_ERROR,
+        ),
+    ];
+
+    for (name, input, reset_id, reason) in cases {
+        let mut codec = Codec::new(mock_io::Builder::new().read(&input).build());
+        let actual = poll_err!(codec);
+        match (reset_id, actual) {
+            (None, proto::Error::GoAway(_, actual, _)) => assert_eq!(actual, reason, "{name}"),
+            (Some(id), proto::Error::Reset(actual_id, actual, _)) => {
+                assert_eq!((actual_id, actual), (StreamId::from(id), reason), "{name}")
+            }
+            (_, other) => panic!("{}: unexpected error {:?}", name, other),
+        }
+    }
+}
