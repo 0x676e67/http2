@@ -2518,3 +2518,37 @@ async fn frame_on_pending_open_stream_is_conn_error() {
         join(srv, client).await;
     }
 }
+
+#[tokio::test]
+async fn read_activity_and_abrupt_shutdown() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let (tx, rx) = futures::channel::oneshot::channel();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.send_frame(frames::ping([1; 8])).await;
+        srv.recv_frame(frames::ping([1; 8]).pong()).await;
+        tx.send(()).unwrap();
+        srv.recv_frame(frames::go_away(0).reason(Reason::INTERNAL_ERROR))
+            .await;
+        srv.recv_eof().await;
+    };
+
+    let client = async move {
+        let (client, mut conn) = client::handshake(io).await.expect("handshake");
+        conn.drive(rx).await.unwrap();
+        assert!(conn.take_read_activity());
+        // A poll that reads nothing leaves it unset.
+        conn.drive(util::yield_once()).await;
+        assert!(!conn.take_read_activity());
+
+        // The reason survives the close that follows the last handle.
+        drop(client);
+        conn.abrupt_shutdown(Reason::INTERNAL_ERROR);
+        conn.await.expect("client");
+    };
+
+    join(srv, client).await;
+}

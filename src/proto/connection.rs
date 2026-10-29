@@ -52,6 +52,9 @@ where
     /// Ping/pong handler
     ping_pong: PingPong,
 
+    /// Whether bytes were read since `take_read_activity` was last called.
+    read_activity: bool,
+
     /// Connection settings
     settings: Settings,
 
@@ -207,6 +210,7 @@ where
                 go_away: GoAway::new(),
                 pending_refusal: None,
                 ping_pong: PingPong::new(config.preface_ping),
+                read_activity: false,
                 settings: Settings::new(config.settings),
                 streams,
                 #[cfg(feature = "tracing")]
@@ -540,6 +544,7 @@ where
             let frame = Pin::new(&mut self.codec).poll_next(cx);
             if self.codec.take_read_activity() {
                 self.inner.ping_pong.record_read();
+                self.inner.read_activity = true;
             }
 
             match self.inner.as_dyn().recv_frame(ready!(frame?))? {
@@ -564,6 +569,11 @@ where
 
     fn clear_expired_reset_streams(&mut self) {
         self.inner.streams.clear_expired_reset_streams();
+    }
+
+    /// Returns whether bytes were read since the last call.
+    pub(crate) fn take_read_activity(&mut self) -> bool {
+        std::mem::take(&mut self.inner.read_activity)
     }
 
     /// Returns the remote extended CONNECT setting, or `None` before its initial SETTINGS.

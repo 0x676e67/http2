@@ -1634,6 +1634,25 @@ where
         self.inner.take_user_pings().map(PingPong::new)
     }
 
+    /// Returns whether any bytes were read from the server since the last call.
+    ///
+    /// Bytes of frames the connection ignores or has not fully received also
+    /// count, so this measures read idleness for keep-alive logic.
+    pub fn take_read_activity(&mut self) -> bool {
+        self.inner.take_read_activity()
+    }
+
+    /// Sets the connection to a GOAWAY state.
+    ///
+    /// Does not terminate the connection. Must continue being polled to close
+    /// connection.
+    ///
+    /// After flushing the GOAWAY frame, the connection is closed. Any
+    /// outstanding streams do not prevent the connection from closing.
+    pub fn abrupt_shutdown(&mut self, reason: Reason) {
+        self.inner.go_away_from_user(reason);
+    }
+
     /// Returns the maximum number of concurrent streams that may be initiated
     /// by this client.
     ///
