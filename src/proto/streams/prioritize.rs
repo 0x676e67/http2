@@ -9,10 +9,9 @@ use crate::codec::UserError::*;
 use crate::tracing;
 
 use bytes::buf::Take;
-use smallvec::SmallVec;
 use std::{
     cmp::{self, Ordering},
-    fmt, io, mem,
+    fmt, io, iter, mem,
     task::Waker,
 };
 
@@ -79,9 +78,12 @@ enum InFlightData {
 const MAX_DATA_FRAME_PARTS: usize = 63;
 
 pub(crate) struct Prioritized<B> {
-    // The buffer, then any queued chunks coalesced after it. Only the last
-    // part can be partly taken.
-    parts: SmallVec<[Take<B>; 1]>,
+    // The buffer
+    inner: Take<B>,
+
+    // Queued chunks coalesced after the buffer. Only the last part can be
+    // partly taken.
+    rest: Vec<Take<B>>,
 
     // Whether the chunk of the last part ends the stream
     end_of_stream: bool,
@@ -623,21 +625,18 @@ impl Prioritize {
         &mut self,
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
-        mut frame: frame::Data<Prioritized<B>>,
+        frame: frame::Data<Prioritized<B>>,
     ) -> bool
     where
         B: Buf,
     {
         tracing::trace!(
             ?frame,
-            sz = frame
-                .payload()
-                .parts
-                .last()
-                .map_or(0, |part| part.get_ref().remaining()),
+            sz = frame.payload().last().get_ref().remaining(),
             "reclaimed"
         );
 
+        let mut eos = false;
         let key = frame.payload().stream;
 
         match mem::replace(&mut self.in_flight_data_frame, InFlightData::Nothing) {
@@ -651,13 +650,16 @@ impl Prioritize {
             }
         }
 
-        // TODO: Ensure fully written
-        // Earlier parts were taken whole, so only the last can have bytes left
-        let Some(last) = frame.payload_mut().parts.pop() else {
-            return false;
-        };
-        let eos = frame.payload().end_of_stream;
-        let mut frame = frame.map(|_| last.into_inner());
+        let mut frame = frame.map(|mut prioritized| {
+            // TODO: Ensure fully written
+            eos = prioritized.end_of_stream;
+            // Earlier parts were taken whole, so only the last can have bytes left
+            prioritized
+                .rest
+                .pop()
+                .unwrap_or(prioritized.inner)
+                .into_inner()
+        });
 
         if frame.payload().has_remaining() {
             let mut stream = store.resolve(key);
@@ -849,7 +851,8 @@ impl Prioritize {
                     // Wrap the frame's data payload to ensure that the
                     // correct amount of data gets written.
                     let mut frame = frame.map(|buf| Prioritized {
-                        parts: SmallVec::from_buf([buf.take(len as usize)]),
+                        inner: buf.take(len as usize),
+                        rest: Vec::new(),
                         end_of_stream: eos,
                         stream: stream.key(),
                     });
@@ -998,6 +1001,11 @@ impl Prioritize {
 // ===== impl Prioritized =====
 
 impl<B: Buf> Prioritized<B> {
+    /// The last part, the only one that can be partly taken.
+    fn last(&self) -> &Take<B> {
+        self.rest.last().unwrap_or(&self.inner)
+    }
+
     /// Appends the stream's queued DATA chunks, up to `room` bytes.
     ///
     /// Stops at a non-DATA frame, a partly taken chunk or END_STREAM. Returns
@@ -1015,7 +1023,7 @@ impl<B: Buf> Prioritized<B> {
                 // Empty chunks add no part, so they merge even into a full frame
                 Some(Frame::Data(frame))
                     if !frame.payload().has_remaining()
-                        || (room > 0 && self.parts.len() < MAX_DATA_FRAME_PARTS) =>
+                        || (room > 0 && self.rest.len() + 1 < MAX_DATA_FRAME_PARTS) =>
                 {
                     frame
                 }
@@ -1032,7 +1040,7 @@ impl<B: Buf> Prioritized<B> {
             self.end_of_stream = frame.is_end_stream();
 
             if len > 0 {
-                self.parts.push(frame.into_payload().take(len));
+                self.rest.push(frame.into_payload().take(len));
                 added += len;
                 room -= len;
             }
@@ -1054,11 +1062,23 @@ where
     B: Buf,
 {
     fn remaining(&self) -> usize {
-        self.parts.iter().map(Buf::remaining).sum()
+        let n = self.inner.remaining();
+
+        if self.rest.is_empty() {
+            return n;
+        }
+
+        n + self.rest.iter().map(Buf::remaining).sum::<usize>()
     }
 
     fn chunk(&self) -> &[u8] {
-        self.parts
+        let chunk = self.inner.chunk();
+
+        if !chunk.is_empty() || self.rest.is_empty() {
+            return chunk;
+        }
+
+        self.rest
             .iter()
             .map(Buf::chunk)
             .find(|chunk| !chunk.is_empty())
@@ -1066,9 +1086,13 @@ where
     }
 
     fn chunks_vectored<'a>(&'a self, dst: &mut [std::io::IoSlice<'a>]) -> usize {
+        if self.rest.is_empty() {
+            return self.inner.chunks_vectored(dst);
+        }
+
         let mut n = 0;
 
-        for part in &self.parts {
+        for part in iter::once(&self.inner).chain(&self.rest) {
             let cnt = part.chunks_vectored(&mut dst[n..]);
             let len: usize = dst[n..n + cnt].iter().map(|slice| slice.len()).sum();
             n += cnt;
@@ -1083,7 +1107,11 @@ where
     }
 
     fn advance(&mut self, mut cnt: usize) {
-        for part in &mut self.parts {
+        if self.rest.is_empty() {
+            return self.inner.advance(cnt);
+        }
+
+        for part in iter::once(&mut self.inner).chain(&mut self.rest) {
             if cnt == 0 {
                 break;
             }
@@ -1098,14 +1126,8 @@ where
 impl<B: Buf> fmt::Debug for Prioritized<B> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("Prioritized")
-            .field(
-                "remaining",
-                &self
-                    .parts
-                    .last()
-                    .map_or(0, |part| part.get_ref().remaining()),
-            )
-            .field("parts", &self.parts.len())
+            .field("remaining", &self.last().get_ref().remaining())
+            .field("parts", &(self.rest.len() + 1))
             .field("end_of_stream", &self.end_of_stream)
             .field("stream", &self.stream)
             .finish()
@@ -1149,11 +1171,8 @@ mod tests {
         let mut store = Store::new();
         let mut stream = store.insert(StreamId::from(1), Stream::new(StreamId::from(1), 0, 0));
         let mut buf = Prioritized {
-            parts: SmallVec::from_vec(vec![
-                part(b"ab", b"", 2),
-                part(b"cd", b"ef", 3),
-                part(b"gh", b"", 2),
-            ]),
+            inner: part(b"ab", b"", 2),
+            rest: vec![part(b"cd", b"ef", 3), part(b"gh", b"", 2)],
             end_of_stream: false,
             stream: stream.key(),
         };
