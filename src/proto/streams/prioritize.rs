@@ -378,6 +378,8 @@ impl Prioritize {
         let _res = self.flow.assign_capacity(inc);
         debug_assert!(_res.is_ok());
 
+        let held_key = store.held_key();
+
         // Assign newly acquired capacity to streams pending capacity.
         while self.flow.available() > 0 {
             let stream = match self.pending_capacity.pop(store) {
@@ -387,9 +389,13 @@ impl Prioritize {
 
             // Streams pending capacity may have been reset before capacity
             // became available. In that case, the stream won't want any
-            // capacity, and so we shouldn't "transition" on it, but just evict
-            // it and continue the loop.
+            // capacity, so evict it. If this queue was all that kept it, free
+            // it; it was unlinked when it closed, so this is safe inside
+            // `Store::for_each`. The caller transitions its own stream.
             if !(stream.state.is_send_streaming() || stream.buffered_send_data > 0) {
+                if held_key != Some(stream.key()) && stream.is_released() {
+                    counts.transition_after(stream, false);
+                }
                 continue;
             }
 
