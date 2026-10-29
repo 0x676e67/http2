@@ -71,18 +71,9 @@ impl GoAway {
     pub fn go_away_now(&mut self, f: frame::GoAway) {
         self.close_now = true;
         // Keep the reason of a GOAWAY the user asked for.
-        if !self.is_user_initiated {
-            self.go_away_once(f);
+        if self.is_user_initiated {
+            return;
         }
-    }
-
-    pub fn go_away_from_user(&mut self, f: frame::GoAway) {
-        self.is_user_initiated = true;
-        self.close_now = true;
-        self.go_away_once(f);
-    }
-
-    fn go_away_once(&mut self, f: frame::GoAway) {
         if let Some(ref going_away) = self.going_away {
             // Prevent sending the same GOAWAY twice.
             if going_away.last_processed_id == f.last_stream_id() && going_away.reason == f.reason()
@@ -91,6 +82,13 @@ impl GoAway {
             }
         }
         self.go_away(f);
+    }
+
+    pub fn go_away_from_user(&mut self, f: frame::GoAway) {
+        // A later GOAWAY from the user still replaces an earlier one.
+        self.is_user_initiated = false;
+        self.go_away_now(f);
+        self.is_user_initiated = true;
     }
 
     /// Return if a GOAWAY has ever been scheduled.
