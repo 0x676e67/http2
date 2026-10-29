@@ -3,13 +3,11 @@ use crate::frame::{self, Ping};
 use crate::proto::{self, PingPayload};
 use crate::tracing;
 
-use super::streams::Mutex;
-
 use atomic_waker::AtomicWaker;
 use bytes::Buf;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWrite;
@@ -57,8 +55,11 @@ struct UserPingsRx(Arc<UserPingsInner>);
 #[derive(Debug)]
 struct UserPingsInner {
     state: AtomicUsize,
-    /// Payload of the last PING sent by the user.
-    payload: Mutex<PingPayload>,
+    /// Payload of the last user PING, split to avoid 64-bit atomics.
+    ///
+    /// `state` orders every access: the handle writes it only while empty,
+    /// and the connection reads it only after observing the pending PING.
+    payload: [AtomicU32; 2],
     /// Task to wake up the main `Connection`.
     ping_task: AtomicWaker,
     /// Task to wake up `share::PingPong::poll_pong`.
@@ -142,7 +143,7 @@ impl PingPong {
 
         let user_pings = Arc::new(UserPingsInner {
             state: AtomicUsize::new(USER_STATE_EMPTY),
-            payload: Mutex::new(Ping::USER),
+            payload: Default::default(),
             ping_task: AtomicWaker::new(),
             pong_task: AtomicWaker::new(),
         });
@@ -262,7 +263,7 @@ impl PingPong {
                     return Poll::Pending;
                 }
 
-                let payload = *users.0.payload.lock();
+                let payload = users.0.load_payload();
                 dst.buffer(Ping::new(payload).into())
                     .expect("invalid ping frame");
                 if let Some(ref mut preface_ping) = self.preface_ping {
@@ -353,11 +354,11 @@ impl PrefacePing {
 // ===== impl UserPings =====
 
 impl UserPings {
-    pub(crate) fn send_ping(&self, payload: PingPayload) -> Result<(), Option<proto::Error>> {
+    pub(crate) fn send_ping(&mut self, payload: PingPayload) -> Result<(), Option<proto::Error>> {
         // The connection reads the payload only after the exchange below
         // publishes the PING, so it is replaced only while none is pending.
         if self.0.state.load(Ordering::Acquire) == USER_STATE_EMPTY {
-            *self.0.payload.lock() = payload;
+            self.0.store_payload(payload);
         }
 
         let prev = self
@@ -384,7 +385,7 @@ impl UserPings {
         }
     }
 
-    pub(crate) fn poll_pong(&self, cx: &mut Context) -> Poll<Result<(), proto::Error>> {
+    pub(crate) fn poll_pong(&mut self, cx: &mut Context) -> Poll<Result<(), proto::Error>> {
         // Must register before checking state, in case state were to change
         // before we could register, and then the ping would just be lost.
         self.0.pong_task.register(cx.waker());
@@ -407,11 +408,30 @@ impl UserPings {
     }
 }
 
+// ===== impl UserPingsInner =====
+
+impl UserPingsInner {
+    fn store_payload(&self, [a, b, c, d, e, f, g, h]: PingPayload) {
+        self.payload[0].store(u32::from_ne_bytes([a, b, c, d]), Ordering::Relaxed);
+        self.payload[1].store(u32::from_ne_bytes([e, f, g, h]), Ordering::Relaxed);
+    }
+
+    fn load_payload(&self) -> PingPayload {
+        let [a, b, c, d] = self.payload[0].load(Ordering::Relaxed).to_ne_bytes();
+        let [e, f, g, h] = self.payload[1].load(Ordering::Relaxed).to_ne_bytes();
+        [a, b, c, d, e, f, g, h]
+    }
+}
+
 // ===== impl UserPingsRx =====
 
 impl UserPingsRx {
     fn receive_pong(&self, payload: &PingPayload) -> bool {
-        if *self.0.payload.lock() != *payload {
+        // Only the connection enters the pending pong state, and the handle
+        // keeps the payload until the pong is taken.
+        if self.0.state.load(Ordering::Acquire) != USER_STATE_PENDING_PONG
+            || self.0.load_payload() != *payload
+        {
             return false;
         }
 
