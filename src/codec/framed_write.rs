@@ -47,6 +47,9 @@ struct Encoder<B> {
     /// Max frame size, this is specified by the peer
     max_frame_size: FrameSize,
 
+    /// Local cap on DATA payloads, below `max_frame_size`
+    max_data_frame_size: Option<FrameSize>,
+
     /// Chain payloads bigger than this.
     chain_threshold: usize,
 
@@ -97,6 +100,7 @@ where
                 next: None,
                 last_data_frame: None,
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
+                max_data_frame_size: None,
                 chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
             },
@@ -134,6 +138,11 @@ where
     /// underlying I/O object.
     pub(crate) fn has_capacity(&self) -> bool {
         self.encoder.has_capacity()
+    }
+
+    /// Returns whether the upstream writer takes vectored writes.
+    pub(crate) fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     /// Buffer a frame.
@@ -373,6 +382,19 @@ impl<T, B> FramedWrite<T, B> {
     pub fn set_max_frame_size(&mut self, val: usize) {
         assert!(val <= frame::MAX_MAX_FRAME_SIZE as usize);
         self.encoder.max_frame_size = val as FrameSize;
+    }
+
+    /// Returns the max DATA payload size if a local cap was set
+    pub(crate) fn max_data_frame_size(&self) -> Option<usize> {
+        self.encoder
+            .max_data_frame_size
+            .map(|max| max.min(self.encoder.max_frame_size) as usize)
+    }
+
+    /// Caps DATA payloads whatever the peer's max frame size.
+    pub(crate) fn set_max_data_frame_size(&mut self, val: usize) {
+        self.encoder.max_data_frame_size =
+            Some(val.clamp(1, frame::MAX_MAX_FRAME_SIZE as usize) as FrameSize);
     }
 
     /// Set the peer's header table size.

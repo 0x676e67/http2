@@ -99,6 +99,16 @@ impl<T, B> Codec<T, B> {
         self.framed_write().set_max_frame_size(val)
     }
 
+    /// Returns the max DATA payload size if a local cap was set.
+    pub(crate) fn max_send_data_frame_size(&self) -> Option<usize> {
+        self.inner.get_ref().max_data_frame_size()
+    }
+
+    /// Caps DATA payloads sent to the peer, whatever its max frame size.
+    pub(crate) fn set_max_send_data_frame_size(&mut self, val: usize) {
+        self.framed_write().set_max_data_frame_size(val)
+    }
+
     /// Set the peer's header table size size.
     pub fn set_send_header_table_size(&mut self, val: usize) {
         self.framed_write().set_header_table_size(val)
@@ -149,6 +159,11 @@ where
     /// underlying I/O object.
     pub(crate) fn has_send_capacity(&mut self) -> bool {
         self.framed_write().has_capacity()
+    }
+
+    /// Returns whether the underlying I/O object takes vectored writes.
+    pub(crate) fn is_write_vectored(&self) -> bool {
+        self.inner.get_ref().is_write_vectored()
     }
 
     /// Buffer a frame.
