@@ -55,15 +55,15 @@ struct UserPingsRx(Arc<UserPingsInner>);
 #[derive(Debug)]
 struct UserPingsInner {
     state: AtomicUsize,
+    /// Task to wake up the main `Connection`.
+    ping_task: AtomicWaker,
+    /// Task to wake up `share::PingPong::poll_pong`.
+    pong_task: AtomicWaker,
     /// Payload of the last user PING, split to avoid 64-bit atomics.
     ///
     /// `state` orders every access: the handle writes it only while empty,
     /// and the connection reads it only after observing the pending PING.
     payload: [AtomicU32; 2],
-    /// Task to wake up the main `Connection`.
-    ping_task: AtomicWaker,
-    /// Task to wake up `share::PingPong::poll_pong`.
-    pong_task: AtomicWaker,
 }
 
 #[derive(Debug)]
@@ -103,38 +103,6 @@ impl PingPong {
         }
     }
 
-    pub(crate) fn preface_ping_mut(&mut self) -> Option<&mut PrefacePing> {
-        self.preface_ping.as_mut()
-    }
-
-    /// Sends a preface PING armed by an already buffered frame.
-    pub(crate) fn send_pending_preface_ping<T, B>(
-        &mut self,
-        cx: &mut Context,
-        dst: &mut Codec<T, B>,
-    ) -> Poll<io::Result<()>>
-    where
-        T: AsyncWrite + Unpin,
-        B: Buf,
-    {
-        if let Some(ref mut preface_ping) = self.preface_ping {
-            if !preface_ping.buffer_pending(dst) {
-                ready!(dst.poll_send_capacity(cx))?;
-                let buffered = preface_ping.buffer_pending(dst);
-                debug_assert!(buffered);
-            }
-        }
-
-        Poll::Ready(Ok(()))
-    }
-
-    /// Records read activity for the preface PING.
-    pub(crate) fn record_read(&mut self) {
-        if let Some(ref mut preface_ping) = self.preface_ping {
-            preface_ping.last_read = Instant::now();
-        }
-    }
-
     /// Can only be called once. If called a second time, returns `None`.
     pub(crate) fn take_user_pings(&mut self) -> Option<UserPings> {
         if self.user_pings.is_some() {
@@ -143,9 +111,9 @@ impl PingPong {
 
         let user_pings = Arc::new(UserPingsInner {
             state: AtomicUsize::new(USER_STATE_EMPTY),
-            payload: Default::default(),
             ping_task: AtomicWaker::new(),
             pong_task: AtomicWaker::new(),
+            payload: Default::default(),
         });
         self.user_pings = Some(UserPingsRx(user_pings.clone()));
         Some(UserPings(user_pings))
@@ -279,6 +247,38 @@ impl PingPong {
         }
 
         Poll::Ready(Ok(()))
+    }
+
+    pub(crate) fn preface_ping_mut(&mut self) -> Option<&mut PrefacePing> {
+        self.preface_ping.as_mut()
+    }
+
+    /// Sends a preface PING armed by an already buffered frame.
+    pub(crate) fn send_pending_preface_ping<T, B>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, B>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let Some(ref mut preface_ping) = self.preface_ping {
+            if !preface_ping.buffer_pending(dst) {
+                ready!(dst.poll_send_capacity(cx))?;
+                let buffered = preface_ping.buffer_pending(dst);
+                debug_assert!(buffered);
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Records read activity for the preface PING.
+    pub(crate) fn record_read(&mut self) {
+        if let Some(ref mut preface_ping) = self.preface_ping {
+            preface_ping.last_read = Instant::now();
+        }
     }
 }
 

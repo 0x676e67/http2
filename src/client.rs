@@ -1299,20 +1299,6 @@ impl Builder {
         self
     }
 
-    /// Sends a PING with the next HEADERS or non-empty DATA frame once nothing
-    /// has been read for longer than `threshold`.
-    ///
-    /// The PING follows HEADERS but precedes DATA, and its payload is a
-    /// big-endian counter starting at 1 that skips the payload of a user PING
-    /// in flight. Another PING is only sent after the previous one is
-    /// acknowledged; a missing ACK does not close the connection.
-    ///
-    /// See [RFC 9113 section 6.7](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.7).
-    pub fn preface_ping(&mut self, threshold: Duration) -> &mut Self {
-        self.preface_ping = Some(threshold);
-        self
-    }
-
     /// Creates a new configured HTTP/2 client backed by `io`.
     ///
     /// It is expected that `io` already be in an appropriate state to commence
@@ -1435,6 +1421,20 @@ impl Builder {
     /// ```
     pub fn initial_stream_window_size(&mut self, target: u32) -> &mut Self {
         self.initial_target_stream_window_size = Some(target);
+        self
+    }
+
+    /// Sends a PING with the next HEADERS or non-empty DATA frame once nothing
+    /// has been read for longer than `threshold`.
+    ///
+    /// The PING follows HEADERS but precedes DATA, and its payload is a
+    /// big-endian counter starting at 1 that skips the payload of a user PING
+    /// in flight. Another PING is only sent after the previous one is
+    /// acknowledged; a missing ACK does not close the connection.
+    ///
+    /// See [RFC 9113 section 6.7](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.7).
+    pub fn preface_ping(&mut self, threshold: Duration) -> &mut Self {
+        self.preface_ping = Some(threshold);
         self
     }
 }
