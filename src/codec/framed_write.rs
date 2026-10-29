@@ -25,6 +25,9 @@ pub struct FramedWrite<T, B> {
     inner: T,
     final_flush_done: bool,
 
+    /// Whether `inner` returned bytes since the last `take_read_activity`.
+    read_activity: bool,
+
     encoder: Encoder<B>,
 }
 
@@ -91,6 +94,7 @@ where
         FramedWrite {
             inner,
             final_flush_done: false,
+            read_activity: false,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
                 buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
@@ -134,6 +138,12 @@ where
     /// underlying I/O object.
     pub(crate) fn has_capacity(&self) -> bool {
         self.encoder.has_capacity()
+    }
+
+    /// Returns whether the encoder still has capacity after buffering `len`
+    /// more bytes.
+    pub(crate) fn has_capacity_after(&self, len: usize) -> bool {
+        self.encoder.has_capacity_after(len)
     }
 
     /// Buffer a frame.
@@ -327,9 +337,13 @@ where
     }
 
     fn has_capacity(&self) -> bool {
+        self.has_capacity_after(0)
+    }
+
+    fn has_capacity_after(&self, len: usize) -> bool {
         self.next.is_none()
             && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
-                >= self.min_buffer_capacity)
+                >= self.min_buffer_capacity.saturating_add(len))
     }
 
     fn is_empty(&self) -> bool {
@@ -347,6 +361,11 @@ impl<B> Encoder<B> {
 }
 
 impl<T, B> FramedWrite<T, B> {
+    /// Returns whether any bytes were read since the last call.
+    pub(crate) fn take_read_activity(&mut self) -> bool {
+        std::mem::take(&mut self.read_activity)
+    }
+
     /// Returns the max frame size that can be sent
     pub fn max_frame_size(&self) -> usize {
         self.encoder.max_frame_size()
@@ -379,7 +398,13 @@ impl<T: AsyncRead + Unpin, B> AsyncRead for FramedWrite<T, B> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let filled = buf.filled().len();
+        ready!(Pin::new(&mut self.inner).poll_read(cx, buf))?;
+        if buf.filled().len() > filled {
+            self.read_activity = true;
+        }
+
+        Poll::Ready(Ok(()))
     }
 }
 

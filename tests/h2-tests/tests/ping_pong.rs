@@ -183,3 +183,86 @@ async fn user_notifies_when_connection_closes() {
         "broken pipe",
     );
 }
+
+#[tokio::test]
+async fn preface_ping_after_read_idle() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let (tx, rx) = oneshot::channel();
+
+    let large = build_large_headers();
+    let get = large.iter().fold(
+        frames::headers(3).request("GET", "https://http2.akamai.com/"),
+        |frame, &(name, ref value)| frame.field(name, &value[..]),
+    );
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        // No PING right after the handshake, nor for empty DATA.
+        srv.recv_frame(frames::headers(1).request("POST", "https://http2.akamai.com/"))
+            .await;
+        srv.recv_frame(frames::data(1, "")).await;
+        // The PING follows HEADERS and all of its CONTINUATION frames, and no
+        // other PING is sent while it awaits its ACK.
+        srv.recv_frame(get.eos()).await;
+        srv.recv_frame(frames::ping(1u64.to_be_bytes())).await;
+        srv.recv_frame(frames::data(1, "")).await;
+        srv.recv_frame(frames::data(1, "a")).await;
+        srv.send_frame(frames::ping(1u64.to_be_bytes()).pong())
+            .await;
+        srv.send_frame(frames::headers(3).response(204).eos()).await;
+        // Bytes of an ignored unknown frame also reset the idle time.
+        idle_ms(400).await;
+        srv.send_bytes(&[0, 0, 0, 0xfa, 0, 0, 0, 0, 0]).await;
+        tx.send(()).unwrap();
+        srv.recv_frame(frames::data(1, "b")).await;
+        // The PING precedes DATA.
+        srv.recv_frame(frames::ping(2u64.to_be_bytes())).await;
+        srv.recv_frame(frames::data(1, "c").eos()).await;
+        srv.send_frame(frames::ping(2u64.to_be_bytes()).pong())
+            .await;
+        srv.send_frame(frames::headers(1).response(204).eos()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .preface_ping(Duration::from_millis(200))
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+
+        let req = async {
+            let request = Request::post("https://http2.akamai.com/").body(()).unwrap();
+            let (post, mut stream) = client.send_request(request, false).unwrap();
+
+            idle_ms(400).await;
+            stream.send_data(Bytes::new(), false).unwrap();
+            util::yield_once().await;
+
+            let request = large
+                .iter()
+                .fold(
+                    Request::get("https://http2.akamai.com/"),
+                    |request, &(name, ref value)| request.header(name, &value[..]),
+                )
+                .body(())
+                .unwrap();
+            let (get, _) = client.send_request(request, true).unwrap();
+            stream.send_data(Bytes::new(), false).unwrap();
+            stream.send_data("a".into(), false).unwrap();
+            assert_eq!(get.await.unwrap().status(), StatusCode::NO_CONTENT);
+
+            rx.await.unwrap();
+            stream.send_data("b".into(), false).unwrap();
+            idle_ms(400).await;
+            stream.send_data("c".into(), true).unwrap();
+            assert_eq!(post.await.unwrap().status(), StatusCode::NO_CONTENT);
+        };
+
+        conn.drive(req).await;
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}

@@ -92,6 +92,7 @@ pub(crate) struct Config {
     pub headers_pseudo_order: Option<PseudoOrder>,
     pub headers_stream_dependency: Option<StreamDependency>,
     pub priorities: Option<Priorities>,
+    pub preface_ping: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -205,7 +206,7 @@ where
                 error: None,
                 go_away: GoAway::new(),
                 pending_refusal: None,
-                ping_pong: PingPong::new(),
+                ping_pong: PingPong::new(config.preface_ping),
                 settings: Settings::new(config.settings),
                 streams,
                 #[cfg(feature = "tracing")]
@@ -261,7 +262,13 @@ where
         #[cfg(feature = "tracing")]
         let _e = self.inner.span.enter();
         let _span = tracing::trace_span!("poll_ready");
-        // The order of these calls don't really matter too much
+        // A preface PING armed by an already buffered frame goes first. The
+        // order of the other calls doesn't really matter too much.
+        ready!(
+            self.inner
+                .ping_pong
+                .send_pending_preface_ping(cx, &mut self.codec)
+        )?;
         ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
         ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;
         ready!(
@@ -464,7 +471,11 @@ where
                             // Ensure all window updates have been sent.
                             //
                             // This will also handle flushing `self.codec`
-                            ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
+                            ready!(self.inner.streams.poll_complete(
+                                cx,
+                                &mut self.codec,
+                                self.inner.ping_pong.preface_ping_mut()
+                            ))?;
 
                             if (self.inner.error.is_some()
                                 || self.inner.go_away.should_close_on_idle())
@@ -526,11 +537,12 @@ where
             }
             ready!(self.poll_ready(cx))?;
 
-            match self
-                .inner
-                .as_dyn()
-                .recv_frame(ready!(Pin::new(&mut self.codec).poll_next(cx)?))?
-            {
+            let frame = Pin::new(&mut self.codec).poll_next(cx);
+            if self.codec.take_read_activity() {
+                self.inner.ping_pong.record_read();
+            }
+
+            match self.inner.as_dyn().recv_frame(ready!(frame?))? {
                 ReceivedFrame::Settings(frame) => {
                     self.inner.settings.recv_settings(
                         frame,

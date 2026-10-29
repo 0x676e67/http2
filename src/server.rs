@@ -1567,6 +1567,7 @@ where
                             headers_stream_dependency: None,
                             headers_pseudo_order: None,
                             priorities: None,
+                            preface_ping: None,
                         },
                     );
 

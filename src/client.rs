@@ -368,6 +368,9 @@ pub struct Builder {
     /// Priority stream list
     priorities: Option<Priorities>,
 
+    /// Read-idle threshold for the preface PING
+    preface_ping: Option<Duration>,
+
     /// Initial target receive window size for locally initiated streams.
     initial_target_stream_window_size: Option<u32>,
 }
@@ -693,6 +696,7 @@ impl Builder {
             headers_pseudo_order: None,
             headers_stream_dependency: None,
             priorities: None,
+            preface_ping: None,
             initial_target_stream_window_size: None,
         }
     }
@@ -1295,6 +1299,20 @@ impl Builder {
         self
     }
 
+    /// Sends a PING with the next HEADERS or non-empty DATA frame once nothing
+    /// has been read for longer than `threshold`.
+    ///
+    /// The PING follows HEADERS but precedes DATA, and its payload is a
+    /// big-endian counter starting at 1. Another PING is only sent after the
+    /// previous one is acknowledged; a missing ACK does not close the
+    /// connection.
+    ///
+    /// See [RFC 9113 section 6.7](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.7).
+    pub fn preface_ping(&mut self, threshold: Duration) -> &mut Self {
+        self.preface_ping = Some(threshold);
+        self
+    }
+
     /// Creates a new configured HTTP/2 client backed by `io`.
     ///
     /// It is expected that `io` already be in an appropriate state to commence
@@ -1543,6 +1561,7 @@ where
                 headers_pseudo_order: builder.headers_pseudo_order,
                 headers_stream_dependency: builder.headers_stream_dependency,
                 priorities: builder.priorities,
+                preface_ping: builder.preface_ping,
             },
         );
         let send_request = SendRequest {

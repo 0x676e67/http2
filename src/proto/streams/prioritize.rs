@@ -507,6 +507,7 @@ impl Prioritize {
         counts: &mut Counts,
         recv: &mut Recv,
         dst: &mut Codec<T, Prioritized<B>>,
+        mut preface_ping: Option<&mut PrefacePing>,
     ) -> io::Result<BufferStatus>
     where
         T: AsyncWrite + Unpin,
@@ -521,7 +522,11 @@ impl Prioritize {
         tracing::trace!("buffer_pending");
 
         loop {
-            if !dst.has_send_capacity() {
+            // A due preface PING goes ahead of a DATA frame, so keep room for
+            // it before popping the next frame.
+            let ping_due = preface_ping.as_deref().is_some_and(PrefacePing::is_due);
+            let reserved = if ping_due { PrefacePing::FRAME_LEN } else { 0 };
+            if !dst.has_send_capacity_after(reserved) {
                 return Ok(BufferStatus::CodecFull);
             }
 
@@ -543,6 +548,22 @@ impl Prioritize {
                 Some(frame) => {
                     tracing::trace!(?frame, "writing");
 
+                    // The preface PING goes after HEADERS but ahead of DATA.
+                    if let Some(preface_ping) = preface_ping.as_deref_mut().filter(|_| ping_due) {
+                        match frame {
+                            Frame::Headers(_) => preface_ping.arm(),
+                            Frame::Data(ref frame) if frame.payload().has_remaining() => {
+                                preface_ping.arm();
+                                // Room is reserved above; without it the PING
+                                // stays armed and follows the DATA frame.
+                                let buffered = dst.has_send_capacity_after(PrefacePing::FRAME_LEN)
+                                    && preface_ping.buffer_pending(dst);
+                                debug_assert!(buffered, "room is reserved for the PING");
+                            }
+                            _ => {}
+                        }
+                    }
+
                     debug_assert_eq!(self.in_flight_data_frame, InFlightData::Nothing);
                     if let Frame::Data(ref frame) = frame {
                         self.in_flight_data_frame = InFlightData::DataFrame(frame.payload().stream);
@@ -554,6 +575,12 @@ impl Prioritize {
                     // before accepting another frame so that slot is not
                     // overwritten.
                     self.reclaim_frame(buffer, store, dst);
+
+                    if let Some(preface_ping) = preface_ping.as_deref_mut() {
+                        if !preface_ping.buffer_pending(dst) {
+                            return Ok(BufferStatus::CodecFull);
+                        }
+                    }
                 }
                 None => {
                     return Ok(BufferStatus::Complete);

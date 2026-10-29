@@ -1,5 +1,5 @@
 use crate::codec::Codec;
-use crate::frame::Ping;
+use crate::frame::{self, Ping};
 use crate::proto::{self, PingPayload};
 use crate::tracing;
 
@@ -9,6 +9,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWrite;
 
 /// Acknowledges ping requests from the remote.
@@ -17,6 +18,29 @@ pub(crate) struct PingPong {
     pending_ping: Option<PendingPing>,
     pending_pong: Option<PingPayload>,
     user_pings: Option<UserPingsRx>,
+    preface_ping: Option<PrefacePing>,
+}
+
+/// PING sent after the next HEADERS frame or ahead of the next non-empty DATA
+/// frame once nothing has been read for longer than `threshold`.
+///
+/// Payloads carry a big-endian counter starting at 1. The ACK only allows the
+/// next PING; a missing ACK is not acted on.
+#[derive(Debug)]
+pub(crate) struct PrefacePing {
+    threshold: Duration,
+    last_read: Instant,
+    next_id: u64,
+    state: PrefaceState,
+}
+
+#[derive(Debug)]
+enum PrefaceState {
+    Idle,
+    /// Armed by a frame but not buffered yet.
+    Pending(PingPayload),
+    /// Buffered and waiting for the ACK.
+    InFlight(PingPayload),
 }
 
 #[derive(Debug)]
@@ -62,11 +86,44 @@ const USER_STATE_CLOSED: usize = 4;
 // ===== impl PingPong =====
 
 impl PingPong {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(preface_ping: Option<Duration>) -> Self {
         PingPong {
             pending_ping: None,
             pending_pong: None,
             user_pings: None,
+            preface_ping: preface_ping.map(PrefacePing::new),
+        }
+    }
+
+    pub(crate) fn preface_ping_mut(&mut self) -> Option<&mut PrefacePing> {
+        self.preface_ping.as_mut()
+    }
+
+    /// Sends a preface PING armed by an already buffered frame.
+    pub(crate) fn send_pending_preface_ping<T, B>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, B>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let Some(ref mut preface_ping) = self.preface_ping {
+            if !preface_ping.buffer_pending(dst) {
+                ready!(dst.poll_ready(cx))?;
+                let buffered = preface_ping.buffer_pending(dst);
+                debug_assert!(buffered);
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Records read activity for the preface PING.
+    pub(crate) fn record_read(&mut self) {
+        if let Some(ref mut preface_ping) = self.preface_ping {
+            preface_ping.last_read = Instant::now();
         }
     }
 
@@ -114,6 +171,13 @@ impl PingPong {
 
                 // if not the payload we expected, put it back.
                 self.pending_ping = Some(pending);
+            }
+
+            if let Some(ref mut preface_ping) = self.preface_ping {
+                if preface_ping.recv_ack(ping.payload()) {
+                    tracing::trace!("recv PING preface ack");
+                    return ReceivedPing::Unknown;
+                }
             }
 
             if let Some(ref users) = self.user_pings {
@@ -202,6 +266,64 @@ impl PingPong {
 impl ReceivedPing {
     pub(crate) fn is_shutdown(&self) -> bool {
         matches!(*self, Self::Shutdown)
+    }
+}
+
+// ===== impl PrefacePing =====
+
+impl PrefacePing {
+    /// Encoded size of a PING frame.
+    pub(crate) const FRAME_LEN: usize = frame::HEADER_LEN + 8;
+
+    fn new(threshold: Duration) -> Self {
+        PrefacePing {
+            threshold,
+            last_read: Instant::now(),
+            next_id: 1,
+            state: PrefaceState::Idle,
+        }
+    }
+
+    /// Returns whether no PING is outstanding and the connection has been
+    /// read-idle for longer than the threshold.
+    pub(crate) fn is_due(&self) -> bool {
+        matches!(self.state, PrefaceState::Idle) && self.last_read.elapsed() > self.threshold
+    }
+
+    /// Arms the next PING; callers check `is_due` first.
+    pub(crate) fn arm(&mut self) {
+        let payload = self.next_id.to_be_bytes();
+        self.next_id = self.next_id.wrapping_add(1);
+        self.state = PrefaceState::Pending(payload);
+    }
+
+    /// Buffers an armed PING. Returns `false` if the codec is full.
+    pub(crate) fn buffer_pending<T, B>(&mut self, dst: &mut Codec<T, B>) -> bool
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let PrefaceState::Pending(payload) = self.state {
+            if !dst.has_send_capacity() {
+                return false;
+            }
+
+            dst.buffer(Ping::new(payload).into())
+                .expect("invalid ping frame");
+            self.state = PrefaceState::InFlight(payload);
+        }
+
+        true
+    }
+
+    fn recv_ack(&mut self, payload: &PingPayload) -> bool {
+        match self.state {
+            PrefaceState::InFlight(ref sent) if sent == payload => {
+                self.state = PrefaceState::Idle;
+                true
+            }
+            _ => false,
+        }
     }
 }
 

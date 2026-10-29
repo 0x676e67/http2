@@ -130,6 +130,12 @@ impl<T, B> Codec<T, B> {
         self.framed_write().take_last_data_frame()
     }
 
+    /// Returns whether any bytes were read from the socket since the last
+    /// call, including bytes of frames that are partial or ignored.
+    pub(crate) fn take_read_activity(&mut self) -> bool {
+        self.framed_write().take_read_activity()
+    }
+
     fn framed_write(&mut self) -> &mut FramedWrite<T, B> {
         self.inner.get_mut()
     }
@@ -149,6 +155,12 @@ where
     /// underlying I/O object.
     pub(crate) fn has_send_capacity(&mut self) -> bool {
         self.framed_write().has_capacity()
+    }
+
+    /// Returns whether the codec can still buffer a frame after `len` more
+    /// bytes are buffered.
+    pub(crate) fn has_send_capacity_after(&mut self, len: usize) -> bool {
+        self.framed_write().has_capacity_after(len)
     }
 
     /// Buffer a frame.
