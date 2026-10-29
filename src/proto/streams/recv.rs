@@ -622,13 +622,18 @@ impl Recv {
                     tracing::trace!("decrementing all windows; dec={}", dec);
 
                     store.try_for_each(|mut stream| {
-                        if self.apply_request_window_settings(&mut stream, target)? {
-                            return Ok(());
+                        if !self.apply_request_window_settings(&mut stream, target)? {
+                            stream
+                                .recv_flow
+                                .dec_recv_window(dec)
+                                .map_err(proto::Error::library_go_away)?;
                         }
-                        stream
-                            .recv_flow
-                            .dec_recv_window(dec)
-                            .map_err(proto::Error::library_go_away)?;
+                        // Capacity released before the ACK can cross the
+                        // WINDOW_UPDATE threshold once the window shrinks.
+                        // Nothing else queues it, so the peer would stall.
+                        if stream.recv_flow.unclaimed_capacity().is_some() {
+                            self.pending_window_updates.push(&mut stream);
+                        }
                         Ok::<_, proto::Error>(())
                     })?;
                 }

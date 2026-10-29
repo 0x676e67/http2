@@ -125,7 +125,7 @@ impl Settings {
         P: Peer,
     {
         if let Some(settings) = self.remote.clone() {
-            if !dst.poll_ready(cx)?.is_ready() {
+            if !dst.poll_send_capacity(cx)?.is_ready() {
                 return Poll::Pending;
             }
 
@@ -156,7 +156,7 @@ impl Settings {
 
         match &self.local {
             Local::ToSend(settings) => {
-                if !dst.poll_ready(cx)?.is_ready() {
+                if !dst.poll_send_capacity(cx)?.is_ready() {
                     return Poll::Pending;
                 }
 

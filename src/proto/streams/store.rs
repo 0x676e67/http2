@@ -76,6 +76,11 @@ pub(super) struct VacantEntry<'a> {
 
 pub(super) trait Resolve {
     fn resolve(&mut self, key: Key) -> Ptr<'_>;
+
+    /// Key of the stream the caller still holds through this resolver.
+    fn held_key(&self) -> Option<Key> {
+        None
+    }
 }
 
 // ===== impl Store =====
@@ -403,7 +408,7 @@ impl<'a> Ptr<'a> {
     /// Remove the stream from the store
     pub fn remove(self) -> StreamId {
         // The stream must have been unlinked before this point
-        debug_assert!(!self.store.ids.contains_key(&self.key.stream_id));
+        debug_assert!(!self.is_linked());
 
         // Remove the stream state
         let stream = self.store.slab.remove(self.key.index.0 as usize);
@@ -414,10 +419,16 @@ impl<'a> Ptr<'a> {
     /// Remove the StreamId -> stream state association.
     ///
     /// This will effectively remove the stream as far as the H2 protocol is
-    /// concerned.
+    /// concerned. Once unlinked, the id may map to a newer stream, such as one
+    /// created to reset a late frame, which is left alone.
     pub fn unlink(&mut self) {
-        let id = self.key.stream_id;
-        self.store.ids.swap_remove(&id);
+        if self.is_linked() {
+            self.store.ids.swap_remove(&self.key.stream_id);
+        }
+    }
+
+    fn is_linked(&self) -> bool {
+        self.store.ids.get(&self.key.stream_id) == Some(&self.key.index)
     }
 }
 
@@ -427,6 +438,10 @@ impl<'a> Resolve for Ptr<'a> {
             key,
             store: &mut *self.store,
         }
+    }
+
+    fn held_key(&self) -> Option<Key> {
+        Some(self.key)
     }
 }
 
