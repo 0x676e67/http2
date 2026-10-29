@@ -1303,9 +1303,9 @@ impl Builder {
     /// has been read for longer than `threshold`.
     ///
     /// The PING follows HEADERS but precedes DATA, and its payload is a
-    /// big-endian counter starting at 1. Another PING is only sent after the
-    /// previous one is acknowledged; a missing ACK does not close the
-    /// connection.
+    /// big-endian counter starting at 1 that skips the payload of a user PING
+    /// in flight. Another PING is only sent after the previous one is
+    /// acknowledged; a missing ACK does not close the connection.
     ///
     /// See [RFC 9113 section 6.7](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.7).
     pub fn preface_ping(&mut self, threshold: Duration) -> &mut Self {

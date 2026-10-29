@@ -2,6 +2,7 @@ use futures::channel::oneshot;
 use futures::StreamExt;
 use h2_support::assert_ping;
 use h2_support::prelude::*;
+use std::task::Poll;
 
 #[tokio::test]
 async fn recv_single_ping() {
@@ -125,6 +126,54 @@ async fn user_ping_pong() {
         );
 
         conn.drive(futures::future::poll_fn(move |cx| ping_pong.poll_pong(cx)))
+            .await
+            .unwrap();
+        drop(client);
+        conn.await.expect("client");
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn user_ping_custom_payload() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let (tx, rx) = oneshot::channel();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(frames::ping([0; 8])).await;
+        // An ACK with another payload is ignored. The pong for the server
+        // PING shows that the client has read it.
+        srv.send_frame(frames::ping(frame::Ping::USER).pong()).await;
+        srv.send_frame(frames::ping([1; 8])).await;
+        srv.recv_frame(frames::ping([1; 8]).pong()).await;
+        tx.send(()).unwrap();
+        srv.send_frame(frames::ping([0; 8]).pong()).await;
+        srv.recv_frame(frames::go_away(0)).await;
+        srv.recv_eof().await;
+    };
+
+    let client = async move {
+        let (client, mut conn) = client::handshake(io).await.expect("client handshake");
+        // yield once so we can ack server settings
+        conn.drive(util::yield_once()).await;
+        // `ping_pong()` method conflict with mock future ext trait.
+        let mut ping_pong = client::Connection::ping_pong(&mut conn).expect("taking ping_pong");
+        ping_pong.send_ping(Ping::new([0; 8])).expect("send ping");
+        // A rejected PING does not replace the pending payload.
+        ping_pong
+            .send_ping(Ping::new([2; 8]))
+            .expect_err("send ping while pending");
+
+        conn.drive(rx).await.unwrap();
+        assert!(poll_fn(|cx| Poll::Ready(ping_pong.poll_pong(cx)))
+            .await
+            .is_pending());
+
+        conn.drive(poll_fn(move |cx| ping_pong.poll_pong(cx)))
             .await
             .unwrap();
         drop(client);
@@ -261,6 +310,57 @@ async fn preface_ping_after_read_idle() {
         };
 
         conn.drive(req).await;
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn preface_ping_skips_user_ping_payload() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(frames::ping(1u64.to_be_bytes())).await;
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        // The preface PING skips the payload of the user PING in flight, so
+        // each ACK completes its own PING.
+        srv.recv_frame(frames::ping(2u64.to_be_bytes())).await;
+        srv.send_frame(frames::ping(1u64.to_be_bytes()).pong())
+            .await;
+        srv.send_frame(frames::ping(2u64.to_be_bytes()).pong())
+            .await;
+        srv.send_frame(frames::headers(1).response(204).eos()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .preface_ping(Duration::from_millis(200))
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        // `ping_pong()` method conflict with mock future ext trait.
+        let mut ping_pong = client::Connection::ping_pong(&mut conn).expect("taking ping_pong");
+        ping_pong
+            .send_ping(Ping::new(1u64.to_be_bytes()))
+            .expect("send ping");
+        conn.drive(idle_ms(400)).await;
+
+        let request = Request::get("https://http2.akamai.com/").body(()).unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        conn.drive(poll_fn(|cx| ping_pong.poll_pong(cx)))
+            .await
+            .unwrap();
+        let response = conn.drive(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         conn.await.unwrap();
     };
 

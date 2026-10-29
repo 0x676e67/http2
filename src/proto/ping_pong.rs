@@ -3,6 +3,8 @@ use crate::frame::{self, Ping};
 use crate::proto::{self, PingPayload};
 use crate::tracing;
 
+use super::streams::Mutex;
+
 use atomic_waker::AtomicWaker;
 use bytes::Buf;
 use std::io;
@@ -24,14 +26,17 @@ pub(crate) struct PingPong {
 /// PING sent after the next HEADERS frame or ahead of the next non-empty DATA
 /// frame once nothing has been read for longer than `threshold`.
 ///
-/// Payloads carry a big-endian counter starting at 1. The ACK only allows the
-/// next PING; a missing ACK is not acted on.
+/// Payloads carry a big-endian counter starting at 1 that skips the payload of
+/// a user PING in flight. The ACK only allows the next PING; a missing ACK is
+/// not acted on.
 #[derive(Debug)]
 pub(crate) struct PrefacePing {
     threshold: Duration,
     last_read: Instant,
     next_id: u64,
     state: PrefaceState,
+    /// Payload of a user PING awaiting its ACK, which the counter skips.
+    user_in_flight: Option<PingPayload>,
 }
 
 #[derive(Debug)]
@@ -52,6 +57,8 @@ struct UserPingsRx(Arc<UserPingsInner>);
 #[derive(Debug)]
 struct UserPingsInner {
     state: AtomicUsize,
+    /// Payload of the last PING sent by the user.
+    payload: Mutex<PingPayload>,
     /// Task to wake up the main `Connection`.
     ping_task: AtomicWaker,
     /// Task to wake up `share::PingPong::poll_pong`.
@@ -135,6 +142,7 @@ impl PingPong {
 
         let user_pings = Arc::new(UserPingsInner {
             state: AtomicUsize::new(USER_STATE_EMPTY),
+            payload: Mutex::new(Ping::USER),
             ping_task: AtomicWaker::new(),
             pong_task: AtomicWaker::new(),
         });
@@ -158,6 +166,26 @@ impl PingPong {
         assert!(self.pending_pong.is_none());
 
         if ping.is_ack() {
+            // Equal payloads are matched in write order. A preface PING skips
+            // the payload of a user PING already in flight, and no user PING
+            // is written while the shutdown PING is pending.
+            if let Some(ref mut preface_ping) = self.preface_ping {
+                if preface_ping.recv_ack(ping.payload()) {
+                    tracing::trace!("recv PING preface ack");
+                    return ReceivedPing::Unknown;
+                }
+            }
+
+            if let Some(ref users) = self.user_pings {
+                if users.receive_pong(ping.payload()) {
+                    if let Some(ref mut preface_ping) = self.preface_ping {
+                        preface_ping.user_in_flight = None;
+                    }
+                    tracing::trace!("recv PING USER ack");
+                    return ReceivedPing::Unknown;
+                }
+            }
+
             if let Some(pending) = self.pending_ping.take() {
                 if &pending.payload == ping.payload() {
                     assert_eq!(
@@ -171,20 +199,6 @@ impl PingPong {
 
                 // if not the payload we expected, put it back.
                 self.pending_ping = Some(pending);
-            }
-
-            if let Some(ref mut preface_ping) = self.preface_ping {
-                if preface_ping.recv_ack(ping.payload()) {
-                    tracing::trace!("recv PING preface ack");
-                    return ReceivedPing::Unknown;
-                }
-            }
-
-            if let Some(ref users) = self.user_pings {
-                if ping.payload() == &Ping::USER && users.receive_pong() {
-                    tracing::trace!("recv PING USER ack");
-                    return ReceivedPing::Unknown;
-                }
             }
 
             // else we were acked a ping we didn't send?
@@ -248,8 +262,12 @@ impl PingPong {
                     return Poll::Pending;
                 }
 
-                dst.buffer(Ping::new(Ping::USER).into())
+                let payload = *users.0.payload.lock();
+                dst.buffer(Ping::new(payload).into())
                     .expect("invalid ping frame");
+                if let Some(ref mut preface_ping) = self.preface_ping {
+                    preface_ping.user_in_flight = Some(payload);
+                }
                 users
                     .0
                     .state
@@ -281,6 +299,7 @@ impl PrefacePing {
             last_read: Instant::now(),
             next_id: 1,
             state: PrefaceState::Idle,
+            user_in_flight: None,
         }
     }
 
@@ -292,9 +311,13 @@ impl PrefacePing {
 
     /// Arms the next PING; callers check `is_due` first.
     pub(crate) fn arm(&mut self) {
-        let payload = self.next_id.to_be_bytes();
-        self.next_id = self.next_id.wrapping_add(1);
-        self.state = PrefaceState::Pending(payload);
+        let mut id = self.next_id;
+        if self.user_in_flight == Some(id.to_be_bytes()) {
+            id = id.wrapping_add(1);
+        }
+
+        self.next_id = id.wrapping_add(1);
+        self.state = PrefaceState::Pending(id.to_be_bytes());
     }
 
     /// Buffers an armed PING. Returns `false` if the codec is full.
@@ -330,7 +353,13 @@ impl PrefacePing {
 // ===== impl UserPings =====
 
 impl UserPings {
-    pub(crate) fn send_ping(&self) -> Result<(), Option<proto::Error>> {
+    pub(crate) fn send_ping(&self, payload: PingPayload) -> Result<(), Option<proto::Error>> {
+        // The connection reads the payload only after the exchange below
+        // publishes the PING, so it is replaced only while none is pending.
+        if self.0.state.load(Ordering::Acquire) == USER_STATE_EMPTY {
+            *self.0.payload.lock() = payload;
+        }
+
         let prev = self
             .0
             .state
@@ -381,7 +410,11 @@ impl UserPings {
 // ===== impl UserPingsRx =====
 
 impl UserPingsRx {
-    fn receive_pong(&self) -> bool {
+    fn receive_pong(&self, payload: &PingPayload) -> bool {
+        if *self.0.payload.lock() != *payload {
+            return false;
+        }
+
         let prev = self
             .0
             .state

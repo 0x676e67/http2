@@ -1,6 +1,6 @@
 use crate::codec::UserError;
-use crate::frame::Reason;
-use crate::proto::{self, WindowSize};
+use crate::frame::{self, Reason};
+use crate::proto::{self, PingPayload, WindowSize};
 
 use bytes::{Buf, Bytes};
 use http::HeaderMap;
@@ -206,7 +206,7 @@ pub struct PingPong {
 ///
 /// [`PingPong`]: struct.PingPong.html
 pub struct Ping {
-    _p: (),
+    payload: PingPayload,
 }
 
 /// Received via [`PingPong`][] when a peer acknowledges a [`Ping`][].
@@ -554,12 +554,7 @@ impl PingPong {
 
     #[doc(hidden)]
     pub fn send_ping(&mut self, ping: Ping) -> Result<(), crate::Error> {
-        // Passing a `Ping` here is just to be forwards-compatible with
-        // eventually allowing choosing a ping payload. For now, we can
-        // just ignore it.
-        let _ = ping;
-
-        self.inner.send_ping().map_err(|err| match err {
+        self.inner.send_ping(ping.payload).map_err(|err| match err {
             Some(err) => err.into(),
             None => UserError::SendPingWhilePending.into(),
         })
@@ -587,7 +582,19 @@ impl Ping {
     ///
     /// [`PingPong`]: struct.PingPong.html
     pub fn opaque() -> Ping {
-        Ping { _p: () }
+        Ping {
+            payload: frame::Ping::USER,
+        }
+    }
+
+    /// Creates a `Ping` carrying `payload`.
+    ///
+    /// Only an acknowledgement echoing the same payload completes the
+    /// [`PingPong`][].
+    ///
+    /// [`PingPong`]: struct.PingPong.html
+    pub fn new(payload: [u8; 8]) -> Ping {
+        Ping { payload }
     }
 }
 
