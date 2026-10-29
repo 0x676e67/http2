@@ -271,7 +271,7 @@ where
         )?;
         if let Some(id) = self.inner.pending_refusal {
             // Keep the refusal pending if making room requires socket progress.
-            ready!(self.codec.poll_ready(cx))?;
+            ready!(self.codec.poll_send_capacity(cx))?;
             self.inner.streams.count_pending_refusal()?;
             self.codec
                 .buffer(frame::Reset::new(id, Reason::REFUSED_STREAM).into())

@@ -127,7 +127,7 @@ impl GoAway {
         B: Buf,
     {
         if let Some(frame) = self.pending.take() {
-            if !dst.poll_ready(cx)?.is_ready() {
+            if !dst.poll_send_capacity(cx)?.is_ready() {
                 self.pending = Some(frame);
                 return Poll::Pending;
             }
