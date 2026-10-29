@@ -111,7 +111,7 @@ impl PingPong {
     {
         if let Some(ref mut preface_ping) = self.preface_ping {
             if !preface_ping.buffer_pending(dst) {
-                ready!(dst.poll_ready(cx))?;
+                ready!(dst.poll_send_capacity(cx))?;
                 let buffered = preface_ping.buffer_pending(dst);
                 debug_assert!(buffered);
             }
