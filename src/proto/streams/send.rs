@@ -88,11 +88,11 @@ impl Send {
         {
             tracing::debug!("illegal connection-specific headers found");
             return Err(UserError::MalformedHeaders);
-        } else if let Some(te) = fields.get(http::header::TE) {
-            if te != "trailers" {
-                tracing::debug!("illegal connection-specific headers found");
-                return Err(UserError::MalformedHeaders);
-            }
+        } else if let Some(te) = fields.get(http::header::TE)
+            && te != "trailers"
+        {
+            tracing::debug!("illegal connection-specific headers found");
+            return Err(UserError::MalformedHeaders);
         }
         Ok(())
     }
@@ -159,10 +159,8 @@ impl Send {
 
         // Need to notify the connection when pushing onto pending_open since
         // queue_frame only notifies for pending_send.
-        if pending_open {
-            if let Some(task) = task.take() {
-                task.wake();
-            }
+        if pending_open && let Some(task) = task.take() {
+            task.wake();
         }
 
         Ok(())
@@ -661,10 +659,10 @@ impl Send {
     }
 
     pub fn ensure_not_idle(&self, id: StreamId) -> Result<(), Reason> {
-        if let Ok(next) = self.next_stream_id {
-            if id >= next {
-                return Err(Reason::PROTOCOL_ERROR);
-            }
+        if let Ok(next) = self.next_stream_id
+            && id >= next
+        {
+            return Err(Reason::PROTOCOL_ERROR);
         }
         // if next_stream_id is overflowed, that's ok.
 
