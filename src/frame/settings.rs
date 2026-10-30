@@ -185,16 +185,16 @@ impl ExperimentalSettingsBuilder {
         };
 
         // Only insert if this unknown setting ID has not been seen before (deduplication)
-        if let SettingId::Unknown(id) = setting.id {
-            if matches!(SettingId::from(id), SettingId::Unknown(_)) {
-                let mask_id = setting.id.mask_id();
-                if mask_id != 0 {
-                    if self.mask & mask_id == 0 {
-                        self.mask |= mask_id;
-                        self.settings.push(setting);
-                    } else {
-                        tracing::trace!("duplicate unknown setting ID ignored: {id:?}");
-                    }
+        if let SettingId::Unknown(id) = setting.id
+            && matches!(SettingId::from(id), SettingId::Unknown(_))
+        {
+            let mask_id = setting.id.mask_id();
+            if mask_id != 0 {
+                if self.mask & mask_id == 0 {
+                    self.mask |= mask_id;
+                    self.settings.push(setting);
+                } else {
+                    tracing::trace!("duplicate unknown setting ID ignored: {id:?}");
                 }
             }
         }
@@ -376,7 +376,7 @@ impl Settings {
         }
 
         // Ensure the payload length is correct, each setting is 6 bytes long.
-        if payload.len() % 6 != 0 {
+        if !payload.len().is_multiple_of(6) {
             tracing::debug!("invalid settings payload length; len={:?}", payload.len());
             return Err(Error::InvalidPayloadAckSettings);
         }
@@ -472,70 +472,69 @@ impl Settings {
         for id in &self.settings_order {
             match id {
                 SettingId::HeaderTableSize => {
-                    if let Some(v) = self.header_table_size {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.header_table_size
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::EnablePush => {
-                    if let Some(v) = self.enable_push {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.enable_push
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::MaxConcurrentStreams => {
-                    if let Some(v) = self.max_concurrent_streams {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.max_concurrent_streams
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::InitialWindowSize => {
-                    if let Some(v) = self.initial_window_size {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.initial_window_size
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::MaxFrameSize => {
-                    if let Some(v) = self.max_frame_size {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.max_frame_size
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::MaxHeaderListSize => {
-                    if let Some(v) = self.max_header_list_size {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.max_header_list_size
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::EnableConnectProtocol => {
-                    if let Some(v) = self.enable_connect_protocol {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.enable_connect_protocol
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::NoRfc7540Priorities => {
-                    if let Some(v) = self.no_rfc7540_priorities {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.no_rfc7540_priorities
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::Unknown(_id) => {
                     #[cfg(feature = "unstable")]
-                    if let Some(ref unknown_settings) = self.experimental_settings {
-                        if let Some(setting) = unknown_settings
+                    if let Some(ref unknown_settings) = self.experimental_settings
+                        && let Some(setting) = unknown_settings
                             .into_iter()
                             .find(|setting| setting.id == SettingId::Unknown(*_id))
-                        {
-                            f(setting.clone());
-                        }
+                    {
+                        f(setting.clone());
                     }
                 }
             }
@@ -596,11 +595,11 @@ impl Setting {
     /// 6.5.2.
     pub fn from_id(id: impl Into<SettingId>, value: u32) -> Option<Setting> {
         let id = id.into();
-        if let SettingId::Unknown(id) = id {
-            if id == 0 || id > SettingId::MAX_ID {
-                tracing::debug!("limiting unknown setting id to 0..{}", SettingId::MAX_ID);
-                return None;
-            }
+        if let SettingId::Unknown(id) = id
+            && (id == 0 || id > SettingId::MAX_ID)
+        {
+            tracing::debug!("limiting unknown setting id to 0..{}", SettingId::MAX_ID);
+            return None;
         }
 
         Some(Setting { id, value })
