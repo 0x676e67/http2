@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::vec::IntoIter;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, ReadBuf};
 
 /// An H2 connection
 #[derive(Debug)]
@@ -272,7 +272,12 @@ where
             .send_pending_preface_ping(cx, &mut self.codec)?;
         // The order of these calls don't really matter too much
         ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
-        ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;
+        // A shutdown PING follows its GOAWAY.
+        if !self.inner.go_away.has_pending() {
+            self.inner
+                .ping_pong
+                .send_pending_ping(cx, &mut self.codec)?;
+        }
         ready!(
             self.inner
                 .settings
@@ -297,6 +302,25 @@ where
     /// afterwards. If this is a graceful shutdown, this returns `None`.
     fn poll_go_away(&mut self, cx: &mut Context) -> Poll<Option<io::Result<Reason>>> {
         self.inner.go_away.send_pending_go_away(cx, &mut self.codec)
+    }
+
+    /// Drops incoming bytes while our last frames wait to be written: the peer
+    /// may wait for us to read before it reads them.
+    ///
+    /// The bytes skip the codec, as no frame is read after this.
+    // Out of line, so the scratch buffer stays off the stack of `poll`.
+    #[cold]
+    #[inline(never)]
+    fn discard_input(&mut self, cx: &mut Context) {
+        let mut scratch = [0; 8 * 1024];
+        loop {
+            let mut buf = ReadBuf::new(&mut scratch);
+            match Pin::new(self.codec.get_mut()).poll_read(cx, &mut buf) {
+                Poll::Ready(Ok(())) if !buf.filled().is_empty() => {}
+                // Stop on EOF or an error, and wait for the write side.
+                _ => return,
+            }
+        }
     }
 
     pub fn go_away_from_user(&mut self, e: Reason) {
@@ -507,7 +531,10 @@ where
                 State::Closing(reason, initiator) => {
                     tracing::trace!("connection closing after flush");
                     // Flush/shutdown the codec
-                    ready!(self.codec.shutdown(cx))?;
+                    if self.codec.shutdown(cx)?.is_pending() {
+                        self.discard_input(cx);
+                        return Poll::Pending;
+                    }
 
                     // Transition the state to error
                     self.inner.state = State::Closed(reason, initiator);
@@ -531,7 +558,12 @@ where
             // The order here matters:
             // - poll_go_away may buffer a graceful shutdown GOAWAY frame
             // - If it has, we've also added a PING to be sent in poll_ready
-            if let Some(reason) = ready!(self.poll_go_away(cx)?) {
+            let go_away = self.poll_go_away(cx);
+            if go_away.is_pending() {
+                // Only a GOAWAY that closes the connection waits for room.
+                self.discard_input(cx);
+            }
+            if let Some(reason) = ready!(go_away?) {
                 if self.inner.go_away.should_close_now() {
                     if self.inner.go_away.is_user_initiated() {
                         // A user initiated abrupt shutdown shouldn't return

@@ -34,6 +34,8 @@ struct Link {
     /// Writes to refuse, as if the socket became writable just after each.
     refusals: usize,
     waker: Option<Waker>,
+    /// Bytes the endpoint has read.
+    read: usize,
 }
 
 /// Peer side of a `BufferedIo`.
@@ -46,6 +48,7 @@ fn buffered_io(inner: mock::Mock) -> (BufferedIo, Drain) {
         credit: usize::MAX,
         refusals: 0,
         waker: None,
+        read: 0,
     }));
     let drain = Drain(link.clone());
     (BufferedIo { inner, link }, drain)
@@ -78,6 +81,10 @@ impl Drain {
 
     fn buffered(&self) -> usize {
         self.0.lock().unwrap().buf.len()
+    }
+
+    fn read(&self) -> usize {
+        self.0.lock().unwrap().read
     }
 
     /// Makes every write wait until `resume`.
@@ -113,7 +120,11 @@ impl AsyncRead for BufferedIo {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        let this = self.get_mut();
+        let filled = buf.filled().len();
+        futures::ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
+        this.link.lock().unwrap().read += buf.filled().len() - filled;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -375,10 +386,10 @@ async fn control_frames_do_not_wait_for_backpressured_data() {
     assert!(stalled.is_empty(), "{:#?}", stalled);
 }
 
-/// Yields until `progress` reaches `step`, and returns whether it did.
-async fn reached(progress: &AtomicUsize, step: usize) -> bool {
+/// Yields until `done` holds, and returns whether it did.
+async fn reached(done: impl Fn() -> bool) -> bool {
     for _ in 0..64 {
-        if progress.load(Ordering::SeqCst) >= step {
+        if done() {
             return true;
         }
         util::yield_once().await;
@@ -449,14 +460,22 @@ async fn read_while_blocked(flood: Flood, refusals: usize) {
             .initial_window_size(BODY_LEN as u32);
         peer.send_frame(settings).await;
         peer.send_frame(frames::headers(1).response(200)).await;
-        assert!(reached(&progress, 1).await, "{:?}: stopped reading", flood);
+        assert!(
+            reached(|| progress.load(Ordering::SeqCst) >= 1).await,
+            "{:?}: stopped reading",
+            flood
+        );
 
         // Reading goes on until a flood fills a queue, and stops there until
         // writes drain.
         for i in 0..MAX_QUEUED - 1 {
             if i == MAX_QUEUED - 2 {
                 peer.send_frame(frames::data(1, "a")).await;
-                assert!(reached(&progress, 2).await, "{:?}: stopped early", flood);
+                assert!(
+                    reached(|| progress.load(Ordering::SeqCst) >= 2).await,
+                    "{:?}: stopped early",
+                    flood
+                );
             }
             match flood {
                 Flood::Pings => peer.send_frame(frames::ping([i + 2; 8])).await,
@@ -465,7 +484,7 @@ async fn read_while_blocked(flood: Flood, refusals: usize) {
         }
         peer.send_frame(frames::data(1, "x").eos()).await;
         assert!(
-            !reached(&progress, 3).await,
+            !reached(|| progress.load(Ordering::SeqCst) >= 3).await,
             "{:?}: read past a full queue",
             flood
         );
@@ -495,7 +514,7 @@ async fn read_while_blocked(flood: Flood, refusals: usize) {
             data
         );
         assert!(
-            reached(&progress, 3).await,
+            reached(|| progress.load(Ordering::SeqCst) >= 3).await,
             "{:?}: reading did not resume",
             flood
         );
@@ -517,5 +536,151 @@ async fn reads_while_control_frames_wait_to_be_written() {
         tokio::time::timeout(Duration::from_secs(10), run)
             .await
             .unwrap_or_else(|_| panic!("{:?} with {} refusals timed out", flood, refusals));
+    }
+}
+
+/// How the server closes while nothing it writes gets through.
+#[derive(Clone, Copy, Debug)]
+enum Close {
+    /// The GOAWAY and its PING wait behind DATA.
+    Graceful,
+    /// The GOAWAY waits behind DATA.
+    Abrupt,
+    /// The GOAWAY is buffered, and the final flush waits.
+    AbruptFlush,
+}
+
+async fn close_while_blocked(close: Close) {
+    let (io, mut peer) = mock::new();
+    let (io, drain) = buffered_io(io);
+    let (close_tx, mut close_rx) = oneshot::channel();
+    let accepted = Arc::new(AtomicBool::new(false));
+
+    let server = {
+        let accepted = accepted.clone();
+        async move {
+            let mut conn = server::handshake(io).await.unwrap();
+            let (_request, mut respond) = conn.next().await.unwrap().unwrap();
+            let mut stream = respond.send_response(Response::new(()), false).unwrap();
+            if !matches!(close, Close::AbruptFlush) {
+                stream
+                    .send_data(Bytes::from(vec![0; BODY_LEN]), true)
+                    .unwrap();
+            }
+
+            let mut closing = false;
+            poll_fn(|cx| {
+                if !closing && close_rx.poll_unpin(cx).is_ready() {
+                    closing = true;
+                    match close {
+                        Close::Graceful => conn.graceful_shutdown(),
+                        Close::Abrupt | Close::AbruptFlush => {
+                            conn.abrupt_shutdown(Reason::NO_ERROR)
+                        }
+                    }
+                }
+                while let Some(stream) = futures::ready!(conn.poll_accept(cx)) {
+                    stream.unwrap();
+                    accepted.store(true, Ordering::SeqCst);
+                }
+                Poll::Ready(())
+            })
+            .await;
+        }
+    };
+
+    let peer = async move {
+        peer.assert_server_handshake().await;
+        drain.pause();
+        peer.send_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        for _ in 0..8 {
+            util::yield_once().await;
+        }
+        close_tx.send(()).unwrap();
+        for _ in 0..8 {
+            util::yield_once().await;
+        }
+
+        // Nothing the server writes gets through, yet it reads on.
+        let expected: Vec<frame::Frame> = match close {
+            Close::Graceful => {
+                // Not the ACK of the shutdown PING, as that is not sent yet.
+                peer.send_frame(frames::ping(frame::Ping::SHUTDOWN).pong())
+                    .await;
+                peer.send_frame(
+                    frames::headers(3)
+                        .request("GET", "https://example.com/")
+                        .eos(),
+                )
+                .await;
+                assert!(
+                    reached(|| accepted.load(Ordering::SeqCst)).await,
+                    "{:?}: stopped reading",
+                    close
+                );
+                vec![
+                    frames::go_away(StreamId::MAX).into(),
+                    frames::ping(frame::Ping::SHUTDOWN).into(),
+                ]
+            }
+            Close::Abrupt | Close::AbruptFlush => {
+                let read = drain.read();
+                for i in 0..32 {
+                    if i == 16 {
+                        // The rest must wake the server again.
+                        for _ in 0..8 {
+                            util::yield_once().await;
+                        }
+                    }
+                    peer.send_frame(frames::ping([i; 8])).await;
+                }
+                // PING frames take 17 bytes each.
+                assert!(
+                    reached(|| drain.read() >= read + 32 * 17).await,
+                    "{:?}: stopped reading",
+                    close
+                );
+                vec![frames::go_away(1).into()]
+            }
+        };
+        drain.resume(1);
+
+        // A GOAWAY goes out before its PING.
+        let mut control = Vec::new();
+        while control.len() < expected.len() {
+            let frame = peer.next().await.unwrap().unwrap();
+            if let frame::Frame::GoAway(_) | frame::Frame::Ping(_) = frame {
+                control.push(frame);
+            }
+        }
+        assert_eq!(control, expected, "{:?}", close);
+    };
+
+    // Spawned, so the server only runs when woken.
+    let server = tokio::spawn(server);
+    peer.await;
+    match close {
+        // The connection still waits for the PING ACK.
+        Close::Graceful => {
+            assert!(!server.is_finished(), "{:?}: server ended", close);
+            server.abort();
+        }
+        Close::Abrupt | Close::AbruptFlush => server.await.unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn reads_while_go_away_waits_to_be_written() {
+    h2_support::trace_init!();
+
+    for close in [Close::Graceful, Close::Abrupt, Close::AbruptFlush] {
+        tokio::time::timeout(Duration::from_secs(10), close_while_blocked(close))
+            .await
+            .unwrap_or_else(|_| panic!("{:?} timed out", close));
     }
 }

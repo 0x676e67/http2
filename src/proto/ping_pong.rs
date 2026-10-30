@@ -161,7 +161,7 @@ impl PingPong {
             }
 
             if let Some(pending) = self.pending_ping.take() {
-                if &pending.payload == ping.payload() {
+                if pending.sent && &pending.payload == ping.payload() {
                     assert_eq!(
                         &pending.payload,
                         &Ping::SHUTDOWN,
@@ -219,12 +219,12 @@ impl PingPong {
 
     /// Send any pending pings.
     ///
-    /// A user PING that cannot be written yet does not stop reading.
+    /// A PING that cannot be written yet does not stop reading.
     pub(crate) fn send_pending_ping<T, B>(
         &mut self,
         cx: &mut Context,
         dst: &mut Codec<T, B>,
-    ) -> Poll<io::Result<()>>
+    ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin,
         B: Buf,
@@ -232,7 +232,7 @@ impl PingPong {
         if let Some(ref mut ping) = self.pending_ping {
             if !ping.sent {
                 if !dst.poll_send_capacity(cx)?.is_ready() {
-                    return Poll::Pending;
+                    return Ok(());
                 }
 
                 dst.buffer(Ping::new(ping.payload).into())
@@ -244,7 +244,7 @@ impl PingPong {
             let preface_idle = self.preface_ping.as_ref().is_none_or(PrefacePing::is_idle);
             if preface_idle && users.0.state.load(Ordering::Acquire) == USER_STATE_PENDING_PING {
                 if !dst.poll_send_capacity(cx)?.is_ready() {
-                    return Poll::Ready(Ok(()));
+                    return Ok(());
                 }
 
                 dst.buffer(Ping::new(users.0.load_payload()).into())
@@ -261,7 +261,7 @@ impl PingPong {
             }
         }
 
-        Poll::Ready(Ok(()))
+        Ok(())
     }
 
     pub(crate) fn preface_ping_mut(&mut self) -> Option<&mut PrefacePing> {
