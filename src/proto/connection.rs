@@ -266,13 +266,13 @@ where
         #[cfg(feature = "tracing")]
         let _e = self.inner.span.enter();
         let _span = tracing::trace_span!("poll_ready");
-        // A preface PING armed by an already buffered frame goes first. The
-        // order of the other calls doesn't really matter too much.
+        // A preface PING armed by an already buffered frame goes first.
         ready!(
             self.inner
                 .ping_pong
                 .send_pending_preface_ping(cx, &mut self.codec)
         )?;
+        // The order of these calls don't really matter too much
         ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
         ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;
         ready!(
@@ -472,6 +472,13 @@ where
                         Poll::Ready(result) => result,
                         // The connection is not ready to make progress
                         Poll::Pending => {
+                            // Reads reset the idle time before a preface PING
+                            // can be armed below.
+                            if self.codec.take_read_activity() {
+                                self.inner.ping_pong.record_read();
+                                self.inner.read_activity = true;
+                            }
+
                             // Ensure all window updates have been sent.
                             //
                             // This will also handle flushing `self.codec`
@@ -541,13 +548,11 @@ where
             }
             ready!(self.poll_ready(cx))?;
 
-            let frame = Pin::new(&mut self.codec).poll_next(cx);
-            if self.codec.take_read_activity() {
-                self.inner.ping_pong.record_read();
-                self.inner.read_activity = true;
-            }
-
-            match self.inner.as_dyn().recv_frame(ready!(frame?))? {
+            match self
+                .inner
+                .as_dyn()
+                .recv_frame(ready!(Pin::new(&mut self.codec).poll_next(cx)?))?
+            {
                 ReceivedFrame::Settings(frame) => {
                     self.inner.settings.recv_settings(
                         frame,
@@ -573,7 +578,8 @@ where
 
     /// Returns whether bytes were read since the last call.
     pub(crate) fn take_read_activity(&mut self) -> bool {
-        std::mem::take(&mut self.inner.read_activity)
+        // A poll that closes the connection skips the transfer in `poll`.
+        std::mem::take(&mut self.inner.read_activity) | self.codec.take_read_activity()
     }
 
     /// Returns the remote extended CONNECT setting, or `None` before its initial SETTINGS.

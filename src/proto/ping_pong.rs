@@ -32,13 +32,13 @@ pub(crate) struct PrefacePing {
     threshold: Duration,
     last_read: Instant,
     next_id: u64,
-    state: PrefaceState,
+    state: PrefacePingState,
     /// Payload of a user PING awaiting its ACK, which the counter skips.
     user_in_flight: Option<PingPayload>,
 }
 
 #[derive(Debug)]
-enum PrefaceState {
+enum PrefacePingState {
     Idle,
     /// Armed by a frame but not buffered yet.
     Pending(PingPayload),
@@ -140,7 +140,7 @@ impl PingPong {
             // is written while the shutdown PING is pending.
             if let Some(ref mut preface_ping) = self.preface_ping {
                 if preface_ping.recv_ack(ping.payload()) {
-                    tracing::trace!("recv PING preface ack");
+                    tracing::trace!("recv PING PREFACE ack");
                     return ReceivedPing::Unknown;
                 }
             }
@@ -299,7 +299,7 @@ impl PrefacePing {
             threshold,
             last_read: Instant::now(),
             next_id: 1,
-            state: PrefaceState::Idle,
+            state: PrefacePingState::Idle,
             user_in_flight: None,
         }
     }
@@ -307,7 +307,7 @@ impl PrefacePing {
     /// Returns whether no PING is outstanding and the connection has been
     /// read-idle for longer than the threshold.
     pub(crate) fn is_due(&self) -> bool {
-        matches!(self.state, PrefaceState::Idle) && self.last_read.elapsed() > self.threshold
+        matches!(self.state, PrefacePingState::Idle) && self.last_read.elapsed() > self.threshold
     }
 
     /// Arms the next PING; callers check `is_due` first.
@@ -318,7 +318,7 @@ impl PrefacePing {
         }
 
         self.next_id = id.wrapping_add(1);
-        self.state = PrefaceState::Pending(id.to_be_bytes());
+        self.state = PrefacePingState::Pending(id.to_be_bytes());
     }
 
     /// Buffers an armed PING. Returns `false` if the codec is full.
@@ -327,14 +327,14 @@ impl PrefacePing {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        if let PrefaceState::Pending(payload) = self.state {
+        if let PrefacePingState::Pending(payload) = self.state {
             if !dst.has_send_capacity() {
                 return false;
             }
 
             dst.buffer(Ping::new(payload).into())
                 .expect("invalid ping frame");
-            self.state = PrefaceState::InFlight(payload);
+            self.state = PrefacePingState::InFlight(payload);
         }
 
         true
@@ -342,8 +342,8 @@ impl PrefacePing {
 
     fn recv_ack(&mut self, payload: &PingPayload) -> bool {
         match self.state {
-            PrefaceState::InFlight(ref sent) if sent == payload => {
-                self.state = PrefaceState::Idle;
+            PrefacePingState::InFlight(ref sent) if sent == payload => {
+                self.state = PrefacePingState::Idle;
                 true
             }
             _ => false,
@@ -385,7 +385,7 @@ impl UserPings {
         }
     }
 
-    pub(crate) fn poll_pong(&mut self, cx: &mut Context) -> Poll<Result<(), proto::Error>> {
+    pub(crate) fn poll_pong(&self, cx: &mut Context) -> Poll<Result<(), proto::Error>> {
         // Must register before checking state, in case state were to change
         // before we could register, and then the ping would just be lost.
         self.0.pong_task.register(cx.waker());
