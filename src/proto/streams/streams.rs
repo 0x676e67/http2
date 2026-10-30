@@ -102,7 +102,7 @@ struct Inner {
     refs: usize,
 
     /// Connection-level request `HEADERS` priority inputs
-    headers_priority: HeadersPriorityConfig,
+    headers_priority_config: HeadersPriorityConfig,
 
     /// Pseudo order of the headers stream
     headers_pseudo_order: Option<PseudoOrder>,
@@ -351,7 +351,7 @@ where
         // A `Chain` parent depends on which streams are still open when the
         // initial HEADERS is written, which can be later for queued requests.
         let (stream_dependency, priority_chain) = me
-            .headers_priority
+            .headers_priority_config
             .prepare(request_priority, next_stream_id)?;
         let stream_id = me.actions.send.open()?;
 
@@ -520,10 +520,7 @@ impl Inner {
             },
             store: Store::new(),
             refs: 1,
-            headers_priority: HeadersPriorityConfig::new(
-                config.headers_priority,
-                config.priority_stream_ids,
-            ),
+            headers_priority_config: config.headers_priority_config,
             headers_pseudo_order: config.headers_pseudo_order,
         }))
     }

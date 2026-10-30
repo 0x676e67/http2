@@ -111,7 +111,7 @@ pub enum HeadersDependency {
 /// ```
 /// use http2::ext::{HeadersDependency, HeadersPriority};
 ///
-/// let priority = HeadersPriority::new(HeadersDependency::Chain { urgency: 1 }, 219).exclusive();
+/// let priority = HeadersPriority::exclusive(HeadersDependency::Chain { urgency: 1 }, 219);
 /// let request = http::Request::builder().extension(priority).body(())?;
 /// # let _ = request;
 /// # Ok::<(), http::Error>(())
@@ -140,13 +140,18 @@ impl HeadersPriority {
         }
     }
 
-    /// Sets the exclusive flag, making the request the sole child of its parent
-    /// ([RFC 7540 §5.3.1]).
+    /// Creates exclusive `HEADERS` priority fields, making the request the sole
+    /// child of its parent ([RFC 7540 §5.3.1]).
+    ///
+    /// `weight` is the wire value `0..=255`, as for [`new`](Self::new).
     ///
     /// [RFC 7540 §5.3.1]: https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3.1
-    pub const fn exclusive(mut self) -> Self {
-        self.is_exclusive = true;
-        self
+    pub const fn exclusive(dependency: HeadersDependency, weight: u8) -> Self {
+        Self {
+            dependency,
+            weight,
+            is_exclusive: true,
+        }
     }
 
     /// Returns the parent stream selection.

@@ -103,7 +103,8 @@ impl<'a> IntoIterator for &'a SettingsOrder {
 // ===== impl SettingsOrderBuilder =====
 
 impl SettingsOrderBuilder {
-    /// Appends a setting, ignoring repeats and unknown IDs.
+    /// Appends a setting unless one with the same numeric ID was already
+    /// pushed. IDs 0 and above 15 are ignored.
     pub fn push(mut self, id: SettingId) -> Self {
         let mask_id = id.mask_id();
         if mask_id != 0 {
@@ -117,7 +118,7 @@ impl SettingsOrderBuilder {
         self
     }
 
-    /// Appends every setting, ignoring repeats and unknown IDs.
+    /// Appends every setting with the same rules as [`push`](Self::push).
     pub fn extend(mut self, iter: impl IntoIterator<Item = SettingId>) -> Self {
         for id in iter {
             self = self.push(id);

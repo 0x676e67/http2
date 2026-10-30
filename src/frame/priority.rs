@@ -33,7 +33,7 @@ pub struct Priority {
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub struct StreamDependency {
     /// The ID of the stream dependency target
-    dependency_id: StreamId,
+    pub(super) dependency_id: StreamId,
 
     /// The weight for the stream. The value exposed (and set) here is always in
     /// the range [0, 255], instead of [1, 256] (as defined in section 5.3.2.)
@@ -48,9 +48,16 @@ pub struct StreamDependency {
 
 impl Priority {
     /// Create a new [`Priority`].
-    pub fn new<S: Into<StreamId>>(stream_id: S, dependency: StreamDependency) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stream_id` is a `u32` with the reserved most significant bit
+    /// set; stream identifiers are 31-bit ([RFC 9113 §5.1.1]).
+    ///
+    /// [RFC 9113 §5.1.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1.1
+    pub fn new<S: Into<crate::StreamId>>(stream_id: S, dependency: StreamDependency) -> Self {
         Priority {
-            stream_id: stream_id.into(),
+            stream_id: StreamId::from(stream_id.into()),
             dependency,
         }
     }
@@ -61,7 +68,7 @@ impl Priority {
 
         let dependency = StreamDependency::load(payload)?;
 
-        if dependency.dependency_id() == head.stream_id() {
+        if dependency.dependency_id == head.stream_id() {
             return Err(Error::InvalidDependencyId);
         }
 
@@ -96,9 +103,16 @@ impl<B> From<Priority> for Frame<B> {
 
 impl StreamDependency {
     /// Create a new [`StreamDependency`]
-    pub fn new<S: Into<StreamId>>(dependency_id: S, weight: u8, is_exclusive: bool) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dependency_id` is a `u32` with the reserved most significant
+    /// bit set; stream identifiers are 31-bit ([RFC 9113 §5.1.1]).
+    ///
+    /// [RFC 9113 §5.1.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1.1
+    pub fn new<S: Into<crate::StreamId>>(dependency_id: S, weight: u8, is_exclusive: bool) -> Self {
         StreamDependency {
-            dependency_id: dependency_id.into(),
+            dependency_id: StreamId::from(dependency_id.into()),
             weight,
             is_exclusive,
         }
@@ -123,8 +137,8 @@ impl StreamDependency {
 
     /// Returns the stream this dependency points at.
     #[inline]
-    pub fn dependency_id(&self) -> StreamId {
-        self.dependency_id
+    pub fn dependency_id(&self) -> crate::StreamId {
+        crate::StreamId::from_internal(self.dependency_id)
     }
 
     pub(crate) fn encode<T: BufMut>(&self, dst: &mut T) {
@@ -209,7 +223,7 @@ impl PrioritiesBuilder {
             return self;
         }
 
-        if priority.stream_id == priority.dependency.dependency_id() {
+        if priority.stream_id == priority.dependency.dependency_id {
             tracing::warn!(
                 "ignoring self-dependent priority for stream_id={:?}",
                 priority.stream_id

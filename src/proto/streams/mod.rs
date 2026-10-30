@@ -30,7 +30,6 @@ use self::state::State;
 use self::store::Store;
 use self::stream::Stream;
 
-use crate::ext::HeadersPriority;
 use crate::frame::{PseudoOrder, StreamId, StreamIdOverflow};
 use crate::proto::*;
 
@@ -88,11 +87,8 @@ pub struct Config {
     /// Connection-level budget policy for DATA framing overhead.
     pub(crate) data_frame_budget: DataFrameBudget,
 
-    /// Default `HEADERS` priority for requests without their own.
-    pub headers_priority: Option<HeadersPriority>,
-
-    /// Idle streams declared by the initial PRIORITY frames.
-    pub priority_stream_ids: Vec<StreamId>,
+    /// Connection-level request `HEADERS` priority inputs.
+    pub headers_priority_config: HeadersPriorityConfig,
 
     /// Pseudo order of the headers stream
     pub headers_pseudo_order: Option<PseudoOrder>,

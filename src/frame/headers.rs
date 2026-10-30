@@ -315,7 +315,7 @@ impl Headers {
             }
             let stream_dep = StreamDependency::load(&src[..5])?;
 
-            if stream_dep.dependency_id() == head.stream_id() {
+            if stream_dep.dependency_id == head.stream_id() {
                 // RFC 9113 section 4.3 requires decoding the complete field
                 // block before rejecting only this stream, to keep HPACK in sync.
                 // https://www.rfc-editor.org/rfc/rfc9113.html#section-4.3
@@ -416,7 +416,7 @@ impl Headers {
     /// [RFC 7540 §5.3.1]: https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3.1
     /// [RFC 9113 §5.3.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.3.2
     pub fn set_stream_dependency(&mut self, stream_dep: StreamDependency) {
-        if stream_dep.dependency_id() == self.stream_id {
+        if stream_dep.dependency_id == self.stream_id {
             tracing::warn!(
                 "ignoring self-dependent HEADERS priority for stream_id={:?}",
                 self.stream_id

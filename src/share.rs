@@ -401,6 +401,28 @@ impl StreamId {
         (*self).into()
     }
 }
+
+/// Converts a stream number.
+///
+/// # Panics
+///
+/// Panics if the reserved most significant bit of `src` is set. Stream
+/// identifiers are unsigned 31-bit integers ([RFC 9113 §5.1.1]), so callers
+/// must pass a value in `0..=0x7FFF_FFFF`.
+///
+/// [RFC 9113 §5.1.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1.1
+impl From<u32> for StreamId {
+    fn from(src: u32) -> Self {
+        Self::from_internal(crate::frame::StreamId::from(src))
+    }
+}
+
+impl From<crate::frame::StreamId> for StreamId {
+    fn from(src: crate::frame::StreamId) -> Self {
+        Self::from_internal(src)
+    }
+}
+
 // ===== impl RecvStream =====
 
 impl RecvStream {

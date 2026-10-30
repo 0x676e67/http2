@@ -1241,8 +1241,9 @@ impl Builder {
     ///
     /// # Panics
     ///
-    /// This function panics if `stream_id` is even, since clients only open
-    /// odd streams ([RFC 9113 §5.1.1]).
+    /// Panics if `stream_id` is even or has the reserved most significant bit
+    /// set. Clients must open odd stream identifiers, which are unsigned 31-bit
+    /// integers ([RFC 9113 §5.1.1]).
     ///
     /// [RFC 9113 §5.1.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1.1
     pub fn initial_stream_id(&mut self, stream_id: u32) -> &mut Self {
@@ -1519,7 +1520,7 @@ where
             })
             .transpose()?;
 
-        proto::HeadersPriorityConfig::validate_default(
+        let headers_priority_config = proto::HeadersPriorityConfig::new(
             builder.headers_priority,
             builder.priorities.as_ref(),
             builder.stream_id,
@@ -1560,7 +1561,7 @@ where
                 settings: builder.settings,
                 data_frame_budget: builder.data_frame_budget,
                 headers_pseudo_order: builder.headers_pseudo_order,
-                headers_priority: builder.headers_priority,
+                headers_priority_config,
                 priorities: builder.priorities,
             },
         );

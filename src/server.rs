@@ -1564,7 +1564,7 @@ where
                                 .local_max_error_reset_streams,
                             settings: self.builder.settings.clone(),
                             data_frame_budget: self.builder.data_frame_budget,
-                            headers_priority: None,
+                            headers_priority_config: proto::HeadersPriorityConfig::default(),
                             headers_pseudo_order: None,
                             priorities: None,
                         },

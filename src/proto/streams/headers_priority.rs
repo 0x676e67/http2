@@ -9,7 +9,10 @@ use crate::frame::{Priorities, StreamDependency, StreamId};
 const MAX_URGENCY: u8 = 7;
 
 /// Connection-level inputs for request `HEADERS` priority fields.
-#[derive(Debug)]
+///
+/// A client handshake builds and validates it once; server connections use the
+/// empty default.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct HeadersPriorityConfig {
     /// Used by requests that carry no priority of their own.
     default: Option<HeadersPriority>,
@@ -20,39 +23,34 @@ pub(crate) struct HeadersPriorityConfig {
 // ===== impl HeadersPriorityConfig =====
 
 impl HeadersPriorityConfig {
-    /// Creates a connection's request priority configuration.
+    /// Validates the connection default and records the stream IDs declared by
+    /// the initial PRIORITY frames.
     ///
-    /// `declared` lists the stream IDs declared by the initial PRIORITY frames.
-    /// `default` must have passed [`Self::validate_default`].
-    pub(super) fn new(default: Option<HeadersPriority>, declared: Vec<StreamId>) -> Self {
-        Self { default, declared }
-    }
-
-    /// Rejects a connection default whose `Declared` parent is undeclared or a
-    /// client stream at or above `first_stream_id`.
-    ///
-    /// A default applies to every request, so unlike an override it must not
-    /// name a stream that a later request opens ([RFC 7540 §5.3.1]).
+    /// A default applies to every request, so unlike an override its `Declared`
+    /// parent must not be a client stream at or above `first_stream_id`, which
+    /// a later request opens ([RFC 7540 §5.3.1]).
     ///
     /// [RFC 7540 §5.3.1]: https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3.1
-    pub(crate) fn validate_default(
+    pub(crate) fn new(
         default: Option<HeadersPriority>,
         priorities: Option<&Priorities>,
         first_stream_id: StreamId,
-    ) -> Result<(), UserError> {
+    ) -> Result<Self, UserError> {
+        let declared: Vec<StreamId> = priorities
+            .into_iter()
+            .flat_map(Priorities::stream_ids)
+            .collect();
         if let Some(HeadersPriority {
             dependency: HeadersDependency::Declared(id),
             ..
         }) = default
         {
             let id = StreamId::from(id);
-            let is_declared = priorities
-                .is_some_and(|priorities| priorities.stream_ids().any(|declared| declared == id));
-            if !is_declared || (id.is_client_initiated() && id >= first_stream_id) {
+            if !declared.contains(&id) || (id.is_client_initiated() && id >= first_stream_id) {
                 return Err(UserError::InvalidHeadersDependency);
             }
         }
-        Ok(())
+        Ok(Self { default, declared })
     }
 
     /// Picks the request override or the connection default for `stream_id`,

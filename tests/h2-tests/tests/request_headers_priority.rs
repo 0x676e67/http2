@@ -108,9 +108,10 @@ async fn headers_priority_defaults_overrides_and_chain_parents() {
         builder
             .initial_stream_id(5)
             .priorities(declared(&[3, 19]))
-            .headers_priority(
-                HeadersPriority::new(HeadersDependency::Chain { urgency: 2 }, 182).exclusive(),
-            );
+            .headers_priority(HeadersPriority::exclusive(
+                HeadersDependency::Chain { urgency: 2 },
+                182,
+            ));
         let (mut client, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
 
         let mut responses = Vec::new();
@@ -119,17 +120,18 @@ async fn headers_priority_defaults_overrides_and_chain_parents() {
             ("chain", None),
             (
                 "urgent",
-                Some(
-                    HeadersPriority::new(HeadersDependency::Chain { urgency: 0 }, 255).exclusive(),
-                ),
+                Some(HeadersPriority::exclusive(
+                    HeadersDependency::Chain { urgency: 0 },
+                    255,
+                )),
             ),
             ("chain-parent", None),
             (
                 "least-urgent",
-                Some(
-                    HeadersPriority::new(HeadersDependency::Chain { urgency: 255 }, 109)
-                        .exclusive(),
-                ),
+                Some(HeadersPriority::exclusive(
+                    HeadersDependency::Chain { urgency: 255 },
+                    109,
+                )),
             ),
             (
                 "declared-idle",
@@ -140,7 +142,7 @@ async fn headers_priority_defaults_overrides_and_chain_parents() {
             ),
             (
                 "root",
-                Some(HeadersPriority::new(HeadersDependency::Root, 219).exclusive()),
+                Some(HeadersPriority::exclusive(HeadersDependency::Root, 219)),
             ),
             (
                 "declared",
@@ -158,11 +160,10 @@ async fn headers_priority_defaults_overrides_and_chain_parents() {
         // An undeclared parent and a self-dependency are both rejected before a
         // stream ID is consumed: the next request still uses 19.
         for (path, dependency_id) in [("undeclared", 7), ("self", 19)] {
-            let override_ = HeadersPriority::new(
+            let override_ = HeadersPriority::exclusive(
                 HeadersDependency::Declared(h2::StreamId::from(dependency_id)),
                 0,
-            )
-            .exclusive();
+            );
             let err = client
                 .send_request(request(path, Some(override_)), true)
                 .unwrap_err();
@@ -222,9 +223,10 @@ async fn queued_chain_request_picks_parent_when_headers_are_written() {
 
     let client_task = async move {
         let mut builder = client::Builder::new();
-        builder.headers_priority(
-            HeadersPriority::new(HeadersDependency::Chain { urgency: 2 }, 182).exclusive(),
-        );
+        builder.headers_priority(HeadersPriority::exclusive(
+            HeadersDependency::Chain { urgency: 2 },
+            182,
+        ));
         let (client, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
 
         let mut client = connection.drive(client.ready()).await.unwrap();
@@ -287,9 +289,10 @@ async fn flow_control_reset_removes_chain_parent_before_queued_headers() {
 
     let client_task = async move {
         let mut builder = client::Builder::new();
-        builder.headers_priority(
-            HeadersPriority::new(HeadersDependency::Chain { urgency: 2 }, 182).exclusive(),
-        );
+        builder.headers_priority(HeadersPriority::exclusive(
+            HeadersDependency::Chain { urgency: 2 },
+            182,
+        ));
         let (mut client, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
 
         let (open, _stream) = client.send_request(request("open", None), false).unwrap();
@@ -341,9 +344,10 @@ async fn gracefully_closed_chain_parent_stays_until_final_frame_is_written() {
 
     let client_task = async move {
         let mut builder = client::Builder::new();
-        builder.headers_priority(
-            HeadersPriority::new(HeadersDependency::Chain { urgency: 2 }, 182).exclusive(),
-        );
+        builder.headers_priority(HeadersPriority::exclusive(
+            HeadersDependency::Chain { urgency: 2 },
+            182,
+        ));
         let (mut client, mut connection) = builder.handshake::<_, Bytes>(io).await.unwrap();
 
         let (upload, mut body) = client.send_request(request("upload", None), false).unwrap();
