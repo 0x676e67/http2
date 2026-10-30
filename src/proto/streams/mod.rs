@@ -20,7 +20,9 @@ pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, RecvOutcome, StreamR
 use self::buffer::Buffer;
 use self::counts::Counts;
 use self::flow_control::FlowControl;
-use self::headers_priority::{ChainParents, ChainState, HeadersPriorityConfig};
+pub(crate) use self::headers_priority::HeadersPriorityConfig;
+
+use self::headers_priority::{ChainParents, ChainState};
 use self::prioritize::Prioritize;
 use self::recv::Recv;
 use self::send::Send;

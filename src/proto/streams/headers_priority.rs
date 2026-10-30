@@ -3,14 +3,14 @@ use std::collections::BTreeSet;
 use super::stream::Stream;
 use crate::codec::UserError;
 use crate::ext::{HeadersDependency, HeadersPriority};
-use crate::frame::{StreamDependency, StreamId};
+use crate::frame::{Priorities, StreamDependency, StreamId};
 
 /// Least urgent level accepted by [`HeadersDependency::Chain`].
 const MAX_URGENCY: u8 = 7;
 
 /// Connection-level inputs for request `HEADERS` priority fields.
 #[derive(Debug)]
-pub(super) struct HeadersPriorityConfig {
+pub(crate) struct HeadersPriorityConfig {
     /// Used by requests that carry no priority of their own.
     default: Option<HeadersPriority>,
     /// Idle streams declared by the initial PRIORITY frames.
@@ -22,27 +22,52 @@ pub(super) struct HeadersPriorityConfig {
 impl HeadersPriorityConfig {
     /// Creates a connection's request priority configuration.
     ///
-    /// `default` is used when a request has no override. `declared` lists the
-    /// stream IDs declared by the initial PRIORITY frames.
-    /// The client handshake validates `default` before construction.
+    /// `declared` lists the stream IDs declared by the initial PRIORITY frames.
+    /// `default` must have passed [`Self::validate_default`].
     pub(super) fn new(default: Option<HeadersPriority>, declared: Vec<StreamId>) -> Self {
         Self { default, declared }
     }
 
-    /// Picks the request override or the connection default for `stream_id`.
+    /// Rejects a connection default whose `Declared` parent is undeclared or a
+    /// client stream at or above `first_stream_id`.
     ///
-    /// Runs before the stream ID is consumed, so a rejected request leaves the
-    /// stream ID space untouched. The default was validated at handshake. An
-    /// override is only rejected for an undeclared parent or a self-dependency
-    /// ([RFC 7540 §5.3.1]); depending on a declared idle stream that a later
-    /// request opens is allowed, unlike for the default.
+    /// A default applies to every request, so unlike an override it must not
+    /// name a stream that a later request opens ([RFC 7540 §5.3.1]).
     ///
     /// [RFC 7540 §5.3.1]: https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3.1
-    pub(super) fn select(
+    pub(crate) fn validate_default(
+        default: Option<HeadersPriority>,
+        priorities: Option<&Priorities>,
+        first_stream_id: StreamId,
+    ) -> Result<(), UserError> {
+        if let Some(HeadersPriority {
+            dependency: HeadersDependency::Declared(id),
+            ..
+        }) = default
+        {
+            let id = StreamId::from(id);
+            let is_declared = priorities
+                .is_some_and(|priorities| priorities.stream_ids().any(|declared| declared == id));
+            if !is_declared || (id.is_client_initiated() && id >= first_stream_id) {
+                return Err(UserError::InvalidHeadersDependency);
+            }
+        }
+        Ok(())
+    }
+
+    /// Picks the request override or the connection default for `stream_id`,
+    /// returning the dependency known now and the stream's chain state.
+    ///
+    /// Runs before the stream ID is consumed, so a rejected request leaves the
+    /// stream ID space untouched. An override is only rejected for an
+    /// undeclared parent or a self-dependency ([RFC 7540 §5.3.1]).
+    ///
+    /// [RFC 7540 §5.3.1]: https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3.1
+    pub(super) fn prepare(
         &self,
         request: Option<HeadersPriority>,
         stream_id: StreamId,
-    ) -> Result<Option<HeadersPriority>, UserError> {
+    ) -> Result<(Option<StreamDependency>, ChainState), UserError> {
         if let Some(HeadersPriority {
             dependency: HeadersDependency::Declared(id),
             ..
@@ -53,7 +78,9 @@ impl HeadersPriorityConfig {
                 return Err(UserError::InvalidHeadersDependency);
             }
         }
-        Ok(request.or(self.default))
+        Ok(request
+            .or(self.default)
+            .map_or((None, ChainState::None), ChainState::split))
     }
 }
 
@@ -77,7 +104,7 @@ pub(super) enum ChainState {
 
 impl ChainState {
     /// Returns the dependency known before writing, or defers a `Chain` parent.
-    pub(super) fn split(priority: HeadersPriority) -> (Option<StreamDependency>, Self) {
+    fn split(priority: HeadersPriority) -> (Option<StreamDependency>, Self) {
         let dependency_id = match priority.dependency {
             HeadersDependency::Root => StreamId::zero(),
             HeadersDependency::Declared(id) => id.into(),

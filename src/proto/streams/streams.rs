@@ -9,8 +9,8 @@ use http::{HeaderMap, Request, Response};
 use tokio::io::AsyncWrite;
 
 use super::{
-    Buffer, BufferStatus, ChainState, Config, Counts, HeadersPriorityConfig, Prioritized, Recv,
-    Send, Stream, StreamId,
+    Buffer, BufferStatus, Config, Counts, HeadersPriorityConfig, Prioritized, Recv, Send, Stream,
+    StreamId,
     frame::PseudoOrder,
     recv::RecvHeaderBlockError,
     store::{self, Entry, Resolve, Store},
@@ -348,14 +348,12 @@ where
             return Err(UserError::UnexpectedFrameType.into());
         }
 
-        let priority = me
-            .headers_priority
-            .select(request_priority, next_stream_id)?;
-        let stream_id = me.actions.send.open()?;
         // A `Chain` parent depends on which streams are still open when the
         // initial HEADERS is written, which can be later for queued requests.
-        let (stream_dependency, priority_chain) =
-            priority.map_or((None, ChainState::None), ChainState::split);
+        let (stream_dependency, priority_chain) = me
+            .headers_priority
+            .prepare(request_priority, next_stream_id)?;
+        let stream_id = me.actions.send.open()?;
 
         let mut stream = Stream::new(
             stream_id,

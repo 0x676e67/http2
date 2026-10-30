@@ -136,7 +136,7 @@
 //! [`Error`]: ../struct.Error.html
 
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::{HeadersDependency, HeadersPriority, Protocol};
+use crate::ext::{HeadersPriority, Protocol};
 #[cfg(feature = "unstable")]
 use crate::frame::ExperimentalSettings;
 use crate::frame::{Headers, Pseudo, Reason, Settings, StreamId};
@@ -1276,7 +1276,8 @@ impl Builder {
     /// Sets the default priority fields of outgoing request `HEADERS` frames.
     ///
     /// A request carrying its own [`HeadersPriority`] extension replaces this
-    /// default. The handshake fails if a [`HeadersDependency::Declared`] parent
+    /// default. The handshake fails if a
+    /// [`HeadersDependency::Declared`](crate::ext::HeadersDependency::Declared) parent
     /// is missing from [`Builder::priorities`] or could be a later request's
     /// own stream.
     ///
@@ -1518,23 +1519,11 @@ where
             })
             .transpose()?;
 
-        if let Some(HeadersPriority {
-            dependency: HeadersDependency::Declared(id),
-            ..
-        }) = builder.headers_priority
-        {
-            let id = StreamId::from(id);
-            let is_declared = builder
-                .priorities
-                .as_ref()
-                .is_some_and(|priorities| priorities.stream_ids().any(|declared| declared == id));
-            // A client-initiated ID at or above the first request stream would
-            // eventually depend on itself (RFC 7540 section 5.3.1).
-            // https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3.1
-            if !is_declared || (id.is_client_initiated() && id >= builder.stream_id) {
-                return Err(UserError::InvalidHeadersDependency.into());
-            }
-        }
+        proto::HeadersPriorityConfig::validate_default(
+            builder.headers_priority,
+            builder.priorities.as_ref(),
+            builder.stream_id,
+        )?;
 
         // RFC 9113 section 3.4 requires the client magic to be followed by
         // SETTINGS. Both are prepared without I/O; the connection driver writes

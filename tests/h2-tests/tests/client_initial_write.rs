@@ -373,11 +373,10 @@ async fn initial_connection_write_is_separate_from_profile_headers() {
                             ])
                             .build(),
                     )
-                    .headers_priority(h2::ext::HeadersPriority::new(
-                        h2::ext::HeadersDependency::Root,
-                        u8::MAX,
-                        true,
-                    ));
+                    .headers_priority(
+                        h2::ext::HeadersPriority::new(h2::ext::HeadersDependency::Root, u8::MAX)
+                            .exclusive(),
+                    );
 
                 (
                     [(1, 65_536), (2, 0), (4, 6_291_456), (6, 262_144)],
@@ -1454,11 +1453,9 @@ async fn initial_stream_window_update_follows_complete_header_block() {
 
     let mut request = Request::builder()
         .uri("https://example.com/large")
-        .extension(h2::ext::HeadersPriority::new(
-            h2::ext::HeadersDependency::Root,
-            219,
-            true,
-        ));
+        .extension(
+            h2::ext::HeadersPriority::new(h2::ext::HeadersDependency::Root, 219).exclusive(),
+        );
     for (name, value) in build_large_headers() {
         request = request.header(name, value);
     }
