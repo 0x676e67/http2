@@ -12,6 +12,7 @@ define_enum_with_values! {
     /// Each setting has a value that is a 32 bit unsigned integer (6.5.1.).
     ///
     /// See <https://datatracker.ietf.org/doc/html/rfc9113#name-defined-settings>.
+    #[non_exhaustive]
     @U16
     pub enum SettingId {
         /// This setting allows the sender to inform the remote endpoint

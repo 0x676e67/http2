@@ -97,6 +97,7 @@ define_enum_with_values! {
     /// HTTP/2 pseudo-header fields are a set of predefined header fields that start with ':'.
     /// The order of these fields in a header block is significant. This enum defines the
     /// possible pseudo-header fields and their standard order according to RFC 7540.
+    #[non_exhaustive]
     @U8
     pub enum PseudoId {
         /// The `:method` pseudo-header.
