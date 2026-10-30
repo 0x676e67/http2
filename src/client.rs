@@ -334,7 +334,7 @@ pub struct Builder {
     /// Maximum amount of bytes to "buffer" for writing per stream.
     max_send_buffer_size: usize,
 
-    /// Cap on sent DATA payloads, below the peer's max frame size.
+    /// Cap on sent DATA payloads; the peer's max frame size still applies.
     max_send_data_frame_size: Option<u32>,
 
     /// Maximum number of locally reset streams to keep at a time.
@@ -812,21 +812,20 @@ impl Builder {
     /// DATA frames stay within `max` even when the peer allows larger frames,
     /// since endpoints need not use all available space in a frame
     /// ([RFC 9113 §4.2]). Flow control can only make them smaller. A zero
-    /// `max` is treated as one. By default only the peer's
+    /// `max` is treated as one. Very small values send many small frames,
+    /// which peers may treat as abuse. By default only the peer's
     /// `SETTINGS_MAX_FRAME_SIZE` applies.
     ///
     /// When the I/O object supports vectored writes, the DATA queued on a
-    /// stream is also coalesced into frames of that size without waiting for
-    /// more, as DATA frames carry arbitrary sequences of octets
-    /// ([RFC 9113 §6.1]). Otherwise, as by default, each `send_data` chunk is
-    /// framed on its own, since each part would take its own write.
+    /// stream is also coalesced into frames of up to that size, at most 63
+    /// chunks each, without waiting for more, as DATA frames carry arbitrary
+    /// sequences of octets. Otherwise, as by default, each `send_data` chunk
+    /// is framed on its own, since each part would take its own write.
     ///
-    /// With 16,375 bytes, a frame and its 9-byte header fill one TLS record of
-    /// at most 2^14 bytes ([RFC 8446 §5.1]).
+    /// With 16,375 bytes, a frame and its 9-byte header add up to 2^14 bytes,
+    /// the max plaintext of a TLS record.
     ///
     /// [RFC 9113 §4.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2
-    /// [RFC 9113 §6.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.1
-    /// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
     pub fn max_send_data_frame_size(&mut self, max: u32) -> &mut Self {
         self.max_send_data_frame_size = Some(max);
         self

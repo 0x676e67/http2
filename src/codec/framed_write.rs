@@ -47,7 +47,7 @@ struct Encoder<B> {
     /// Max frame size, this is specified by the peer
     max_frame_size: FrameSize,
 
-    /// Local cap on DATA payloads, below `max_frame_size`
+    /// Local cap on DATA payloads; `max_frame_size` still applies
     max_data_frame_size: Option<FrameSize>,
 
     /// Chain payloads bigger than this.

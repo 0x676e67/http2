@@ -85,7 +85,7 @@ pub(crate) struct Prioritized<B> {
     // partly taken.
     rest: Vec<Take<B>>,
 
-    // Whether the chunk of the last part ends the stream
+    // Whether the last merged chunk ends the stream
     end_of_stream: bool,
 
     // The stream that this is associated with
