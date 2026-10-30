@@ -17,9 +17,9 @@ use tokio::io::AsyncWrite;
 #[derive(Debug)]
 pub(crate) struct PingPong {
     pending_ping: Option<PendingPing>,
-    pending_pongs: SmallVec<[PingPayload; 1]>,
     user_pings: Option<UserPingsRx>,
     preface_ping: Option<PrefacePing>,
+    pending_pongs: SmallVec<[PingPayload; 1]>,
 }
 
 /// PING sent after the next HEADERS frame or ahead of the next non-empty DATA
@@ -102,9 +102,9 @@ impl PingPong {
     pub(crate) fn new(preface_ping: Option<Duration>) -> Self {
         PingPong {
             pending_ping: None,
-            pending_pongs: SmallVec::new(),
             user_pings: None,
             preface_ping: preface_ping.map(PrefacePing::new),
+            pending_pongs: SmallVec::new(),
         }
     }
 
