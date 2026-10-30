@@ -403,10 +403,11 @@ impl Decoder {
             }
         }
 
-        if implicit_block && !src.has_remaining() {
-            if let Some(error) = self.table_size.end_header_block()? {
-                return Err(error);
-            }
+        if implicit_block
+            && !src.has_remaining()
+            && let Some(error) = self.table_size.end_header_block()?
+        {
+            return Err(error);
         }
 
         Ok(())

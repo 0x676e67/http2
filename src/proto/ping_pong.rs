@@ -116,11 +116,12 @@ impl PingPong {
                 self.pending_ping = Some(pending);
             }
 
-            if let Some(ref users) = self.user_pings {
-                if ping.payload() == &Ping::USER && users.receive_pong() {
-                    tracing::trace!("recv PING USER ack");
-                    return ReceivedPing::Unknown;
-                }
+            if let Some(ref users) = self.user_pings
+                && ping.payload() == &Ping::USER
+                && users.receive_pong()
+            {
+                tracing::trace!("recv PING USER ack");
+                return ReceivedPing::Unknown;
             }
 
             // else we were acked a ping we didn't send?
@@ -146,7 +147,7 @@ impl PingPong {
         B: Buf,
     {
         if let Some(pong) = self.pending_pong.take() {
-            if !dst.poll_ready(cx)?.is_ready() {
+            if !dst.poll_send_capacity(cx)?.is_ready() {
                 self.pending_pong = Some(pong);
                 return Poll::Pending;
             }
@@ -170,7 +171,7 @@ impl PingPong {
     {
         if let Some(ref mut ping) = self.pending_ping {
             if !ping.sent {
-                if !dst.poll_ready(cx)?.is_ready() {
+                if !dst.poll_send_capacity(cx)?.is_ready() {
                     return Poll::Pending;
                 }
 
@@ -180,7 +181,7 @@ impl PingPong {
             }
         } else if let Some(ref users) = self.user_pings {
             if users.0.state.load(Ordering::Acquire) == USER_STATE_PENDING_PING {
-                if !dst.poll_ready(cx)?.is_ready() {
+                if !dst.poll_send_capacity(cx)?.is_ready() {
                     return Poll::Pending;
                 }
 

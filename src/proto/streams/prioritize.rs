@@ -378,6 +378,8 @@ impl Prioritize {
         let _res = self.flow.assign_capacity(inc);
         debug_assert!(_res.is_ok());
 
+        let held_key = store.held_key();
+
         // Assign newly acquired capacity to streams pending capacity.
         while self.flow.available() > 0 {
             let stream = match self.pending_capacity.pop(store) {
@@ -387,9 +389,13 @@ impl Prioritize {
 
             // Streams pending capacity may have been reset before capacity
             // became available. In that case, the stream won't want any
-            // capacity, and so we shouldn't "transition" on it, but just evict
-            // it and continue the loop.
+            // capacity, so evict it. If this queue was all that kept it, free
+            // it; it was unlinked when it closed, so this is safe inside
+            // `Store::for_each`. The caller transitions its own stream.
             if !(stream.state.is_send_streaming() || stream.buffered_send_data > 0) {
+                if held_key != Some(stream.key()) && stream.is_released() {
+                    counts.transition_after(stream, false);
+                }
                 continue;
             }
 
@@ -678,11 +684,11 @@ impl Prioritize {
 
         stream.buffered_send_data = 0;
         stream.requested_send_capacity = 0;
-        if let InFlightData::DataFrame(key) = self.in_flight_data_frame {
-            if stream.key() == key {
-                // This stream could get cleaned up now - don't allow the buffered frame to get reclaimed.
-                self.in_flight_data_frame = InFlightData::Drop;
-            }
+        if let InFlightData::DataFrame(key) = self.in_flight_data_frame
+            && stream.key() == key
+        {
+            // This stream could get cleaned up now - don't allow the buffered frame to get reclaimed.
+            self.in_flight_data_frame = InFlightData::Drop;
         }
     }
 
@@ -929,14 +935,14 @@ impl Prioritize {
     ) -> Option<store::Ptr<'s>> {
         tracing::trace!("schedule_pending_open");
         // check for any pending open streams
-        if counts.can_inc_num_send_streams() {
-            if let Some(mut stream) = self.pending_open.pop(store) {
-                tracing::trace!("schedule_pending_open; stream={:?}", stream.id);
+        if counts.can_inc_num_send_streams()
+            && let Some(mut stream) = self.pending_open.pop(store)
+        {
+            tracing::trace!("schedule_pending_open; stream={:?}", stream.id);
 
-                counts.inc_num_send_streams(&mut stream);
-                stream.notify_send();
-                return Some(stream);
-            }
+            counts.inc_num_send_streams(&mut stream);
+            stream.notify_send();
+            return Some(stream);
         }
 
         None

@@ -468,10 +468,10 @@ impl Recv {
         let _res = self.flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
 
-        if self.flow.unclaimed_capacity().is_some() {
-            if let Some(task) = task.take() {
-                task.wake();
-            }
+        if self.flow.unclaimed_capacity().is_some()
+            && let Some(task) = task.take()
+        {
+            task.wake();
         }
     }
 
@@ -576,10 +576,10 @@ impl Recv {
         // If changing the target capacity means we gained a bunch of capacity,
         // enough that we went over the update threshold, then schedule sending
         // a connection WINDOW_UPDATE.
-        if self.flow.unclaimed_capacity().is_some() {
-            if let Some(task) = task.take() {
-                task.wake();
-            }
+        if self.flow.unclaimed_capacity().is_some()
+            && let Some(task) = task.take()
+        {
+            task.wake();
         }
         Ok(())
     }
@@ -622,13 +622,18 @@ impl Recv {
                     tracing::trace!("decrementing all windows; dec={}", dec);
 
                     store.try_for_each(|mut stream| {
-                        if self.apply_request_window_settings(&mut stream, target)? {
-                            return Ok(());
+                        if !self.apply_request_window_settings(&mut stream, target)? {
+                            stream
+                                .recv_flow
+                                .dec_recv_window(dec)
+                                .map_err(proto::Error::library_go_away)?;
                         }
-                        stream
-                            .recv_flow
-                            .dec_recv_window(dec)
-                            .map_err(proto::Error::library_go_away)?;
+                        // Capacity released before the ACK can cross the
+                        // WINDOW_UPDATE threshold once the window shrinks.
+                        // Nothing else queues it, so the peer would stall.
+                        if stream.recv_flow.unclaimed_capacity().is_some() {
+                            self.pending_window_updates.push(&mut stream);
+                        }
                         Ok::<_, proto::Error>(())
                     })?;
                 }
@@ -897,14 +902,14 @@ impl Recv {
 
     /// Ensures that `id` is not in the `Idle` state.
     pub fn ensure_not_idle(&self, id: StreamId) -> Result<(), Reason> {
-        if let Ok(next) = self.next_stream_id {
-            if id >= next {
-                tracing::debug!(
-                    "stream ID implicitly closed, PROTOCOL_ERROR; stream={:?}",
-                    id
-                );
-                return Err(Reason::PROTOCOL_ERROR);
-            }
+        if let Ok(next) = self.next_stream_id
+            && id >= next
+        {
+            tracing::debug!(
+                "stream ID implicitly closed, PROTOCOL_ERROR; stream={:?}",
+                id
+            );
+            return Err(Reason::PROTOCOL_ERROR);
         }
         // if next_stream_id is overflowed, that's ok.
 
@@ -1365,10 +1370,10 @@ impl Recv {
     }
 
     pub(crate) fn sent_local_settings(&mut self, settings: &frame::Settings) {
-        if self.initial_target_stream_window_sz.is_some() {
-            if let Some(size) = settings.initial_window_size() {
-                self.sent_initial_window_sz = size;
-            }
+        if self.initial_target_stream_window_sz.is_some()
+            && let Some(size) = settings.initial_window_size()
+        {
+            self.sent_initial_window_sz = size;
         }
     }
 
