@@ -44,10 +44,12 @@ async fn headers_priority_defaults_overrides_and_chain_parents() {
     };
 
     // A default must name a declared stream that no request opens: stream 3 is
-    // undeclared and declared stream 5 would be a request's own stream, while
-    // declared stream 3 below the first request stream 5 is accepted.
+    // undeclared and declared stream 5 would be the first or a later request's
+    // own stream, while declared stream 3 below the first request stream 5 is
+    // accepted.
     for (initial_stream_id, dependency_id, declared_id, is_valid) in [
         (1, 3, None, false),
+        (5, 5, Some(5), false),
         (3, 5, Some(5), false),
         (5, 3, Some(3), true),
     ] {
@@ -349,6 +351,11 @@ async fn gracefully_closed_chain_parent_stays_until_final_frame_is_written() {
         peer.recv_frame(frames::data(1, "x").eos()).await;
         peer.send_frame(frames::headers(3).response(204).eos())
             .await;
+        // Writing that DATA closed stream 1, so it is no longer a parent.
+        peer.recv_frame(request_headers(5, "after", (0, 182, true)))
+            .await;
+        peer.send_frame(frames::headers(5).response(204).eos())
+            .await;
     };
 
     let client_task = async move {
@@ -366,6 +373,9 @@ async fn gracefully_closed_chain_parent_stays_until_final_frame_is_written() {
 
         let next = client.send_request(request("next", None), true).unwrap().0;
         let response = connection.drive(next).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let after = client.send_request(request("after", None), true).unwrap().0;
+        let response = connection.drive(after).await.unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         drop((client, body));
         connection.await.unwrap();

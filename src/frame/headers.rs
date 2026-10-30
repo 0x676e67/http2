@@ -92,13 +92,13 @@ pub struct Pseudo {
 }
 
 define_enum_with_values! {
-    /// Represents the order of HTTP/2 pseudo-header fields in the header block.
+    /// Identifies an HTTP/2 pseudo-header field ([RFC 9113 §8.3]).
     ///
-    /// HTTP/2 pseudo-header fields are a set of predefined header fields that start with ':'.
-    /// The order of these fields in a header block is significant. This enum defines the
-    /// possible pseudo-header fields and their standard order according to RFC 7540.
-    #[non_exhaustive]
+    /// The declaration order is the default order of [`PseudoOrder`].
+    ///
+    /// [RFC 9113 §8.3]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3
     @U8
+    #[non_exhaustive]
     pub enum PseudoId {
         /// The `:method` pseudo-header.
         Method => 0x0001,
@@ -115,15 +115,14 @@ define_enum_with_values! {
     }
 }
 
-/// Represents the order of HTTP/2 pseudo-header fields in a header block.
+/// The order of pseudo-header fields in outgoing request `HEADERS`.
 ///
-/// This structure maintains an ordered list of pseudo-header fields (such as `:method`, `:scheme`, etc.)
-/// for use when encoding or decoding HTTP/2 header blocks. The order of pseudo-headers is significant
-/// according to the HTTP/2 specification, and this type ensures that the correct order is preserved
-/// and that no duplicates are present.
+/// Set with [`Builder::headers_pseudo_order`](crate::client::Builder::headers_pseudo_order).
+/// Any order is valid, since pseudo-header fields only have to precede regular
+/// fields ([RFC 9113 §8.3]). [`PseudoOrderBuilder`] drops repeats and appends
+/// missing fields in [`PseudoId`] declaration order.
 ///
-/// Typically, a `PseudoOrder` is costructed using the [`PseudoOrderBuilder`] to enforce uniqueness
-/// and protocol-compliant ordering.
+/// [RFC 9113 §8.3]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PseudoOrder {
     ids: SmallVec<[PseudoId; PseudoId::DEFAULT_STACK_SIZE]>,

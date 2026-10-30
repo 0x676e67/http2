@@ -1258,7 +1258,7 @@ impl Builder {
     /// Sets the order of settings parameters in the initial SETTINGS frame.
     ///
     /// This determines the order in which settings are sent during the HTTP/2 handshake.
-    /// Customizing the order may be useful for testing or protocol compliance.
+    /// Customizing the order may be useful for interoperability or testing purposes.
     pub fn settings_order(&mut self, order: SettingsOrder) -> &mut Self {
         self.settings.set_settings_order(order);
         self

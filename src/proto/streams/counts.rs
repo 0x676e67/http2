@@ -85,13 +85,13 @@ pub(super) struct Counts {
     /// Whether the DATA frame budget follows the target connection window.
     data_frame_budget_is_auto: bool,
 
-    /// Open requests offered as `HEADERS` chain parents. Kept here because
-    /// every stream close passes through [`Counts::transition_after`].
-    chain_parents: ChainParents,
-
     /// Number of empty, non-final DATA frames received over the lifetime of
     /// the connection.
     num_recv_empty_data_frames: usize,
+
+    /// Open requests offered as `HEADERS` chain parents. Kept here because
+    /// every stream close passes through [`Counts::transition_after`].
+    chain_parents: ChainParents,
 }
 
 impl Counts {
@@ -111,8 +111,8 @@ impl Counts {
             num_local_error_reset_streams: 0,
             data_frame_budget: Budget::new(config.data_frame_budget.resolve(None)),
             data_frame_budget_is_auto: config.data_frame_budget.is_auto(),
-            chain_parents: ChainParents::default(),
             num_recv_empty_data_frames: 0,
+            chain_parents: ChainParents::default(),
         }
     }
 

@@ -7,6 +7,7 @@ macro_rules! define_enum_with_values {
     (
         $(#[$enum_meta:meta])*
         @U16
+        $(#[$enum_attr:meta])*
         $vis:vis enum $name:ident {
             $(
                 $(#[$variant_meta:meta])*
@@ -15,6 +16,7 @@ macro_rules! define_enum_with_values {
         }
     ) => {
         $(#[$enum_meta])*
+        $(#[$enum_attr])*
         #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
         #[repr(u16)]
         $vis enum $name {
@@ -71,6 +73,7 @@ macro_rules! define_enum_with_values {
     (
         $(#[$enum_meta:meta])*
         @U8
+        $(#[$enum_attr:meta])*
         $vis:vis enum $name:ident {
             $(
                 $(#[$variant_meta:meta])*
@@ -79,6 +82,7 @@ macro_rules! define_enum_with_values {
         }
     ) => {
         $(#[$enum_meta])*
+        $(#[$enum_attr])*
         #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
         #[repr(u8)]
         $vis enum $name {

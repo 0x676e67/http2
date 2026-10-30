@@ -6,14 +6,11 @@ use bytes::{BufMut, BytesMut};
 use smallvec::SmallVec;
 
 define_enum_with_values! {
-    /// An enum that lists all valid settings that can be sent in a SETTINGS
-    /// frame.
+    /// Identifies a SETTINGS parameter ([RFC 9113 §6.5.2]).
     ///
-    /// Each setting has a value that is a 32 bit unsigned integer (6.5.1.).
-    ///
-    /// See <https://datatracker.ietf.org/doc/html/rfc9113#name-defined-settings>.
-    #[non_exhaustive]
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     @U16
+    #[non_exhaustive]
     pub enum SettingId {
         /// This setting allows the sender to inform the remote endpoint
         /// of the maximum size of the compression table used to decode field blocks,
@@ -42,21 +39,22 @@ define_enum_with_values! {
         /// Enables support for the Extended CONNECT protocol.
         EnableConnectProtocol => 0x0008,
 
-        /// Disable RFC 7540 Stream Priorities.
-        /// [RFC 9218]: <https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1>
+        /// Signals that the sender does not use RFC 7540 priorities
+        /// ([RFC 9218 §2.1]).
+        ///
+        /// [RFC 9218 §2.1]: https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1
         NoRfc7540Priorities => 0x0009,
     }
 }
 
-/// Represents the order of settings in a SETTINGS frame.
+/// The order of parameters in the initial client SETTINGS frame.
 ///
-/// This structure maintains an ordered list of `SettingId` values for use when encoding or decoding
-/// HTTP/2 SETTINGS frames. The order of settings can be important for protocol compliance, testing,
-/// or interoperability. `SettingsOrder` ensures that the specified order is preserved and that no
-/// duplicate settings are present.
+/// Set with [`Builder::settings_order`](crate::client::Builder::settings_order).
+/// The protocol requires no particular order; receivers apply parameters in
+/// the order they appear ([RFC 9113 §6.5.3]). [`SettingsOrderBuilder`] drops
+/// repeats and appends missing settings in [`SettingId`] declaration order.
 ///
-/// Typically, a `SettingsOrder` is constructed using the [`SettingsOrderBuilder`] to enforce uniqueness
-/// and protocol-compliant ordering.
+/// [RFC 9113 §6.5.3]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.3
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct SettingsOrder {
     ids: SmallVec<[SettingId; SettingId::DEFAULT_STACK_SIZE]>,
@@ -105,8 +103,10 @@ impl<'a> IntoIterator for &'a SettingsOrder {
 
 impl SettingsOrderBuilder {
     /// Appends a setting unless one with the same numeric ID was already
-    /// pushed. IDs 0 and above 15 are ignored.
+    /// pushed. `Unknown` with a defined ID is treated as that setting, and IDs
+    /// 0 and above 15 are ignored.
     pub fn push(mut self, id: SettingId) -> Self {
+        let id = SettingId::from(u16::from(id));
         let mask_id = id.mask_id();
         if mask_id != 0 {
             if self.mask & mask_id == 0 {
@@ -700,13 +700,20 @@ mod tests {
     #[test]
     fn test_settings_order_duplicate() {
         let order = SettingsOrder::builder()
+            .push(SettingId::Unknown(4))
             .push(SettingId::HeaderTableSize)
             .push(SettingId::HeaderTableSize)
             .build();
 
         assert_eq!(order.ids.len(), SettingId::DEFAULT_IDS.len());
-        assert_eq!(order.ids[0], SettingId::HeaderTableSize);
-        assert_ne!(order.ids[1], SettingId::HeaderTableSize);
+        assert_eq!(
+            order.ids[..3],
+            [
+                SettingId::InitialWindowSize,
+                SettingId::HeaderTableSize,
+                SettingId::EnablePush
+            ]
+        );
     }
 
     #[cfg(feature = "unstable")]

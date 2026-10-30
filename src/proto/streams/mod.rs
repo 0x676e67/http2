@@ -12,6 +12,7 @@ mod stream;
 mod streams;
 mod sync;
 
+pub(crate) use self::headers_priority::HeadersPriorityPolicy;
 pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
 pub(crate) use self::send::PollReset;
@@ -20,8 +21,6 @@ pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, RecvOutcome, StreamR
 use self::buffer::Buffer;
 use self::counts::Counts;
 use self::flow_control::FlowControl;
-pub(crate) use self::headers_priority::HeadersPriorityPolicy;
-
 use self::headers_priority::{ChainLink, ChainParents};
 use self::prioritize::Prioritize;
 use self::recv::Recv;

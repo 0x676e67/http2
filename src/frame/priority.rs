@@ -5,10 +5,12 @@ use crate::tracing;
 use bytes::BufMut;
 use smallvec::SmallVec;
 
-/// The PRIORITY frame (type=0x2) specifies the sender-advised priority
-/// of a stream [Section 5.3].  It can be sent in any stream state,
-/// including idle or closed streams.
-/// [Section 5.3]: <https://tools.ietf.org/html/rfc7540#section-5.3>
+/// The PRIORITY frame (type=0x2) specifies the sender-advised priority of a
+/// stream ([RFC 9113 §6.3]) using the dependency scheme of [RFC 7540 §5.3].
+/// It can be sent in any stream state, including idle or closed streams.
+///
+/// [RFC 9113 §6.3]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.3
+/// [RFC 7540 §5.3]: https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Priority {
     /// The stream ID of the stream that this priority frame is for
@@ -154,13 +156,10 @@ impl StreamDependency {
 
 const DEFAULT_STACK_SIZE: usize = 8;
 
-/// A collection of HTTP/2 PRIORITY frames.
+/// An ordered list of PRIORITY frames.
 ///
-/// The `Priorities` struct maintains an ordered list of `Priority` frames,
-/// which can be used to represent and manage the stream dependency tree
-/// in HTTP/2. This is useful for pre-configuring stream priorities or
-/// sending multiple PRIORITY frames at once during connection setup or
-/// stream reprioritization.
+/// [`Builder::priorities`](crate::client::Builder::priorities) sends them once
+/// at connection setup to declare idle streams in the dependency tree.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Priorities {
     priorities: SmallVec<[Priority; DEFAULT_STACK_SIZE]>,
