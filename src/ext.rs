@@ -111,7 +111,7 @@ pub enum HeadersDependency {
 /// ```
 /// use http2::ext::{HeadersDependency, HeadersPriority};
 ///
-/// let priority = HeadersPriority::exclusive(HeadersDependency::Chain { urgency: 1 }, 219);
+/// let priority = HeadersPriority::new(HeadersDependency::Chain { urgency: 1 }, 219, true);
 /// let request = http::Request::builder().extension(priority).body(())?;
 /// # let _ = request;
 /// # Ok::<(), http::Error>(())
@@ -129,28 +129,18 @@ pub struct HeadersPriority {
 // ===== impl HeadersPriority =====
 
 impl HeadersPriority {
-    /// Creates non-exclusive `HEADERS` priority fields.
+    /// Creates `HEADERS` priority fields.
     ///
     /// `weight` is the wire value `0..=255`, one less than the effective weight.
-    pub const fn new(dependency: HeadersDependency, weight: u8) -> Self {
-        Self {
-            dependency,
-            weight,
-            is_exclusive: false,
-        }
-    }
-
-    /// Creates exclusive `HEADERS` priority fields, making the request the sole
-    /// child of its parent ([RFC 7540 §5.3.1]).
-    ///
-    /// `weight` is the wire value `0..=255`, as for [`new`](Self::new).
+    /// `is_exclusive` makes the request the sole child of its parent
+    /// ([RFC 7540 §5.3.1]).
     ///
     /// [RFC 7540 §5.3.1]: https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3.1
-    pub const fn exclusive(dependency: HeadersDependency, weight: u8) -> Self {
+    pub const fn new(dependency: HeadersDependency, weight: u8, is_exclusive: bool) -> Self {
         Self {
             dependency,
             weight,
-            is_exclusive: true,
+            is_exclusive,
         }
     }
 
