@@ -24,6 +24,8 @@ const DATA_LIMIT: usize = 2 * TRANSPORT_BUFFER;
 struct BufferedIo {
     inner: mock::Mock,
     link: Arc<Mutex<Link>>,
+    /// Reads made after the input ended.
+    reads_after_end: usize,
 }
 
 struct Link {
@@ -36,6 +38,8 @@ struct Link {
     waker: Option<Waker>,
     /// Bytes the endpoint has read.
     read: usize,
+    /// Set once the input ends: reads then fail if `true`, else see EOF.
+    end: Option<bool>,
 }
 
 /// Peer side of a `BufferedIo`.
@@ -49,9 +53,15 @@ fn buffered_io(inner: mock::Mock) -> (BufferedIo, Drain) {
         refusals: 0,
         waker: None,
         read: 0,
+        end: None,
     }));
     let drain = Drain(link.clone());
-    (BufferedIo { inner, link }, drain)
+    let io = BufferedIo {
+        inner,
+        link,
+        reads_after_end: 0,
+    };
+    (io, drain)
 }
 
 impl Link {
@@ -112,6 +122,15 @@ impl Drain {
             waker.wake();
         }
     }
+
+    /// Ends the input with an error, or with EOF if not `error`.
+    fn end(&self, error: bool) {
+        let mut link = self.0.lock().unwrap();
+        link.end = Some(error);
+        if let Some(waker) = link.waker.take() {
+            waker.wake();
+        }
+    }
 }
 
 impl AsyncRead for BufferedIo {
@@ -121,6 +140,18 @@ impl AsyncRead for BufferedIo {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        let end = this.link.lock().unwrap().end;
+        if let Some(error) = end {
+            this.reads_after_end += 1;
+            // Reading must stop at the end rather than spin on it.
+            assert!(this.reads_after_end <= 8, "read on after the end");
+            return Poll::Ready(if error {
+                Err(io::ErrorKind::ConnectionReset.into())
+            } else {
+                Ok(())
+            });
+        }
+
         let filled = buf.filled().len();
         futures::ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
         this.link.lock().unwrap().read += buf.filled().len() - filled;
@@ -563,8 +594,9 @@ async fn close_while_blocked(close: Close) {
             let (_request, mut respond) = conn.next().await.unwrap().unwrap();
             let mut stream = respond.send_response(Response::new(()), false).unwrap();
             if !matches!(close, Close::AbruptFlush) {
+                // Within the initial window, so stream 1 can end.
                 stream
-                    .send_data(Bytes::from(vec![0; BODY_LEN]), true)
+                    .send_data(Bytes::from_static(&[0; 16 * 1024]), true)
                     .unwrap();
             }
 
@@ -645,6 +677,11 @@ async fn close_while_blocked(close: Close) {
                     "{:?}: stopped reading",
                     close
                 );
+                // Then the input ends with an error or EOF.
+                drain.end(matches!(close, Close::Abrupt));
+                for _ in 0..8 {
+                    util::yield_once().await;
+                }
                 vec![frames::go_away(1).into()]
             }
         };
@@ -659,19 +696,23 @@ async fn close_while_blocked(close: Close) {
             }
         }
         assert_eq!(control, expected, "{:?}", close);
+        peer
     };
 
     // Spawned, so the server only runs when woken.
     let server = tokio::spawn(server);
-    peer.await;
-    match close {
-        // The connection still waits for the PING ACK.
-        Close::Graceful => {
-            assert!(!server.is_finished(), "{:?}: server ended", close);
-            server.abort();
+    let mut peer = peer.await;
+    if let Close::Graceful = close {
+        // No stream is left, yet the connection waits for the PING ACK.
+        for _ in 0..8 {
+            util::yield_once().await;
         }
-        Close::Abrupt | Close::AbruptFlush => server.await.unwrap(),
+        assert!(!server.is_finished(), "{:?}: closed early", close);
+        peer.send_frame(frames::ping(frame::Ping::SHUTDOWN).pong())
+            .await;
+        peer.recv_frame(frames::go_away(3)).await;
     }
+    server.await.unwrap();
 }
 
 #[tokio::test]
