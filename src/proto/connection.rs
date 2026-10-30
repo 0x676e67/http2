@@ -477,6 +477,10 @@ where
                                 self.inner.read_activity = true;
                             }
 
+                            // Frames that may rely on received SETTINGS
+                            // follow their ACK.
+                            ready!(self.inner.settings.poll_send_acks(cx, &mut self.codec))?;
+
                             // Ensure all window updates have been sent.
                             //
                             // This will also handle flushing `self.codec`

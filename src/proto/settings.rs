@@ -2,16 +2,21 @@ use crate::codec::UserError;
 use crate::error::Reason;
 use crate::proto::*;
 use crate::tracing;
+use std::collections::VecDeque;
+use std::io;
 use std::task::{Context, Poll};
+
+/// SETTINGS ACKs that may wait for write capacity while reading goes on.
+/// Reading stops at this many, so a SETTINGS flood cannot grow the queue.
+const MAX_PENDING_ACKS: usize = 16;
 
 #[derive(Debug)]
 pub(crate) struct Settings {
     /// Our local SETTINGS sync state with the remote.
     local: Local,
-    /// Received SETTINGS frame pending processing. The ACK must be written to
-    /// the socket first then the settings applied **before** receiving any
-    /// further frames.
-    remote: Option<frame::Settings>,
+    /// Received SETTINGS frames whose ACK is not written yet. They are applied
+    /// on receipt, except for the codec, which picks them up with the ACK.
+    remote: VecDeque<frame::Settings>,
     /// Whether the connection has received the initial SETTINGS frame from the
     /// remote peer.
     has_received_remote_initial_settings: bool,
@@ -36,7 +41,7 @@ impl Settings {
             // The initial local SETTINGS are already buffered in the codec and
             // are written by the connection's initial send path.
             local: Local::WaitingAck(local),
-            remote: None,
+            remote: VecDeque::new(),
             has_received_remote_initial_settings: false,
             remote_extended_connect: false,
         }
@@ -83,10 +88,18 @@ impl Settings {
                 }
             }
         } else {
-            // We always ACK before reading more frames, so `remote` should
-            // always be none!
-            assert!(self.remote.is_none());
-            self.remote = Some(frame);
+            // Frames read before the ACK can be written must see these.
+            // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.3
+            let is_initial = self.mark_remote_initial_settings_as_received();
+            streams.apply_remote_settings(&frame, is_initial)?;
+            if let Some(enabled) = frame.is_extended_connect_protocol_enabled() {
+                self.remote_extended_connect = enabled;
+            }
+
+            // `poll_send` returns ready before more frames are read, so there
+            // is room for another ACK.
+            assert!(self.remote.len() < MAX_PENDING_ACKS);
+            self.remote.push_back(frame);
             Ok(())
         }
     }
@@ -124,40 +137,20 @@ impl Settings {
         C: Buf,
         P: Peer,
     {
-        if let Some(settings) = self.remote.clone() {
-            if !dst.poll_send_capacity(cx)?.is_ready() {
-                return Poll::Pending;
-            }
-
-            // Create an ACK settings frame
-            let frame = frame::Settings::ack();
-
-            // Buffer the settings frame
-            dst.buffer(frame.into()).expect("invalid settings frame");
-
-            tracing::trace!("ACK sent; applying settings");
-
-            let is_initial = self.mark_remote_initial_settings_as_received();
-            streams.apply_remote_settings(&settings, is_initial)?;
-            if let Some(enabled) = settings.is_extended_connect_protocol_enabled() {
-                self.remote_extended_connect = enabled;
-            }
-
-            if let Some(val) = settings.header_table_size() {
-                dst.set_send_header_table_size(val as usize);
-            }
-
-            if let Some(val) = settings.max_frame_size() {
-                dst.set_max_send_frame_size(val as usize);
-            }
+        if self.poll_send_acks(cx, dst)?.is_pending() {
+            // Reading goes on while another ACK can be queued.
+            return if self.remote.len() < MAX_PENDING_ACKS {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            };
         }
-
-        self.remote = None;
 
         match &self.local {
             Local::ToSend(settings) => {
                 if !dst.poll_send_capacity(cx)?.is_ready() {
-                    return Poll::Pending;
+                    // Our SETTINGS can wait without stopping reads.
+                    return Poll::Ready(Ok(()));
                 }
 
                 // Buffer the settings frame
@@ -169,6 +162,46 @@ impl Settings {
                 self.local = Local::WaitingAck(settings.clone());
             }
             Local::WaitingAck(..) | Local::Synced => {}
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Buffers the ACKs owed for received SETTINGS, and returns `Pending`
+    /// until all of them are. Frames that may rely on those settings must
+    /// follow their ACK, since the peer applies them only once it reads it.
+    pub(crate) fn poll_send_acks<T, B>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, B>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        while let Some(settings) = self.remote.pop_front() {
+            if !dst.poll_send_capacity(cx)?.is_ready() {
+                self.remote.push_front(settings);
+                return Poll::Pending;
+            }
+
+            // Create an ACK settings frame
+            let frame = frame::Settings::ack();
+
+            // Buffer the settings frame
+            dst.buffer(frame.into()).expect("invalid settings frame");
+
+            tracing::trace!("ACK sent; applying codec settings");
+
+            // A new table size is signaled only after the ACK.
+            // https://www.rfc-editor.org/rfc/rfc7541.html#section-4.2
+            if let Some(val) = settings.header_table_size() {
+                dst.set_send_header_table_size(val as usize);
+            }
+
+            if let Some(val) = settings.max_frame_size() {
+                dst.set_max_send_frame_size(val as usize);
+            }
         }
 
         Poll::Ready(Ok(()))

@@ -4,7 +4,7 @@ use futures::{FutureExt, StreamExt};
 use h2_support::prelude::*;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use tokio::io::ReadBuf;
@@ -31,6 +31,8 @@ struct Link {
     cap: usize,
     /// Bytes the peer may still drain.
     credit: usize,
+    /// Writes to refuse, as if the socket became writable just after each.
+    refusals: usize,
     waker: Option<Waker>,
 }
 
@@ -42,6 +44,7 @@ fn buffered_io(inner: mock::Mock) -> (BufferedIo, Drain) {
         buf: Vec::new(),
         cap: usize::MAX,
         credit: usize::MAX,
+        refusals: 0,
         waker: None,
     }));
     let drain = Drain(link.clone());
@@ -77,6 +80,24 @@ impl Drain {
         self.0.lock().unwrap().buf.len()
     }
 
+    /// Makes every write wait until `resume`.
+    fn pause(&self) {
+        let mut link = self.0.lock().unwrap();
+        link.cap = 0;
+        link.credit = 0;
+    }
+
+    /// Lets writes through again after refusing the first `refusals`.
+    fn resume(&self, refusals: usize) {
+        let mut link = self.0.lock().unwrap();
+        link.cap = usize::MAX;
+        link.credit = usize::MAX;
+        link.refusals = refusals;
+        if let Some(waker) = link.waker.take() {
+            waker.wake();
+        }
+    }
+
     fn release(&self, n: usize) {
         let mut link = self.0.lock().unwrap();
         link.credit += n;
@@ -104,6 +125,11 @@ impl AsyncWrite for BufferedIo {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let mut link = this.link.lock().unwrap();
+        if link.refusals > 0 {
+            link.refusals -= 1;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
         link.forward(&mut this.inner, cx)?;
 
         let room = link.cap.saturating_sub(link.buf.len());
@@ -347,4 +373,149 @@ async fn control_frames_do_not_wait_for_backpressured_data() {
         }
     }
     assert!(stalled.is_empty(), "{:#?}", stalled);
+}
+
+/// Yields until `progress` reaches `step`, and returns whether it did.
+async fn reached(progress: &AtomicUsize, step: usize) -> bool {
+    for _ in 0..64 {
+        if progress.load(Ordering::SeqCst) >= step {
+            return true;
+        }
+        util::yield_once().await;
+    }
+    false
+}
+
+/// Matches the PONG and SETTINGS ACK queues of the connection.
+const MAX_QUEUED: u8 = 16;
+
+/// Control frames the peer floods a client with while its writes are blocked.
+#[derive(Clone, Copy, Debug)]
+enum Flood {
+    Pings,
+    Settings,
+}
+
+async fn read_while_blocked(flood: Flood, refusals: usize) {
+    let (io, mut peer) = mock::new();
+    let (io, drain) = buffered_io(io);
+    let (paused_tx, paused_rx) = oneshot::channel();
+    let progress = Arc::new(AtomicUsize::new(0));
+
+    let client = {
+        let progress = progress.clone();
+        async move {
+            let (mut client, mut conn) = client::handshake(io).await.unwrap();
+            let mut ping_pong = client::Connection::ping_pong(&mut conn).unwrap();
+            conn.drive(paused_rx).await.unwrap();
+            let request = Request::post("https://example.com/").body(()).unwrap();
+            let (response, mut stream) = client.send_request(request, false).unwrap();
+            stream
+                .send_data(Bytes::from(vec![0; BODY_LEN]), true)
+                .unwrap();
+            // Our PING and SETTINGS wait behind the DATA stuck in the codec.
+            conn.drive(util::yield_once()).await;
+            ping_pong.send_ping(Ping::opaque()).unwrap();
+            conn.set_initial_window_size(65_535).unwrap();
+
+            let mut body = conn.drive(response).await.unwrap().into_body();
+            // SETTINGS take effect before their ACK can be written.
+            assert!(client.is_extended_connect_protocol_enabled());
+            assert_eq!(conn.extended_connect_protocol(), Some(true));
+            for step in 1..=2 {
+                progress.store(step, Ordering::SeqCst);
+                conn.drive(body.data()).await.unwrap().unwrap();
+            }
+            progress.store(3, Ordering::SeqCst);
+            conn.await.unwrap();
+        }
+    };
+
+    let peer = async move {
+        peer.assert_client_handshake().await;
+        peer.send_frame(frames::window_update(0, BODY_LEN as u32))
+            .await;
+        drain.pause();
+        paused_tx.send(()).unwrap();
+        for _ in 0..8 {
+            util::yield_once().await;
+        }
+
+        // Nothing the client writes gets through, yet it reads past the PONG,
+        // SETTINGS ACK, PING and SETTINGS it cannot write.
+        peer.send_frame(frames::ping([1; 8])).await;
+        let settings = frames::settings()
+            .enable_connect_protocol(1)
+            .initial_window_size(BODY_LEN as u32);
+        peer.send_frame(settings).await;
+        peer.send_frame(frames::headers(1).response(200)).await;
+        assert!(reached(&progress, 1).await, "{:?}: stopped reading", flood);
+
+        // Reading goes on until a flood fills a queue, and stops there until
+        // writes drain.
+        for i in 0..MAX_QUEUED - 1 {
+            if i == MAX_QUEUED - 2 {
+                peer.send_frame(frames::data(1, "a")).await;
+                assert!(reached(&progress, 2).await, "{:?}: stopped early", flood);
+            }
+            match flood {
+                Flood::Pings => peer.send_frame(frames::ping([i + 2; 8])).await,
+                Flood::Settings => peer.send_frame(frames::settings()).await,
+            }
+        }
+        peer.send_frame(frames::data(1, "x").eos()).await;
+        assert!(
+            !reached(&progress, 3).await,
+            "{:?}: read past a full queue",
+            flood
+        );
+        drain.resume(refusals);
+
+        let (pongs_due, acks_due) = match flood {
+            Flood::Pings => (MAX_QUEUED, 1),
+            Flood::Settings => (1, MAX_QUEUED),
+        };
+        // Our own PING and SETTINGS get written too.
+        let (mut pongs, mut acks, mut ours, mut data) = (Vec::new(), 0, 0, 0);
+        while pongs.len() < pongs_due as usize || acks < acks_due || ours < 2 {
+            match peer.next().await.unwrap().unwrap() {
+                frame::Frame::Data(frame) if acks == 0 => data += frame.payload().len(),
+                frame::Frame::Settings(frame) if frame.is_ack() => acks += 1,
+                frame::Frame::Ping(frame) if frame.is_ack() => pongs.push(frame.payload()[0]),
+                frame::Frame::Ping(_) | frame::Frame::Settings(_) => ours += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(pongs, (1..=pongs_due).collect::<Vec<_>>());
+        // The peer widens its window only once it reads the ACK.
+        assert!(
+            data <= 65_535,
+            "{:?}: {} DATA bytes before the ACK",
+            flood,
+            data
+        );
+        assert!(
+            reached(&progress, 3).await,
+            "{:?}: reading did not resume",
+            flood
+        );
+    };
+
+    match select(Box::pin(peer), Box::pin(client)).await {
+        Either::Left(_) => {}
+        Either::Right(_) => panic!("{:?}: client finished before the peer", flood),
+    }
+}
+
+#[tokio::test]
+async fn reads_while_control_frames_wait_to_be_written() {
+    h2_support::trace_init!();
+
+    // A second refusal hits the ACK buffered right before stream frames.
+    for (flood, refusals) in [(Flood::Pings, 1), (Flood::Pings, 2), (Flood::Settings, 1)] {
+        let run = read_while_blocked(flood, refusals);
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .unwrap_or_else(|_| panic!("{:?} with {} refusals timed out", flood, refusals));
+    }
 }
