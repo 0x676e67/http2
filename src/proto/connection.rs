@@ -307,7 +307,8 @@ where
     /// Drops incoming bytes while our last frames wait to be written: the peer
     /// may wait for us to read before it reads them.
     ///
-    /// The bytes skip the codec, as no frame is read after this.
+    /// The bytes skip the codec, as no frame is read after this, but still
+    /// count as read activity.
     // Out of line, so the scratch buffer stays off the stack of `poll`.
     #[cold]
     #[inline(never)]
@@ -316,7 +317,9 @@ where
         loop {
             let mut buf = ReadBuf::new(&mut scratch);
             match Pin::new(self.codec.get_mut()).poll_read(cx, &mut buf) {
-                Poll::Ready(Ok(())) if !buf.filled().is_empty() => {}
+                Poll::Ready(Ok(())) if !buf.filled().is_empty() => {
+                    self.inner.read_activity = true;
+                }
                 // Stop on EOF or an error, and wait for the write side.
                 _ => return,
             }
