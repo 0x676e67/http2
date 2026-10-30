@@ -55,6 +55,10 @@ pub enum UserError {
 
     /// The configured per-stream receive window target is invalid.
     InvalidInitialStreamWindowSize,
+
+    /// A `HEADERS` priority depends on an undeclared stream or on the
+    /// request's own stream.
+    InvalidHeadersDependency,
 }
 
 // ===== impl SendError =====
@@ -105,6 +109,7 @@ impl fmt::Display for UserError {
             PeerDisabledServerPush => "sending PUSH_PROMISE to peer who disabled server push",
             InvalidInformationalStatusCode => "invalid informational status code",
             InvalidInitialStreamWindowSize => "invalid initial stream window size",
+            InvalidHeadersDependency => "invalid HEADERS priority dependency",
         })
     }
 }

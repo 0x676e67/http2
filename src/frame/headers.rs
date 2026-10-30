@@ -92,31 +92,37 @@ pub struct Pseudo {
 }
 
 define_enum_with_values! {
-    /// Represents the order of HTTP/2 pseudo-header fields in the header block.
+    /// Identifies an HTTP/2 pseudo-header field ([RFC 9113 §8.3]).
     ///
-    /// HTTP/2 pseudo-header fields are a set of predefined header fields that start with ':'.
-    /// The order of these fields in a header block is significant. This enum defines the
-    /// possible pseudo-header fields and their standard order according to RFC 7540.
+    /// The declaration order is the default order of [`PseudoOrder`].
+    ///
+    /// [RFC 9113 §8.3]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3
     @U8
+    #[non_exhaustive]
     pub enum PseudoId {
+        /// The `:method` pseudo-header.
         Method => 0x0001,
+        /// The `:scheme` pseudo-header.
         Scheme => 0x0002,
+        /// The `:authority` pseudo-header.
         Authority => 0x0003,
+        /// The `:path` pseudo-header.
         Path => 0x0004,
+        /// The `:protocol` pseudo-header.
         Protocol => 0x0005,
+        /// The `:status` pseudo-header.
         Status => 0x0006,
     }
 }
 
-/// Represents the order of HTTP/2 pseudo-header fields in a header block.
+/// The order of pseudo-header fields in outgoing request `HEADERS`.
 ///
-/// This structure maintains an ordered list of pseudo-header fields (such as `:method`, `:scheme`, etc.)
-/// for use when encoding or decoding HTTP/2 header blocks. The order of pseudo-headers is significant
-/// according to the HTTP/2 specification, and this type ensures that the correct order is preserved
-/// and that no duplicates are present.
+/// Set with [`Builder::headers_pseudo_order`](crate::client::Builder::headers_pseudo_order).
+/// Any order is valid, since pseudo-header fields only have to precede regular
+/// fields ([RFC 9113 §8.3]). [`PseudoOrderBuilder`] drops repeats and appends
+/// missing fields in [`PseudoId`] declaration order.
 ///
-/// Typically, a `PseudoOrder` is costructed using the [`PseudoOrderBuilder`] to enforce uniqueness
-/// and protocol-compliant ordering.
+/// [RFC 9113 §8.3]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PseudoOrder {
     ids: SmallVec<[PseudoId; PseudoId::DEFAULT_STACK_SIZE]>,
@@ -132,6 +138,7 @@ pub struct PseudoOrderBuilder {
 // ===== impl PseudoOrder =====
 
 impl PseudoOrder {
+    /// Creates a new [`PseudoOrderBuilder`].
     #[inline]
     pub fn builder() -> PseudoOrderBuilder {
         PseudoOrderBuilder {
@@ -163,6 +170,7 @@ impl<'a> IntoIterator for &'a PseudoOrder {
 // ===== impl PseudoOrderBuilder =====
 
 impl PseudoOrderBuilder {
+    /// Appends a pseudo-header, ignoring repeats.
     pub fn push(mut self, id: PseudoId) -> Self {
         let mask_id = id.mask_id();
         if mask_id != 0 {
@@ -176,6 +184,7 @@ impl PseudoOrderBuilder {
         self
     }
 
+    /// Appends every pseudo-header, ignoring repeats.
     pub fn extend(mut self, iter: impl IntoIterator<Item = PseudoId>) -> Self {
         for id in iter {
             self = self.push(id);
@@ -183,6 +192,7 @@ impl PseudoOrderBuilder {
         self
     }
 
+    /// Finishes the order, appending any pseudo-header not yet listed.
     pub fn build(mut self) -> PseudoOrder {
         if self.ids.len() != PseudoId::DEFAULT_IDS.len() {
             self = self.extend(PseudoId::DEFAULT_IDS);
@@ -305,7 +315,7 @@ impl Headers {
             }
             let stream_dep = StreamDependency::load(&src[..5])?;
 
-            if stream_dep.dependency_id() == head.stream_id() {
+            if stream_dep.dependency_id == head.stream_id() {
                 // RFC 9113 section 4.3 requires decoding the complete field
                 // block before rejecting only this stream, to keep HPACK in sync.
                 // https://www.rfc-editor.org/rfc/rfc9113.html#section-4.3
@@ -406,7 +416,7 @@ impl Headers {
     /// [RFC 7540 §5.3.1]: https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3.1
     /// [RFC 9113 §5.3.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.3.2
     pub fn set_stream_dependency(&mut self, stream_dep: StreamDependency) {
-        if stream_dep.dependency_id() == self.stream_id {
+        if stream_dep.dependency_id == self.stream_id {
             tracing::warn!(
                 "ignoring self-dependent HEADERS priority for stream_id={:?}",
                 self.stream_id

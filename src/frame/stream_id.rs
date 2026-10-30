@@ -92,3 +92,9 @@ impl PartialEq<u32> for StreamId {
         self.0 == *other
     }
 }
+
+impl From<crate::StreamId> for StreamId {
+    fn from(src: crate::StreamId) -> Self {
+        StreamId(src.as_u32())
+    }
+}

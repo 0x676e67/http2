@@ -1357,7 +1357,7 @@ impl<B: Buf> SendResponse<B> {
     ///
     /// If the lock on the stream store has been poisoned.
     pub fn stream_id(&self) -> crate::StreamId {
-        crate::StreamId::from_internal(self.inner.stream_id())
+        self.inner.stream_id().into()
     }
 }
 
@@ -1564,7 +1564,7 @@ where
                                 .local_max_error_reset_streams,
                             settings: self.builder.settings.clone(),
                             data_frame_budget: self.builder.data_frame_budget,
-                            headers_stream_dependency: None,
+                            headers_priority_policy: proto::HeadersPriorityPolicy::default(),
                             headers_pseudo_order: None,
                             priorities: None,
                             preface_ping: None,

@@ -1,5 +1,5 @@
 use crate::codec::UserError;
-use crate::frame::{Priorities, Priority, PseudoOrder, Reason, StreamDependency, StreamId};
+use crate::frame::{Priorities, Priority, PseudoOrder, Reason, StreamId};
 use crate::{client, server, tracing};
 
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
@@ -93,7 +93,7 @@ pub(crate) struct Config {
     pub settings: frame::Settings,
     pub data_frame_budget: DataFrameBudget,
     pub headers_pseudo_order: Option<PseudoOrder>,
-    pub headers_stream_dependency: Option<StreamDependency>,
+    pub headers_priority_policy: HeadersPriorityPolicy,
     pub priorities: Option<Priorities>,
     pub preface_ping: Option<Duration>,
 }
@@ -162,7 +162,7 @@ where
     B: Buf,
 {
     pub fn new(codec: Codec<T, Prioritized<B>>, mut config: Config) -> Connection<T, P, B> {
-        fn streams_config(config: &Config) -> streams::Config {
+        fn streams_config(config: &mut Config) -> streams::Config {
             streams::Config {
                 initial_max_send_streams: config.initial_max_send_streams,
                 local_max_buffer_size: config.max_send_buffer_size,
@@ -182,7 +182,7 @@ where
                     .map(|max| max as usize),
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
                 data_frame_budget: config.data_frame_budget,
-                headers_stream_dependency: config.headers_stream_dependency,
+                headers_priority_policy: std::mem::take(&mut config.headers_priority_policy),
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
             }
         }
@@ -196,7 +196,7 @@ where
                 .map(IntoIterator::into_iter);
             State::ClientInitialSend { pending_priorities }
         };
-        let streams = Streams::new(streams_config(&config));
+        let streams = Streams::new(streams_config(&mut config));
         #[cfg(feature = "tracing")]
         let span = ::tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         #[cfg(feature = "tracing")]

@@ -1,6 +1,7 @@
 mod buffer;
 mod counts;
 mod flow_control;
+mod headers_priority;
 mod prioritize;
 mod recv;
 mod send;
@@ -11,6 +12,7 @@ mod stream;
 mod streams;
 mod sync;
 
+pub(crate) use self::headers_priority::HeadersPriorityPolicy;
 pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
 pub(crate) use self::send::PollReset;
@@ -19,6 +21,7 @@ pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, RecvOutcome, StreamR
 use self::buffer::Buffer;
 use self::counts::Counts;
 use self::flow_control::FlowControl;
+use self::headers_priority::{ChainLink, ChainParents};
 use self::prioritize::Prioritize;
 use self::recv::Recv;
 use self::send::Send;
@@ -26,7 +29,7 @@ use self::state::State;
 use self::store::Store;
 use self::stream::Stream;
 
-use crate::frame::{PseudoOrder, StreamDependency, StreamId, StreamIdOverflow};
+use crate::frame::{PseudoOrder, StreamId, StreamIdOverflow};
 use crate::proto::*;
 
 use bytes::Bytes;
@@ -83,8 +86,8 @@ pub struct Config {
     /// Connection-level budget policy for DATA framing overhead.
     pub(crate) data_frame_budget: DataFrameBudget,
 
-    /// Priority of the headers stream
-    pub headers_stream_dependency: Option<StreamDependency>,
+    /// Connection-level request `HEADERS` priority rules.
+    pub headers_priority_policy: HeadersPriorityPolicy,
 
     /// Pseudo order of the headers stream
     pub headers_pseudo_order: Option<PseudoOrder>,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::frame::StreamDependency;
 use crate::tracing;
 
 #[derive(Debug)]
@@ -87,6 +88,10 @@ pub(super) struct Counts {
     /// Number of empty, non-final DATA frames received over the lifetime of
     /// the connection.
     num_recv_empty_data_frames: usize,
+
+    /// Open requests offered as `HEADERS` chain parents. Kept here because
+    /// every stream close passes through [`Counts::transition_after`].
+    chain_parents: ChainParents,
 }
 
 impl Counts {
@@ -107,6 +112,7 @@ impl Counts {
             data_frame_budget: Budget::new(config.data_frame_budget.resolve(None)),
             data_frame_budget_is_auto: config.data_frame_budget.is_auto(),
             num_recv_empty_data_frames: 0,
+            chain_parents: ChainParents::default(),
         }
     }
 
@@ -296,6 +302,12 @@ impl Counts {
         ret
     }
 
+    /// Chooses the `HEADERS` chain parent as a request's initial `HEADERS` is
+    /// written, and offers the request as a parent in turn.
+    pub fn attach_chain(&mut self, stream: &mut Stream) -> Option<StreamDependency> {
+        self.chain_parents.attach(stream)
+    }
+
     // TODO: move this to macro?
     pub fn transition_after(&mut self, mut stream: store::Ptr, is_reset_counted: bool) {
         tracing::trace!(
@@ -310,6 +322,8 @@ impl Counts {
             self.num_recv_streams,
             self.num_send_streams
         );
+
+        self.chain_parents.detach(&mut stream);
 
         if stream.is_closed() {
             if !stream.is_pending_reset_expiration() {
@@ -393,7 +407,7 @@ mod tests {
             remote_max_initiated: None,
             local_max_error_reset_streams: None,
             data_frame_budget: DataFrameBudget::Configured(DEFAULT_DATA_FRAME_BUDGET),
-            headers_stream_dependency: None,
+            headers_priority_policy: HeadersPriorityPolicy::default(),
             headers_pseudo_order: None,
         }
     }
