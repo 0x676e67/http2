@@ -684,3 +684,21 @@ async fn reads_while_go_away_waits_to_be_written() {
             .unwrap_or_else(|_| panic!("{:?} timed out", close));
     }
 }
+
+#[tokio::test]
+async fn bytes_dropped_while_closing_count_as_read() {
+    h2_support::trace_init!();
+    let (io, mut peer) = mock::new();
+    let (io, drain) = buffered_io(io);
+    let (_client, mut conn) = client::handshake(io).await.unwrap();
+    conn.drive(util::yield_once()).await;
+
+    // The final flush waits, and the client drops what it reads.
+    drain.pause();
+    conn.abrupt_shutdown(Reason::NO_ERROR);
+    conn.drive(util::yield_once()).await;
+    assert!(!conn.take_read_activity());
+    peer.send_frame(frames::ping([1; 8])).await;
+    conn.drive(util::yield_once()).await;
+    assert!(conn.take_read_activity());
+}
