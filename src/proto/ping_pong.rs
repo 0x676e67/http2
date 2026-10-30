@@ -5,6 +5,7 @@ use crate::tracing;
 
 use atomic_waker::AtomicWaker;
 use bytes::Buf;
+use smallvec::SmallVec;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -16,9 +17,9 @@ use tokio::io::AsyncWrite;
 #[derive(Debug)]
 pub(crate) struct PingPong {
     pending_ping: Option<PendingPing>,
-    pending_pong: Option<PingPayload>,
     user_pings: Option<UserPingsRx>,
     preface_ping: Option<PrefacePing>,
+    pending_pongs: SmallVec<[PingPayload; 1]>,
 }
 
 /// PING sent after the next HEADERS frame or ahead of the next non-empty DATA
@@ -80,6 +81,10 @@ pub(crate) enum ReceivedPing {
     Shutdown,
 }
 
+/// PONGs that may wait for write capacity while reading goes on. Reading stops
+/// at this many, so a PING flood cannot grow the queue.
+const MAX_PENDING_PONGS: usize = 16;
+
 /// No user ping pending.
 const USER_STATE_EMPTY: usize = 0;
 /// User has called `send_ping`, but PING hasn't been written yet.
@@ -97,9 +102,9 @@ impl PingPong {
     pub(crate) fn new(preface_ping: Option<Duration>) -> Self {
         PingPong {
             pending_ping: None,
-            pending_pong: None,
             user_pings: None,
             preface_ping: preface_ping.map(PrefacePing::new),
+            pending_pongs: SmallVec::new(),
         }
     }
 
@@ -132,7 +137,7 @@ impl PingPong {
     pub(crate) fn recv_ping(&mut self, ping: Ping) -> ReceivedPing {
         // The caller should always check that `send_pongs` returns ready before
         // calling `recv_ping`.
-        assert!(self.pending_pong.is_none());
+        assert!(self.pending_pongs.len() < MAX_PENDING_PONGS);
 
         if ping.is_ack() {
             // Equal payloads are matched in write order. The preface and user
@@ -177,12 +182,15 @@ impl PingPong {
             ReceivedPing::Unknown
         } else {
             // Save the ping's payload to be sent as an acknowledgement.
-            self.pending_pong = Some(ping.into_payload());
+            self.pending_pongs.push(ping.into_payload());
             ReceivedPing::MustAck
         }
     }
 
     /// Send any pending pongs.
+    ///
+    /// Returns `Pending` only once the queue is full: the peer may itself stop
+    /// reading until it can write, so waiting here to write could deadlock.
     pub(crate) fn send_pending_pong<T, B>(
         &mut self,
         cx: &mut Context,
@@ -192,20 +200,26 @@ impl PingPong {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        if let Some(pong) = self.pending_pong.take() {
+        while let Some(&pong) = self.pending_pongs.first() {
             if !dst.poll_send_capacity(cx)?.is_ready() {
-                self.pending_pong = Some(pong);
-                return Poll::Pending;
+                break;
             }
 
             dst.buffer(Ping::pong(pong).into())
                 .expect("invalid pong frame");
+            self.pending_pongs.remove(0);
         }
 
-        Poll::Ready(Ok(()))
+        if self.pending_pongs.len() < MAX_PENDING_PONGS {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
     }
 
     /// Send any pending pings.
+    ///
+    /// A user PING that cannot be written yet does not stop reading.
     pub(crate) fn send_pending_ping<T, B>(
         &mut self,
         cx: &mut Context,
@@ -230,7 +244,7 @@ impl PingPong {
             let preface_idle = self.preface_ping.as_ref().is_none_or(PrefacePing::is_idle);
             if preface_idle && users.0.state.load(Ordering::Acquire) == USER_STATE_PENDING_PING {
                 if !dst.poll_send_capacity(cx)?.is_ready() {
-                    return Poll::Pending;
+                    return Poll::Ready(Ok(()));
                 }
 
                 dst.buffer(Ping::new(users.0.load_payload()).into())
@@ -256,8 +270,8 @@ impl PingPong {
 
     /// Sends a preface PING armed by an already buffered frame.
     ///
-    /// Unlike the other PINGs, this never waits for room: reading stays
-    /// possible, and the PING is still written ahead of the next DATA frame.
+    /// It never waits for room, and is still written ahead of the next DATA
+    /// frame.
     pub(crate) fn send_pending_preface_ping<T, B>(
         &mut self,
         cx: &mut Context,
