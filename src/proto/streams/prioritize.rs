@@ -1000,63 +1000,6 @@ impl Prioritize {
 
 // ===== impl Prioritized =====
 
-impl<B: Buf> Prioritized<B> {
-    /// The last part, the only one that can be partly taken.
-    fn last(&self) -> &Take<B> {
-        self.rest.last().unwrap_or(&self.inner)
-    }
-
-    /// Appends the stream's queued DATA chunks, up to `room` bytes.
-    ///
-    /// Stops at a non-DATA frame, a partly taken chunk or END_STREAM. Returns
-    /// the bytes added and whether the frame now ends the stream.
-    fn coalesce(
-        &mut self,
-        mut room: usize,
-        stream: &mut store::Ptr,
-        buffer: &mut Buffer<Frame<B>>,
-    ) -> (usize, bool) {
-        let mut added = 0;
-
-        loop {
-            let frame = match stream.pending_send.pop_front(buffer) {
-                // Empty chunks add no part, so they merge even into a full frame
-                Some(Frame::Data(frame))
-                    if !frame.payload().has_remaining()
-                        || (room > 0 && self.rest.len() + 1 < MAX_DATA_FRAME_PARTS) =>
-                {
-                    frame
-                }
-                // Trailers and DATA past the room keep their place
-                Some(frame) => {
-                    stream.pending_send.push_front(buffer, frame);
-                    return (added, false);
-                }
-                None => return (added, false),
-            };
-
-            let sz = frame.payload().remaining();
-            let len = cmp::min(sz, room);
-            self.end_of_stream = frame.is_end_stream();
-
-            if len > 0 {
-                self.rest.push(frame.into_payload().take(len));
-                added += len;
-                room -= len;
-            }
-
-            // The rest of a partly taken chunk is pushed back on reclaim
-            if len < sz {
-                return (added, false);
-            }
-
-            if self.end_of_stream {
-                return (added, true);
-            }
-        }
-    }
-}
-
 impl<B> Buf for Prioritized<B>
 where
     B: Buf,
@@ -1131,6 +1074,63 @@ impl<B: Buf> fmt::Debug for Prioritized<B> {
             .field("end_of_stream", &self.end_of_stream)
             .field("stream", &self.stream)
             .finish()
+    }
+}
+
+impl<B: Buf> Prioritized<B> {
+    /// The last part, the only one that can be partly taken.
+    fn last(&self) -> &Take<B> {
+        self.rest.last().unwrap_or(&self.inner)
+    }
+
+    /// Appends the stream's queued DATA chunks, up to `room` bytes.
+    ///
+    /// Stops at a non-DATA frame, a partly taken chunk or END_STREAM. Returns
+    /// the bytes added and whether the frame now ends the stream.
+    fn coalesce(
+        &mut self,
+        mut room: usize,
+        stream: &mut store::Ptr,
+        buffer: &mut Buffer<Frame<B>>,
+    ) -> (usize, bool) {
+        let mut added = 0;
+
+        loop {
+            let frame = match stream.pending_send.pop_front(buffer) {
+                // Empty chunks add no part, so they merge even into a full frame
+                Some(Frame::Data(frame))
+                    if !frame.payload().has_remaining()
+                        || (room > 0 && self.rest.len() + 1 < MAX_DATA_FRAME_PARTS) =>
+                {
+                    frame
+                }
+                // Trailers and DATA past the room keep their place
+                Some(frame) => {
+                    stream.pending_send.push_front(buffer, frame);
+                    return (added, false);
+                }
+                None => return (added, false),
+            };
+
+            let sz = frame.payload().remaining();
+            let len = cmp::min(sz, room);
+            self.end_of_stream = frame.is_end_stream();
+
+            if len > 0 {
+                self.rest.push(frame.into_payload().take(len));
+                added += len;
+                room -= len;
+            }
+
+            // The rest of a partly taken chunk is pushed back on reclaim
+            if len < sz {
+                return (added, false);
+            }
+
+            if self.end_of_stream {
+                return (added, true);
+            }
+        }
     }
 }
 
