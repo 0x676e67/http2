@@ -4,7 +4,7 @@ use super::{
 };
 use crate::codec::UserError;
 use crate::frame::{self, Reason};
-use crate::proto::{self, Error, Initiator};
+use crate::proto::{self, Error, Initiator, PrefacePing};
 use crate::tracing;
 
 use bytes::Buf;
@@ -381,13 +381,14 @@ impl Send {
         counts: &mut Counts,
         recv: &mut Recv,
         dst: &mut Codec<T, Prioritized<B>>,
+        preface_ping: Option<&mut PrefacePing>,
     ) -> io::Result<BufferStatus>
     where
         T: AsyncWrite + Unpin,
         B: Buf,
     {
         self.prioritize
-            .buffer_pending(buffer, store, counts, recv, dst)
+            .buffer_pending(buffer, store, counts, recv, dst, preface_ping)
     }
 
     pub fn reclaim_written_frame<T, B>(

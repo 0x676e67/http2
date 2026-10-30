@@ -133,6 +133,12 @@ impl<T, B> Codec<T, B> {
     fn framed_write(&mut self) -> &mut FramedWrite<T, B> {
         self.inner.get_mut()
     }
+
+    /// Returns whether any bytes were read from the socket since the last
+    /// call, including bytes of frames that are partial or ignored.
+    pub(crate) fn take_read_activity(&mut self) -> bool {
+        self.framed_write().take_read_activity()
+    }
 }
 
 impl<T, B> Codec<T, B>
@@ -181,6 +187,12 @@ where
     /// Unlike `poll_ready`, this does not wait for the upstream flush.
     pub(crate) fn poll_send_capacity(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         self.framed_write().poll_capacity(cx)
+    }
+
+    /// Returns whether the codec can still buffer a frame after `len` more
+    /// bytes are buffered.
+    pub(crate) fn has_send_capacity_after(&mut self, len: usize) -> bool {
+        self.framed_write().has_capacity_after(len)
     }
 }
 

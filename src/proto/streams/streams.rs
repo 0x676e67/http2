@@ -23,7 +23,7 @@ use crate::{
     ext::Protocol,
     frame::{self, Frame, Reason},
     proto,
-    proto::{Error, Initiator, Open, Peer, WindowSize, peer},
+    proto::{Error, Initiator, Open, Peer, PrefacePing, WindowSize, peer},
     server, tracing,
 };
 
@@ -229,6 +229,7 @@ where
         &mut self,
         cx: &mut Context,
         dst: &mut Codec<T, Prioritized<B>>,
+        mut preface_ping: Option<&mut PrefacePing>,
     ) -> Poll<io::Result<()>>
     where
         T: AsyncWrite + Unpin,
@@ -239,7 +240,8 @@ where
 
             let status = {
                 let mut me = self.inner.lock();
-                let status = me.buffer_pending(&self.send_buffer, dst)?;
+                let status =
+                    me.buffer_pending(&self.send_buffer, dst, preface_ping.as_deref_mut())?;
 
                 // Register the task while holding the same lock used to
                 // observe that all pending frames have been buffered. A
@@ -254,7 +256,12 @@ where
 
             match status {
                 BufferStatus::Complete => {}
-                BufferStatus::CodecFull => continue,
+                // `poll_ready` only flushes a full codec, but room may also be
+                // reserved for a preface PING.
+                BufferStatus::CodecFull => {
+                    ready!(dst.flush(cx))?;
+                    continue;
+                }
             }
 
             // Flush any frames staged by `buffer_pending` without holding the
@@ -1045,11 +1052,19 @@ impl Inner {
         &mut self,
         send_buffer: &SendBuffer<B>,
         dst: &mut Codec<T, Prioritized<B>>,
+        mut preface_ping: Option<&mut PrefacePing>,
     ) -> io::Result<BufferStatus>
     where
         T: AsyncWrite + Unpin,
         B: Buf,
     {
+        // A preface PING armed by an already buffered frame goes out first.
+        if let Some(preface_ping) = preface_ping.as_deref_mut()
+            && !preface_ping.buffer_pending(dst)
+        {
+            return Ok(BufferStatus::CodecFull);
+        }
+
         let mut send_buffer = send_buffer.inner.lock();
         let send_buffer = &mut *send_buffer;
 
@@ -1073,6 +1088,7 @@ impl Inner {
             &mut self.counts,
             &mut self.actions.recv,
             dst,
+            preface_ping,
         )? == BufferStatus::CodecFull
         {
             return Ok(BufferStatus::CodecFull);

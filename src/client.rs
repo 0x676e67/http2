@@ -368,6 +368,9 @@ pub struct Builder {
     /// Priority stream list
     priorities: Option<Priorities>,
 
+    /// Read-idle threshold for the preface PING
+    preface_ping: Option<Duration>,
+
     /// Initial target receive window size for locally initiated streams.
     initial_target_stream_window_size: Option<u32>,
 }
@@ -693,6 +696,7 @@ impl Builder {
             headers_pseudo_order: None,
             headers_stream_dependency: None,
             priorities: None,
+            preface_ping: None,
             initial_target_stream_window_size: None,
         }
     }
@@ -1419,6 +1423,20 @@ impl Builder {
         self.initial_target_stream_window_size = Some(target);
         self
     }
+
+    /// Sends a PING with the next HEADERS or non-empty DATA frame once nothing
+    /// has been read for longer than `threshold`.
+    ///
+    /// The PING follows HEADERS but precedes DATA, and its payload is a
+    /// big-endian counter starting at 1. It is skipped while the previous one
+    /// or a user PING awaits an ACK, and user PINGs are held back until it is
+    /// acknowledged; a missing ACK does not close the connection.
+    ///
+    /// See [RFC 9113 section 6.7](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.7).
+    pub fn preface_ping(&mut self, threshold: Duration) -> &mut Self {
+        self.preface_ping = Some(threshold);
+        self
+    }
 }
 
 impl Default for Builder {
@@ -1543,6 +1561,7 @@ where
                 headers_pseudo_order: builder.headers_pseudo_order,
                 headers_stream_dependency: builder.headers_stream_dependency,
                 priorities: builder.priorities,
+                preface_ping: builder.preface_ping,
             },
         );
         let send_request = SendRequest {
@@ -1613,6 +1632,25 @@ where
     /// This may only be called once. Calling multiple times will return `None`.
     pub fn ping_pong(&mut self) -> Option<PingPong> {
         self.inner.take_user_pings().map(PingPong::new)
+    }
+
+    /// Returns whether any bytes were read from the server since the last call.
+    ///
+    /// Bytes of frames the connection ignores or has not fully received also
+    /// count, so this measures read idleness for keep-alive logic.
+    pub fn take_read_activity(&mut self) -> bool {
+        self.inner.take_read_activity()
+    }
+
+    /// Sets the connection to a GOAWAY state.
+    ///
+    /// Does not terminate the connection. Must continue being polled to close
+    /// connection.
+    ///
+    /// After flushing the GOAWAY frame, the connection is closed. Any
+    /// outstanding streams do not prevent the connection from closing.
+    pub fn abrupt_shutdown(&mut self, reason: Reason) {
+        self.inner.go_away_from_user(reason);
     }
 
     /// Returns the maximum number of concurrent streams that may be initiated

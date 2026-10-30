@@ -52,6 +52,9 @@ where
     /// Ping/pong handler
     ping_pong: PingPong,
 
+    /// Whether bytes were read since `take_read_activity` was last called.
+    read_activity: bool,
+
     /// Connection settings
     settings: Settings,
 
@@ -92,6 +95,7 @@ pub(crate) struct Config {
     pub headers_pseudo_order: Option<PseudoOrder>,
     pub headers_stream_dependency: Option<StreamDependency>,
     pub priorities: Option<Priorities>,
+    pub preface_ping: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -205,7 +209,8 @@ where
                 error: None,
                 go_away: GoAway::new(),
                 pending_refusal: None,
-                ping_pong: PingPong::new(),
+                ping_pong: PingPong::new(config.preface_ping),
+                read_activity: false,
                 settings: Settings::new(config.settings),
                 streams,
                 #[cfg(feature = "tracing")]
@@ -261,6 +266,10 @@ where
         #[cfg(feature = "tracing")]
         let _e = self.inner.span.enter();
         let _span = tracing::trace_span!("poll_ready");
+        // A preface PING armed by an already buffered frame goes first.
+        self.inner
+            .ping_pong
+            .send_pending_preface_ping(cx, &mut self.codec)?;
         // The order of these calls don't really matter too much
         ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
         ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;
@@ -461,10 +470,21 @@ where
                         Poll::Ready(result) => result,
                         // The connection is not ready to make progress
                         Poll::Pending => {
+                            // Reads reset the idle time before a preface PING
+                            // can be armed below.
+                            if self.codec.take_read_activity() {
+                                self.inner.ping_pong.record_read();
+                                self.inner.read_activity = true;
+                            }
+
                             // Ensure all window updates have been sent.
                             //
                             // This will also handle flushing `self.codec`
-                            ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
+                            ready!(self.inner.streams.poll_complete(
+                                cx,
+                                &mut self.codec,
+                                self.inner.ping_pong.preface_ping_mut()
+                            ))?;
 
                             if (self.inner.error.is_some()
                                 || self.inner.go_away.should_close_on_idle())
@@ -552,6 +572,12 @@ where
 
     fn clear_expired_reset_streams(&mut self) {
         self.inner.streams.clear_expired_reset_streams();
+    }
+
+    /// Returns whether bytes were read since the last call.
+    pub(crate) fn take_read_activity(&mut self) -> bool {
+        // A poll that closes the connection skips the transfer in `poll`.
+        std::mem::take(&mut self.inner.read_activity) | self.codec.take_read_activity()
     }
 
     /// Returns the remote extended CONNECT setting, or `None` before its initial SETTINGS.
