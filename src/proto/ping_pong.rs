@@ -5,7 +5,7 @@ use crate::tracing;
 
 use atomic_waker::AtomicWaker;
 use bytes::Buf;
-use std::collections::VecDeque;
+use smallvec::SmallVec;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -17,7 +17,7 @@ use tokio::io::AsyncWrite;
 #[derive(Debug)]
 pub(crate) struct PingPong {
     pending_ping: Option<PendingPing>,
-    pending_pongs: VecDeque<PingPayload>,
+    pending_pongs: SmallVec<[PingPayload; 1]>,
     user_pings: Option<UserPingsRx>,
     preface_ping: Option<PrefacePing>,
 }
@@ -102,7 +102,7 @@ impl PingPong {
     pub(crate) fn new(preface_ping: Option<Duration>) -> Self {
         PingPong {
             pending_ping: None,
-            pending_pongs: VecDeque::new(),
+            pending_pongs: SmallVec::new(),
             user_pings: None,
             preface_ping: preface_ping.map(PrefacePing::new),
         }
@@ -182,7 +182,7 @@ impl PingPong {
             ReceivedPing::Unknown
         } else {
             // Save the ping's payload to be sent as an acknowledgement.
-            self.pending_pongs.push_back(ping.into_payload());
+            self.pending_pongs.push(ping.into_payload());
             ReceivedPing::MustAck
         }
     }
@@ -200,14 +200,14 @@ impl PingPong {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        while let Some(pong) = self.pending_pongs.pop_front() {
+        while let Some(&pong) = self.pending_pongs.first() {
             if !dst.poll_send_capacity(cx)?.is_ready() {
-                self.pending_pongs.push_front(pong);
                 break;
             }
 
             dst.buffer(Ping::pong(pong).into())
                 .expect("invalid pong frame");
+            self.pending_pongs.remove(0);
         }
 
         if self.pending_pongs.len() < MAX_PENDING_PONGS {

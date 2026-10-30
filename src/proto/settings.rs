@@ -2,7 +2,7 @@ use crate::codec::UserError;
 use crate::error::Reason;
 use crate::proto::*;
 use crate::tracing;
-use std::collections::VecDeque;
+use smallvec::SmallVec;
 use std::io;
 use std::task::{Context, Poll};
 
@@ -16,7 +16,7 @@ pub(crate) struct Settings {
     local: Local,
     /// Received SETTINGS frames whose ACK is not written yet. They are applied
     /// on receipt, except for the codec, which picks them up with the ACK.
-    remote: VecDeque<frame::Settings>,
+    remote: SmallVec<[frame::Settings; 1]>,
     /// Whether the connection has received the initial SETTINGS frame from the
     /// remote peer.
     has_received_remote_initial_settings: bool,
@@ -41,7 +41,7 @@ impl Settings {
             // The initial local SETTINGS are already buffered in the codec and
             // are written by the connection's initial send path.
             local: Local::WaitingAck(local),
-            remote: VecDeque::new(),
+            remote: SmallVec::new(),
             has_received_remote_initial_settings: false,
             remote_extended_connect: false,
         }
@@ -99,7 +99,7 @@ impl Settings {
             // `poll_send` returns ready before more frames are read, so there
             // is room for another ACK.
             assert!(self.remote.len() < MAX_PENDING_ACKS);
-            self.remote.push_back(frame);
+            self.remote.push(frame);
             Ok(())
         }
     }
@@ -179,9 +179,8 @@ impl Settings {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        while let Some(settings) = self.remote.pop_front() {
+        while let Some(settings) = self.remote.first() {
             if !dst.poll_send_capacity(cx)?.is_ready() {
-                self.remote.push_front(settings);
                 return Poll::Pending;
             }
 
@@ -202,6 +201,8 @@ impl Settings {
             if let Some(val) = settings.max_frame_size() {
                 dst.set_max_send_frame_size(val as usize);
             }
+
+            self.remote.remove(0);
         }
 
         Poll::Ready(Ok(()))
