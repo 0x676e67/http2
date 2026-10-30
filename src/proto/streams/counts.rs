@@ -303,7 +303,7 @@ impl Counts {
     }
 
     /// Chooses the `HEADERS` chain parent as a request's initial `HEADERS` is
-    /// written, and registers the request as a candidate.
+    /// written, and offers the request as a parent in turn.
     pub fn attach_chain(&mut self, stream: &mut Stream) -> Option<StreamDependency> {
         self.chain_parents.attach(stream)
     }
