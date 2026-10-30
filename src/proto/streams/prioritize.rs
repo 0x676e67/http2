@@ -582,10 +582,10 @@ impl Prioritize {
                     // overwritten.
                     self.reclaim_frame(buffer, store, dst);
 
-                    if let Some(preface_ping) = preface_ping.as_deref_mut() {
-                        if !preface_ping.buffer_pending(dst) {
-                            return Ok(BufferStatus::CodecFull);
-                        }
+                    if let Some(preface_ping) = preface_ping.as_deref_mut()
+                        && !preface_ping.buffer_pending(dst)
+                    {
+                        return Ok(BufferStatus::CodecFull);
                     }
                 }
                 None => {

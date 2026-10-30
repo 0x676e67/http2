@@ -1059,10 +1059,10 @@ impl Inner {
         B: Buf,
     {
         // A preface PING armed by an already buffered frame goes out first.
-        if let Some(preface_ping) = preface_ping.as_deref_mut() {
-            if !preface_ping.buffer_pending(dst) {
-                return Ok(BufferStatus::CodecFull);
-            }
+        if let Some(preface_ping) = preface_ping.as_deref_mut()
+            && !preface_ping.buffer_pending(dst)
+        {
+            return Ok(BufferStatus::CodecFull);
         }
 
         let mut send_buffer = send_buffer.inner.lock();

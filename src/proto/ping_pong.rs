@@ -138,21 +138,21 @@ impl PingPong {
             // Equal payloads are matched in write order. The preface and user
             // PINGs never await an ACK together, and no user PING is written
             // while the shutdown PING is pending.
-            if let Some(ref mut preface_ping) = self.preface_ping {
-                if preface_ping.recv_ack(ping.payload()) {
-                    tracing::trace!("recv PING PREFACE ack");
-                    return ReceivedPing::Unknown;
-                }
+            if let Some(ref mut preface_ping) = self.preface_ping
+                && preface_ping.recv_ack(ping.payload())
+            {
+                tracing::trace!("recv PING PREFACE ack");
+                return ReceivedPing::Unknown;
             }
 
-            if let Some(ref users) = self.user_pings {
-                if users.receive_pong(ping.payload()) {
-                    if let Some(ref mut preface_ping) = self.preface_ping {
-                        preface_ping.user_in_flight = false;
-                    }
-                    tracing::trace!("recv PING USER ack");
-                    return ReceivedPing::Unknown;
+            if let Some(ref users) = self.user_pings
+                && users.receive_pong(ping.payload())
+            {
+                if let Some(ref mut preface_ping) = self.preface_ping {
+                    preface_ping.user_in_flight = false;
                 }
+                tracing::trace!("recv PING USER ack");
+                return ReceivedPing::Unknown;
             }
 
             if let Some(pending) = self.pending_ping.take() {
@@ -267,11 +267,12 @@ impl PingPong {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        if let Some(ref mut preface_ping) = self.preface_ping {
-            if !preface_ping.buffer_pending(dst) && dst.poll_send_capacity(cx)?.is_ready() {
-                let buffered = preface_ping.buffer_pending(dst);
-                debug_assert!(buffered);
-            }
+        if let Some(ref mut preface_ping) = self.preface_ping
+            && !preface_ping.buffer_pending(dst)
+            && dst.poll_send_capacity(cx)?.is_ready()
+        {
+            let buffered = preface_ping.buffer_pending(dst);
+            debug_assert!(buffered);
         }
 
         Ok(())
