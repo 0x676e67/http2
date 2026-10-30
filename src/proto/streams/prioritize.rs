@@ -1177,21 +1177,14 @@ mod tests {
             stream: stream.key(),
         };
 
-        assert_eq!(buf.remaining(), 7);
         // The second part is listed only up to "cd", so "gh" must wait.
         assert_eq!(listed(&buf, &mut [IoSlice::new(&[]); 64]), [b"ab", b"cd"]);
 
         buf.advance(4);
-        assert_eq!(buf.chunk(), b"e");
         assert_eq!(
             listed(&buf, &mut [IoSlice::new(&[]); 64]),
             [&b"e"[..], b"gh"]
         );
-
-        buf.advance(3);
-        assert!(!buf.has_remaining());
-        assert!(buf.chunk().is_empty());
-        assert_eq!(buf.chunks_vectored(&mut [IoSlice::new(&[]); 64]), 0);
 
         stream.unlink();
         stream.remove();

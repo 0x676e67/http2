@@ -72,12 +72,7 @@ pub fn new() -> (Mock, Handle) {
 
 /// Create a new mock and handle that accepts vectored writes
 pub fn new_vectored() -> (Mock, Handle) {
-    new_vectored_with_write_capacity(usize::MAX)
-}
-
-/// Create a vectored mock and handle allowing up to `cap` bytes to be written.
-pub fn new_vectored_with_write_capacity(cap: usize) -> (Mock, Handle) {
-    let (mut mock, handle) = new_with_write_capacity(cap);
+    let (mut mock, handle) = new();
     mock.vectored = true;
     (mock, handle)
 }
