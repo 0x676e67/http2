@@ -378,17 +378,13 @@ impl<B: Buf> SendStream<B> {
     ///
     /// If the lock on the stream store has been poisoned.
     pub fn stream_id(&self) -> StreamId {
-        StreamId::from_internal(self.inner.stream_id())
+        self.inner.stream_id().into()
     }
 }
 
 // ===== impl StreamId =====
 
 impl StreamId {
-    pub(crate) fn from_internal(id: crate::frame::StreamId) -> Self {
-        StreamId(id.into())
-    }
-
     /// Returns the `u32` corresponding to this `StreamId`
     ///
     /// # Note
@@ -413,13 +409,13 @@ impl StreamId {
 /// [RFC 9113 §5.1.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1.1
 impl From<u32> for StreamId {
     fn from(src: u32) -> Self {
-        Self::from_internal(crate::frame::StreamId::from(src))
+        crate::frame::StreamId::from(src).into()
     }
 }
 
 impl From<crate::frame::StreamId> for StreamId {
     fn from(src: crate::frame::StreamId) -> Self {
-        Self::from_internal(src)
+        StreamId(src.into())
     }
 }
 
@@ -520,7 +516,7 @@ impl FlowControl {
     /// Returns the stream ID of the stream whose capacity will
     /// be released by this `FlowControl`.
     pub fn stream_id(&self) -> StreamId {
-        StreamId::from_internal(self.inner.stream_id())
+        self.inner.stream_id().into()
     }
 
     /// Get the current available capacity of data this stream *could* receive.

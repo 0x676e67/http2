@@ -138,7 +138,7 @@ impl StreamDependency {
     /// Returns the stream this dependency points at.
     #[inline]
     pub fn dependency_id(&self) -> crate::StreamId {
-        crate::StreamId::from_internal(self.dependency_id)
+        self.dependency_id.into()
     }
 
     pub(crate) fn encode<T: BufMut>(&self, dst: &mut T) {

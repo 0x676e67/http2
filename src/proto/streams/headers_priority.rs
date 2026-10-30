@@ -156,8 +156,8 @@ impl ChainParents {
         Some(StreamDependency::new(parent, weight, is_exclusive))
     }
 
-    /// Stops offering a stream as a parent once it is reset, or closed with its
-    /// final frame flushed, since the peer sees it open until then.
+    /// Stops offering a stream as a parent once it is reset, or once it is
+    /// closed and its final frame has been written.
     pub(super) fn detach(&mut self, stream: &mut Stream) {
         let Some(ChainLink::Attached { urgency }) = stream.chain_link else {
             return;

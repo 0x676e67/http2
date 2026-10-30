@@ -815,27 +815,27 @@ impl Inner {
         } else {
             // The remote may send window updates for streams that the local now
             // considers closed. It's ok...
-            if let Some(stream) = self.store.find_mut(&id) {
+            if let Some(mut stream) = self.store.find_mut(&id) {
                 if stream.is_pending_open {
                     proto_err!(conn: "recv_window_update: received frame on idle stream {:?}", id);
                     return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
 
+                let Err(reason) = self.actions.send.recv_stream_window_update(
+                    frame.size_increment(),
+                    send_buffer,
+                    &mut stream,
+                    &mut self.counts,
+                    &mut self.actions.task,
+                ) else {
+                    return Ok(());
+                };
+
                 // A flow-control reset closes the stream, so run the same
                 // transition bookkeeping as every other reset path.
+                let res = Err(Error::library_reset(id, reason));
                 let actions = &mut self.actions;
                 return self.counts.transition(stream, |counts, stream| {
-                    let res = actions
-                        .send
-                        .recv_stream_window_update(
-                            frame.size_increment(),
-                            send_buffer,
-                            stream,
-                            counts,
-                            &mut actions.task,
-                        )
-                        .map_err(|reason| Error::library_reset(id, reason));
-
                     actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
                 });
             } else {

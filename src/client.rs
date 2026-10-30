@@ -1740,7 +1740,7 @@ impl ResponseFuture {
     ///
     /// If the lock on the stream store has been poisoned.
     pub fn stream_id(&self) -> crate::StreamId {
-        crate::StreamId::from_internal(self.inner.stream_id())
+        self.inner.stream_id().into()
     }
 
     /// Polls for informational responses (1xx status codes).
