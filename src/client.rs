@@ -1520,7 +1520,7 @@ where
             })
             .transpose()?;
 
-        let headers_priority_config = proto::HeadersPriorityConfig::new(
+        let headers_priority_policy = proto::HeadersPriorityPolicy::new(
             builder.headers_priority,
             builder.priorities.as_ref(),
             builder.stream_id,
@@ -1561,7 +1561,7 @@ where
                 settings: builder.settings,
                 data_frame_budget: builder.data_frame_budget,
                 headers_pseudo_order: builder.headers_pseudo_order,
-                headers_priority_config,
+                headers_priority_policy,
                 priorities: builder.priorities,
             },
         );

@@ -8,116 +8,116 @@ use crate::frame::{Priorities, StreamDependency, StreamId};
 /// Least urgent level accepted by [`HeadersDependency::Chain`].
 const MAX_URGENCY: u8 = 7;
 
-/// Connection-level inputs for request `HEADERS` priority fields.
+/// Connection-level rules for request `HEADERS` priority fields.
 ///
-/// A client handshake builds and validates it once; server connections use the
-/// empty default.
+/// Holds the connection default and the stream IDs declared by the initial
+/// PRIORITY frames. A client handshake builds it once; server connections use
+/// the empty default.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct HeadersPriorityConfig {
+pub(crate) struct HeadersPriorityPolicy {
     /// Used by requests that carry no priority of their own.
     default: Option<HeadersPriority>,
     /// Idle streams declared by the initial PRIORITY frames.
     declared: Vec<StreamId>,
 }
 
-// ===== impl HeadersPriorityConfig =====
+// ===== impl HeadersPriorityPolicy =====
 
-impl HeadersPriorityConfig {
-    /// Validates the connection default and records the stream IDs declared by
-    /// the initial PRIORITY frames.
+impl HeadersPriorityPolicy {
+    /// Validates the connection default and records the declared stream IDs.
     ///
-    /// A default applies to every request, so unlike an override its `Declared`
-    /// parent must not be a client stream at or above `first_stream_id`, which
-    /// a later request opens ([RFC 7540 §5.3.1]).
+    /// A default `Declared` parent must be declared. Since the default applies
+    /// to every request, it must also not be a client stream at or above
+    /// `initial_stream_id`, which a later request opens ([RFC 7540 §5.3.1]).
     ///
     /// [RFC 7540 §5.3.1]: https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3.1
     pub(crate) fn new(
         default: Option<HeadersPriority>,
         priorities: Option<&Priorities>,
-        first_stream_id: StreamId,
+        initial_stream_id: StreamId,
     ) -> Result<Self, UserError> {
         let declared: Vec<StreamId> = priorities
             .into_iter()
             .flat_map(Priorities::stream_ids)
             .collect();
-        if let Some(HeadersPriority {
-            dependency: HeadersDependency::Declared(id),
-            ..
-        }) = default
+        if let Some(id) = default.and_then(declared_parent)
+            && (!declared.contains(&id) || (id.is_client_initiated() && id >= initial_stream_id))
         {
-            let id = StreamId::from(id);
-            if !declared.contains(&id) || (id.is_client_initiated() && id >= first_stream_id) {
-                return Err(UserError::InvalidHeadersDependency);
-            }
+            return Err(UserError::InvalidHeadersDependency);
         }
         Ok(Self { default, declared })
     }
 
-    /// Picks the request override or the connection default for `stream_id`,
-    /// returning the dependency known now and the stream's chain state.
+    /// Returns the request override, else the connection default.
     ///
     /// Runs before the stream ID is consumed, so a rejected request leaves the
     /// stream ID space untouched. An override is only rejected for an
     /// undeclared parent or a self-dependency ([RFC 7540 §5.3.1]).
     ///
     /// [RFC 7540 §5.3.1]: https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3.1
-    pub(super) fn prepare(
+    pub(super) fn resolve(
         &self,
         request: Option<HeadersPriority>,
         stream_id: StreamId,
-    ) -> Result<(Option<StreamDependency>, ChainState), UserError> {
-        if let Some(HeadersPriority {
-            dependency: HeadersDependency::Declared(id),
-            ..
-        }) = request
+    ) -> Result<Option<HeadersPriority>, UserError> {
+        if let Some(id) = request.and_then(declared_parent)
+            && (id == stream_id || !self.declared.contains(&id))
         {
-            let id = StreamId::from(id);
-            if id == stream_id || !self.declared.contains(&id) {
-                return Err(UserError::InvalidHeadersDependency);
-            }
+            return Err(UserError::InvalidHeadersDependency);
         }
-        Ok(request
-            .or(self.default)
-            .map_or((None, ChainState::None), ChainState::split))
+        Ok(request.or(self.default))
     }
 }
 
-/// Chain membership of one request stream.
-#[derive(Debug, Default)]
-pub(super) enum ChainState {
-    #[default]
-    None,
-    /// Parent is chosen when the initial `HEADERS` is written. `urgency` is
-    /// at most [`MAX_URGENCY`].
+/// Returns the dependency of a `Root` or `Declared` priority, known before the
+/// stream opens. A `Chain` parent waits for [`ChainParents::attach`].
+pub(super) fn fixed_dependency(priority: HeadersPriority) -> Option<StreamDependency> {
+    let parent = match priority.dependency {
+        HeadersDependency::Root => StreamId::ZERO,
+        HeadersDependency::Declared(id) => id.into(),
+        HeadersDependency::Chain { .. } => return None,
+    };
+    Some(StreamDependency::new(
+        parent,
+        priority.weight,
+        priority.is_exclusive,
+    ))
+}
+
+/// Returns the parent of a `Declared` priority.
+fn declared_parent(priority: HeadersPriority) -> Option<StreamId> {
+    match priority.dependency {
+        HeadersDependency::Declared(id) => Some(id.into()),
+        HeadersDependency::Root | HeadersDependency::Chain { .. } => None,
+    }
+}
+
+/// A request's place among `Chain` requests.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ChainLink {
+    /// Parent not chosen yet. `urgency` is at most [`MAX_URGENCY`].
     Pending {
         urgency: u8,
         weight: u8,
         is_exclusive: bool,
     },
-    /// A parent candidate at this urgency until the stream closes.
-    Candidate { urgency: u8 },
+    /// Offered as a parent at `urgency` until the stream closes.
+    Attached { urgency: u8 },
 }
 
-// ===== impl ChainState =====
+// ===== impl ChainLink =====
 
-impl ChainState {
-    /// Returns the dependency known before writing, or defers a `Chain` parent.
-    fn split(priority: HeadersPriority) -> (Option<StreamDependency>, Self) {
-        let dependency_id = match priority.dependency {
-            HeadersDependency::Root => StreamId::zero(),
-            HeadersDependency::Declared(id) => id.into(),
-            HeadersDependency::Chain { urgency } => {
-                let chain = Self::Pending {
-                    urgency: urgency.min(MAX_URGENCY),
-                    weight: priority.weight,
-                    is_exclusive: priority.is_exclusive,
-                };
-                return (None, chain);
-            }
-        };
-        let dependency =
-            StreamDependency::new(dependency_id, priority.weight, priority.is_exclusive);
-        (Some(dependency), Self::None)
+impl ChainLink {
+    /// Returns the pending link of a `Chain` priority.
+    pub(super) fn pending(priority: HeadersPriority) -> Option<Self> {
+        match priority.dependency {
+            HeadersDependency::Chain { urgency } => Some(Self::Pending {
+                urgency: urgency.min(MAX_URGENCY),
+                weight: priority.weight,
+                is_exclusive: priority.is_exclusive,
+            }),
+            HeadersDependency::Root | HeadersDependency::Declared(_) => None,
+        }
     }
 }
 
@@ -133,14 +133,14 @@ pub(super) struct ChainParents {
 // ===== impl ChainParents =====
 
 impl ChainParents {
-    /// Chooses the parent of a pending `Chain` stream whose initial `HEADERS`
-    /// is being written, and registers the stream as a candidate.
+    /// Chooses the parent of a pending stream whose initial `HEADERS` is being
+    /// written, and offers the stream as a parent in turn.
     pub(super) fn attach(&mut self, stream: &mut Stream) -> Option<StreamDependency> {
-        let ChainState::Pending {
+        let Some(ChainLink::Pending {
             urgency,
             weight,
             is_exclusive,
-        } = stream.priority_chain
+        }) = stream.chain_link
         else {
             return None;
         };
@@ -149,18 +149,22 @@ impl ChainParents {
         let parent = self.by_urgency[..=index]
             .iter()
             .rev()
-            .find_map(|level| level.last().copied())
-            .unwrap_or_else(StreamId::zero);
+            .find_map(|ids| ids.last().copied())
+            .unwrap_or(StreamId::ZERO);
         self.by_urgency[index].insert(stream.id);
-        stream.priority_chain = ChainState::Candidate { urgency };
+        stream.chain_link = Some(ChainLink::Attached { urgency });
         Some(StreamDependency::new(parent, weight, is_exclusive))
     }
 
-    /// Stops offering a closed stream as a parent.
+    /// Stops offering a stream as a parent once it is reset, or closed with its
+    /// final frame flushed, since the peer sees it open until then.
     pub(super) fn detach(&mut self, stream: &mut Stream) {
-        if let ChainState::Candidate { urgency } = stream.priority_chain {
+        let Some(ChainLink::Attached { urgency }) = stream.chain_link else {
+            return;
+        };
+        if stream.state.is_reset() || stream.is_closed() {
             self.by_urgency[usize::from(urgency)].remove(&stream.id);
-            stream.priority_chain = ChainState::None;
+            stream.chain_link = None;
         }
     }
 }

@@ -323,12 +323,7 @@ impl Counts {
             self.num_send_streams
         );
 
-        // A reset stream stops being a parent at once, even while RST_STREAM
-        // is queued. A gracefully closed one stays until its final frame is
-        // flushed, since the peer still sees it open until then.
-        if stream.state.is_reset() || stream.is_closed() {
-            self.chain_parents.detach(&mut stream);
-        }
+        self.chain_parents.detach(&mut stream);
 
         if stream.is_closed() {
             if !stream.is_pending_reset_expiration() {
@@ -412,7 +407,7 @@ mod tests {
             remote_max_initiated: None,
             local_max_error_reset_streams: None,
             data_frame_budget: DataFrameBudget::Configured(DEFAULT_DATA_FRAME_BUDGET),
-            headers_priority_config: HeadersPriorityConfig::default(),
+            headers_priority_policy: HeadersPriorityPolicy::default(),
             headers_pseudo_order: None,
         }
     }

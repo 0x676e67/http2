@@ -90,7 +90,7 @@ pub(crate) struct Config {
     pub settings: frame::Settings,
     pub data_frame_budget: DataFrameBudget,
     pub headers_pseudo_order: Option<PseudoOrder>,
-    pub headers_priority_config: HeadersPriorityConfig,
+    pub headers_priority_policy: HeadersPriorityPolicy,
     pub priorities: Option<Priorities>,
 }
 
@@ -178,7 +178,7 @@ where
                     .map(|max| max as usize),
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
                 data_frame_budget: config.data_frame_budget,
-                headers_priority_config: std::mem::take(&mut config.headers_priority_config),
+                headers_priority_policy: std::mem::take(&mut config.headers_priority_policy),
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
             }
         }

@@ -9,9 +9,10 @@ use http::{HeaderMap, Request, Response};
 use tokio::io::AsyncWrite;
 
 use super::{
-    Buffer, BufferStatus, Config, Counts, HeadersPriorityConfig, Prioritized, Recv, Send, Stream,
-    StreamId,
+    Buffer, BufferStatus, ChainLink, Config, Counts, HeadersPriorityPolicy, Prioritized, Recv,
+    Send, Stream, StreamId,
     frame::PseudoOrder,
+    headers_priority,
     recv::RecvHeaderBlockError,
     store::{self, Entry, Resolve, Store},
     sync::Mutex,
@@ -101,8 +102,8 @@ struct Inner {
     /// The number of stream refs to this shared state.
     refs: usize,
 
-    /// Connection-level request `HEADERS` priority inputs
-    headers_priority_config: HeadersPriorityConfig,
+    /// Connection-level request `HEADERS` priority rules
+    headers_priority_policy: HeadersPriorityPolicy,
 
     /// Pseudo order of the headers stream
     headers_pseudo_order: Option<PseudoOrder>,
@@ -348,11 +349,9 @@ where
             return Err(UserError::UnexpectedFrameType.into());
         }
 
-        // A `Chain` parent depends on which streams are still open when the
-        // initial HEADERS is written, which can be later for queued requests.
-        let (stream_dependency, priority_chain) = me
-            .headers_priority_config
-            .prepare(request_priority, next_stream_id)?;
+        let priority = me
+            .headers_priority_policy
+            .resolve(request_priority, next_stream_id)?;
         let stream_id = me.actions.send.open()?;
 
         let mut stream = Stream::new(
@@ -360,7 +359,9 @@ where
             me.actions.send.init_window_sz(),
             me.actions.recv.init_window_sz(),
         );
-        stream.priority_chain = priority_chain;
+        // A `Chain` parent depends on which streams are still open when the
+        // initial HEADERS is written, which can be later for queued requests.
+        stream.chain_link = priority.and_then(ChainLink::pending);
 
         match *request.method() {
             Method::HEAD => stream.content_length = ContentLength::Head,
@@ -375,7 +376,7 @@ where
             protocol,
             end_of_stream,
             me.headers_pseudo_order.clone(),
-            stream_dependency,
+            priority.and_then(headers_priority::fixed_dependency),
         )?;
 
         me.actions.recv.init_request_window(&mut stream);
@@ -520,7 +521,7 @@ impl Inner {
             },
             store: Store::new(),
             refs: 1,
-            headers_priority_config: config.headers_priority_config,
+            headers_priority_policy: config.headers_priority_policy,
             headers_pseudo_order: config.headers_pseudo_order,
         }))
     }

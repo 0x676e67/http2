@@ -43,9 +43,14 @@ async fn headers_priority_defaults_overrides_and_chain_parents() {
             .build()
     };
 
-    // Stream 3 is undeclared, and declared stream 5 would later be a request's
-    // own stream, so both defaults fail the handshake.
-    for (initial_stream_id, dependency_id, declared_id) in [(1, 3, None), (3, 5, Some(5))] {
+    // A default must name a declared stream that no request opens: stream 3 is
+    // undeclared and declared stream 5 would be a request's own stream, while
+    // declared stream 3 below the first request stream 5 is accepted.
+    for (initial_stream_id, dependency_id, declared_id, is_valid) in [
+        (1, 3, None, false),
+        (3, 5, Some(5), false),
+        (5, 3, Some(3), true),
+    ] {
         let (io, _peer) = mock::new();
         let mut builder = client::Builder::new();
         builder
@@ -57,11 +62,15 @@ async fn headers_priority_defaults_overrides_and_chain_parents() {
         if let Some(id) = declared_id {
             builder.priorities(declared(&[id]));
         }
-        let err = builder.handshake::<_, Bytes>(io).await.unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "user error: invalid HEADERS priority dependency"
-        );
+        let result = builder.handshake::<_, Bytes>(io).await;
+        if is_valid {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "user error: invalid HEADERS priority dependency"
+            );
+        }
     }
 
     let (io, mut peer) = mock::new();

@@ -20,9 +20,9 @@ pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, RecvOutcome, StreamR
 use self::buffer::Buffer;
 use self::counts::Counts;
 use self::flow_control::FlowControl;
-pub(crate) use self::headers_priority::HeadersPriorityConfig;
+pub(crate) use self::headers_priority::HeadersPriorityPolicy;
 
-use self::headers_priority::{ChainParents, ChainState};
+use self::headers_priority::{ChainLink, ChainParents};
 use self::prioritize::Prioritize;
 use self::recv::Recv;
 use self::send::Send;
@@ -87,8 +87,8 @@ pub struct Config {
     /// Connection-level budget policy for DATA framing overhead.
     pub(crate) data_frame_budget: DataFrameBudget,
 
-    /// Connection-level request `HEADERS` priority inputs.
-    pub headers_priority_config: HeadersPriorityConfig,
+    /// Connection-level request `HEADERS` priority rules.
+    pub headers_priority_policy: HeadersPriorityPolicy,
 
     /// Pseudo order of the headers stream
     pub headers_pseudo_order: Option<PseudoOrder>,

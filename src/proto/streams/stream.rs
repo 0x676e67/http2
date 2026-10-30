@@ -118,8 +118,8 @@ pub(super) struct Stream {
     /// Initial request window state, only for clients using a stream target.
     pub initial_window: Option<InitialWindow>,
 
-    /// `HeadersDependency::Chain` state of a client request.
-    pub priority_chain: ChainState,
+    /// `HeadersDependency::Chain` link of a client request.
+    pub chain_link: Option<ChainLink>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,7 +210,7 @@ impl Stream {
             pending_push_promises: store::Queue::new(),
             content_length: ContentLength::Omitted,
             initial_window: None,
-            priority_chain: ChainState::None,
+            chain_link: None,
         }
     }
 
