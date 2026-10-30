@@ -267,11 +267,9 @@ where
         let _e = self.inner.span.enter();
         let _span = tracing::trace_span!("poll_ready");
         // A preface PING armed by an already buffered frame goes first.
-        ready!(
-            self.inner
-                .ping_pong
-                .send_pending_preface_ping(cx, &mut self.codec)
-        )?;
+        self.inner
+            .ping_pong
+            .send_pending_preface_ping(cx, &mut self.codec)?;
         // The order of these calls don't really matter too much
         ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
         ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;

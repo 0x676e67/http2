@@ -317,28 +317,35 @@ async fn preface_ping_after_read_idle() {
 }
 
 #[tokio::test]
-async fn preface_ping_skips_user_ping_payload() {
+async fn preface_ping_and_user_ping_take_turns() {
     h2_support::trace_init!();
     let (io, mut srv) = mock::new();
+
+    let get = |id| {
+        frames::headers(id)
+            .request("GET", "https://http2.akamai.com/")
+            .eos()
+    };
 
     let srv = async move {
         let settings = srv.assert_client_handshake().await;
         assert_default_settings!(settings);
+        // No preface PING while a user PING awaits its ACK.
+        srv.recv_frame(frames::ping([7; 8])).await;
+        srv.recv_frame(get(1)).await;
+        srv.send_frame(frames::ping([7; 8]).pong()).await;
+        srv.send_frame(frames::headers(1).response(204).eos()).await;
+        // A user PING waits for the ACK of a preface PING.
+        srv.recv_frame(get(3)).await;
         srv.recv_frame(frames::ping(1u64.to_be_bytes())).await;
-        srv.recv_frame(
-            frames::headers(1)
-                .request("GET", "https://http2.akamai.com/")
-                .eos(),
-        )
-        .await;
-        // The preface PING skips the payload of the user PING in flight, so
-        // each ACK completes its own PING.
-        srv.recv_frame(frames::ping(2u64.to_be_bytes())).await;
+        srv.send_frame(frames::headers(3).response(204).eos()).await;
+        srv.recv_frame(get(5)).await;
         srv.send_frame(frames::ping(1u64.to_be_bytes()).pong())
             .await;
-        srv.send_frame(frames::ping(2u64.to_be_bytes()).pong())
+        srv.recv_frame(frames::ping(1u64.to_be_bytes())).await;
+        srv.send_frame(frames::ping(1u64.to_be_bytes()).pong())
             .await;
-        srv.send_frame(frames::headers(1).response(204).eos()).await;
+        srv.send_frame(frames::headers(5).response(204).eos()).await;
     };
 
     let client = async move {
@@ -349,13 +356,28 @@ async fn preface_ping_skips_user_ping_payload() {
             .expect("handshake");
         // `ping_pong()` method conflict with mock future ext trait.
         let mut ping_pong = client::Connection::ping_pong(&mut conn).expect("taking ping_pong");
+        let mut get = || {
+            let request = Request::get("https://http2.akamai.com/").body(()).unwrap();
+            client.send_request(request, true).unwrap().0
+        };
+
+        ping_pong.send_ping(Ping::new([7; 8])).expect("send ping");
+        conn.drive(idle_ms(400)).await;
+        let response = get();
+        conn.drive(poll_fn(|cx| ping_pong.poll_pong(cx)))
+            .await
+            .unwrap();
+        let response = conn.drive(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        conn.drive(idle_ms(400)).await;
+        let response = get();
+        let response = conn.drive(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         ping_pong
             .send_ping(Ping::new(1u64.to_be_bytes()))
             .expect("send ping");
-        conn.drive(idle_ms(400)).await;
-
-        let request = Request::get("https://http2.akamai.com/").body(()).unwrap();
-        let (response, _) = client.send_request(request, true).unwrap();
+        let response = get();
         conn.drive(poll_fn(|cx| ping_pong.poll_pong(cx)))
             .await
             .unwrap();

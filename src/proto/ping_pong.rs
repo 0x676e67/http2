@@ -24,17 +24,17 @@ pub(crate) struct PingPong {
 /// PING sent after the next HEADERS frame or ahead of the next non-empty DATA
 /// frame once nothing has been read for longer than `threshold`.
 ///
-/// Payloads carry a big-endian counter starting at 1 that skips the payload of
-/// a user PING in flight. The ACK only allows the next PING; a missing ACK is
-/// not acted on.
+/// Payloads carry a big-endian counter starting at 1. At most one of this and
+/// a user PING awaits an ACK, since a peer may stop reading while it cannot
+/// write one; a missing ACK is not acted on.
 #[derive(Debug)]
 pub(crate) struct PrefacePing {
     threshold: Duration,
     last_read: Instant,
     next_id: u64,
     state: PrefacePingState,
-    /// Payload of a user PING awaiting its ACK, which the counter skips.
-    user_in_flight: Option<PingPayload>,
+    /// Whether a user PING awaits its ACK.
+    user_in_flight: bool,
 }
 
 #[derive(Debug)]
@@ -135,9 +135,9 @@ impl PingPong {
         assert!(self.pending_pong.is_none());
 
         if ping.is_ack() {
-            // Equal payloads are matched in write order. A preface PING skips
-            // the payload of a user PING already in flight, and no user PING
-            // is written while the shutdown PING is pending.
+            // Equal payloads are matched in write order. The preface and user
+            // PINGs never await an ACK together, and no user PING is written
+            // while the shutdown PING is pending.
             if let Some(ref mut preface_ping) = self.preface_ping {
                 if preface_ping.recv_ack(ping.payload()) {
                     tracing::trace!("recv PING PREFACE ack");
@@ -148,7 +148,7 @@ impl PingPong {
             if let Some(ref users) = self.user_pings {
                 if users.receive_pong(ping.payload()) {
                     if let Some(ref mut preface_ping) = self.preface_ping {
-                        preface_ping.user_in_flight = None;
+                        preface_ping.user_in_flight = false;
                     }
                     tracing::trace!("recv PING USER ack");
                     return ReceivedPing::Unknown;
@@ -226,16 +226,17 @@ impl PingPong {
                 ping.sent = true;
             }
         } else if let Some(ref users) = self.user_pings {
-            if users.0.state.load(Ordering::Acquire) == USER_STATE_PENDING_PING {
+            // A user PING waits for the ACK of a preface PING.
+            let preface_idle = self.preface_ping.as_ref().is_none_or(PrefacePing::is_idle);
+            if preface_idle && users.0.state.load(Ordering::Acquire) == USER_STATE_PENDING_PING {
                 if !dst.poll_send_capacity(cx)?.is_ready() {
                     return Poll::Pending;
                 }
 
-                let payload = users.0.load_payload();
-                dst.buffer(Ping::new(payload).into())
+                dst.buffer(Ping::new(users.0.load_payload()).into())
                     .expect("invalid ping frame");
                 if let Some(ref mut preface_ping) = self.preface_ping {
-                    preface_ping.user_in_flight = Some(payload);
+                    preface_ping.user_in_flight = true;
                 }
                 users
                     .0
@@ -254,24 +255,26 @@ impl PingPong {
     }
 
     /// Sends a preface PING armed by an already buffered frame.
+    ///
+    /// Unlike the other PINGs, this never waits for room: reading stays
+    /// possible, and the PING is still written ahead of the next DATA frame.
     pub(crate) fn send_pending_preface_ping<T, B>(
         &mut self,
         cx: &mut Context,
         dst: &mut Codec<T, B>,
-    ) -> Poll<io::Result<()>>
+    ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin,
         B: Buf,
     {
         if let Some(ref mut preface_ping) = self.preface_ping {
-            if !preface_ping.buffer_pending(dst) {
-                ready!(dst.poll_send_capacity(cx))?;
+            if !preface_ping.buffer_pending(dst) && dst.poll_send_capacity(cx)?.is_ready() {
                 let buffered = preface_ping.buffer_pending(dst);
                 debug_assert!(buffered);
             }
         }
 
-        Poll::Ready(Ok(()))
+        Ok(())
     }
 
     /// Records read activity for the preface PING.
@@ -300,25 +303,24 @@ impl PrefacePing {
             last_read: Instant::now(),
             next_id: 1,
             state: PrefacePingState::Idle,
-            user_in_flight: None,
+            user_in_flight: false,
         }
     }
 
     /// Returns whether no PING is outstanding and the connection has been
     /// read-idle for longer than the threshold.
     pub(crate) fn is_due(&self) -> bool {
-        matches!(self.state, PrefacePingState::Idle) && self.last_read.elapsed() > self.threshold
+        self.is_idle() && !self.user_in_flight && self.last_read.elapsed() > self.threshold
+    }
+
+    fn is_idle(&self) -> bool {
+        matches!(self.state, PrefacePingState::Idle)
     }
 
     /// Arms the next PING; callers check `is_due` first.
     pub(crate) fn arm(&mut self) {
-        let mut id = self.next_id;
-        if self.user_in_flight == Some(id.to_be_bytes()) {
-            id = id.wrapping_add(1);
-        }
-
-        self.next_id = id.wrapping_add(1);
-        self.state = PrefacePingState::Pending(id.to_be_bytes());
+        self.state = PrefacePingState::Pending(self.next_id.to_be_bytes());
+        self.next_id = self.next_id.wrapping_add(1);
     }
 
     /// Buffers an armed PING. Returns `false` if the codec is full.

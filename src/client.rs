@@ -1428,8 +1428,8 @@ impl Builder {
     /// has been read for longer than `threshold`.
     ///
     /// The PING follows HEADERS but precedes DATA, and its payload is a
-    /// big-endian counter starting at 1 that skips the payload of a user PING
-    /// in flight. Another PING is only sent after the previous one is
+    /// big-endian counter starting at 1. It is skipped while the previous one
+    /// or a user PING awaits an ACK, and user PINGs are held back until it is
     /// acknowledged; a missing ACK does not close the connection.
     ///
     /// See [RFC 9113 section 6.7](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.7).
