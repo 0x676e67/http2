@@ -819,10 +819,8 @@ impl Builder {
     /// When the I/O object supports vectored writes, the DATA queued on a
     /// stream is also coalesced into frames of up to that size, at most 63
     /// chunks each, without waiting for more, as DATA frames carry arbitrary
-    /// sequences of octets. Appending less than 256 bytes never lifts a frame
-    /// to 256 bytes or more, since the encoder copies smaller frames into a
-    /// shared write. Without vectored writes, as by default, each `send_data`
-    /// chunk is framed on its own, since each part would take its own write.
+    /// sequences of octets. Otherwise, as by default, each `send_data` chunk
+    /// is framed on its own, since each part would take its own write.
     ///
     /// With 16,375 bytes, a frame and its 9-byte header add up to 2^14 bytes,
     /// the max plaintext of a TLS record.

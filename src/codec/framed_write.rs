@@ -72,7 +72,7 @@ const DEFAULT_BUFFER_CAPACITY: usize = 16 * 1_024;
 /// Chain payloads bigger than this when vectored I/O is enabled. The remote
 /// will never advertise a max frame size less than this (well, the spec says
 /// the max frame size can't be less than 16kb, so not even close).
-pub(crate) const CHAIN_THRESHOLD: usize = 256;
+const CHAIN_THRESHOLD: usize = 256;
 
 /// Chain payloads bigger than this when vectored I/O is **not** enabled.
 /// A larger value in this scenario will reduce the number of small and
@@ -292,6 +292,17 @@ where
                     // Encode the frame head to the buffer
                     head.encode(len, self.buf.get_mut());
 
+                    // Only capped DATA is coalesced from several chunks
+                    if self.max_data_frame_size.is_some() {
+                        self.copy_small_chunks(&mut v);
+
+                        // Copied whole, like a smaller frame
+                        if !v.payload().has_remaining() {
+                            self.last_data_frame = Some(v);
+                            return Ok(());
+                        }
+                    }
+
                     if self.buf.get_ref().remaining() < self.chain_threshold {
                         let extra_bytes = self.chain_threshold - self.buf.remaining();
                         self.buf.get_mut().put(v.payload_mut().take(extra_bytes));
@@ -350,6 +361,25 @@ where
         }
 
         Ok(())
+    }
+
+    /// Copies the leading payload chunks under the chain threshold while they
+    /// fit the buffer, as smaller frames are copied, so they do not end the
+    /// write.
+    fn copy_small_chunks(&mut self, frame: &mut frame::Data<B>) {
+        let buf = self.buf.get_mut();
+
+        loop {
+            let chunk = frame.payload().chunk();
+            let n = chunk.len();
+
+            if n == 0 || n >= self.chain_threshold || n > buf.capacity() - buf.len() {
+                return;
+            }
+
+            buf.extend_from_slice(chunk);
+            frame.payload_mut().advance(n);
+        }
     }
 
     fn has_capacity(&self) -> bool {
@@ -433,5 +463,80 @@ mod unstable {
         pub fn get_ref(&self) -> &T {
             &self.inner
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::StreamId;
+    use bytes::{Bytes, buf::Chain};
+    use std::task::Waker;
+
+    /// Records the length of each write.
+    #[derive(Default)]
+    struct Writes(Vec<usize>);
+
+    impl AsyncWrite for Writes {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.push(buf.len());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let n = bufs.iter().map(|buf| buf.len()).sum();
+            self.0.push(n);
+            Poll::Ready(Ok(n))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn data(a: usize, b: usize) -> Frame<Chain<Bytes, Bytes>> {
+        let payload = Bytes::from(vec![0; a]).chain(Bytes::from(vec![0; b]));
+        frame::Data::new(StreamId::from(1), payload).into()
+    }
+
+    #[test]
+    fn capped_data_frames_copy_small_leading_chunks() {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut codec = FramedWrite::new(Writes::default());
+
+        // Without a cap, frames of 256 bytes or more end the write
+        codec.buffer(data(100, 200)).unwrap();
+        assert!(!codec.has_capacity());
+        assert!(codec.flush(&mut cx).is_ready());
+
+        // With one, chunks under 256 bytes are copied while they fit, so
+        // frames share a write until the buffer fills
+        codec.set_max_data_frame_size(16_375);
+        while codec.has_capacity() {
+            codec.buffer(data(255, 255)).unwrap();
+        }
+        assert!(codec.flush(&mut cx).is_ready());
+
+        codec.buffer(data(255, 256)).unwrap();
+        assert!(!codec.has_capacity());
+        assert!(codec.flush(&mut cx).is_ready());
+
+        assert_eq!(codec.get_mut().0, [309, 32 * 519, 520]);
     }
 }

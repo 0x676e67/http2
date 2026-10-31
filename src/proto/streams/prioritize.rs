@@ -3,7 +3,6 @@ use super::*;
 
 use crate::frame::Reason;
 
-use crate::codec::CHAIN_THRESHOLD;
 use crate::codec::UserError;
 use crate::codec::UserError::*;
 
@@ -74,18 +73,9 @@ enum InFlightData {
 /// Max payload parts of a coalesced DATA frame.
 ///
 /// Plus the frame head, contiguous parts fit the 64 slices that
-/// `poll_write_buf` passes to one vectored write.
+/// `poll_write_buf` passes to one vectored write, and tiny chunks cannot
+/// build a long part list.
 const MAX_DATA_FRAME_PARTS: usize = 63;
-
-/// Whether `part` bytes may join a coalesced DATA frame of `len` bytes.
-///
-/// Vectored writes copy frames under the chain threshold into a shared write,
-/// while frames at or over it end the write, so two small pieces are not
-/// merged to reach it. Copied frames still fill the 16 KiB write buffer, so
-/// runs of 251 to 255-byte chunks can take one more write per 62 chunks.
-fn joins(len: usize, part: usize) -> bool {
-    len >= CHAIN_THRESHOLD || part >= CHAIN_THRESHOLD || len + part < CHAIN_THRESHOLD
-}
 
 pub(crate) struct Prioritized<B> {
     // The buffer
@@ -1095,9 +1085,8 @@ impl<B: Buf> Prioritized<B> {
 
     /// Appends the stream's queued DATA chunks, up to `room` bytes.
     ///
-    /// Stops at a non-DATA frame, DATA that does not join, a partly taken
-    /// chunk or END_STREAM. Returns the bytes added and whether the frame now
-    /// ends the stream.
+    /// Stops at a non-DATA frame, a partly taken chunk or END_STREAM. Returns
+    /// the bytes added and whether the frame now ends the stream.
     fn coalesce(
         &mut self,
         mut room: usize,
@@ -1105,20 +1094,17 @@ impl<B: Buf> Prioritized<B> {
         buffer: &mut Buffer<Frame<B>>,
     ) -> (usize, bool) {
         let mut added = 0;
-        let head = self.inner.remaining();
 
         loop {
             let frame = match stream.pending_send.pop_front(buffer) {
                 // Empty chunks add no part, so they merge even into a full frame
-                Some(Frame::Data(frame)) if !frame.payload().has_remaining() => frame,
                 Some(Frame::Data(frame))
-                    if room > 0
-                        && self.rest.len() + 1 < MAX_DATA_FRAME_PARTS
-                        && joins(head + added, cmp::min(frame.payload().remaining(), room)) =>
+                    if !frame.payload().has_remaining()
+                        || (room > 0 && self.rest.len() + 1 < MAX_DATA_FRAME_PARTS) =>
                 {
                     frame
                 }
-                // Trailers and DATA that does not join keep their place
+                // Trailers and DATA past the room keep their place
                 Some(frame) => {
                     stream.pending_send.push_front(buffer, frame);
                     return (added, false);
