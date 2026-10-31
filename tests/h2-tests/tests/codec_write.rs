@@ -286,25 +286,28 @@ async fn max_send_data_frame_size_coalesces_queued_data() {
         srv.recv_frame(frames::data(3, &body[49_125..]).eos()).await;
         srv.send_frame(frames::headers(3).response(204).eos()).await;
 
-        // 1-byte chunks stop at the part limit. Trailers stop the merge and
-        // keep their place.
+        // 1-byte chunks stop at the part limit, which empty chunks do not
+        // count toward. Trailers stop the merge and keep their place.
         srv.recv_frame(frames::headers(5).request("POST", "https://example.com/"))
             .await;
-        let body = chunks(&[1; 100]).concat();
+        let body = chunks(&[1, 0].repeat(100)).concat();
         recv_data(&mut srv, 5, &body, &[63, 37]).await;
         srv.recv_frame(frames::headers(5).field("zomg", "hello").eos())
             .await;
         srv.send_frame(frames::headers(5).response(204).eos()).await;
 
         // Merged frames took their full length from the connection window,
-        // so 1 byte past the 12_212 left waits for WINDOW_UPDATE.
+        // so the merge stops at the 12_212 bytes left, under the stream
+        // window, and 1 byte waits for WINDOW_UPDATE. Running out of queued
+        // DATA does not end the stream.
         srv.recv_frame(frames::headers(7).request("POST", "https://example.com/"))
             .await;
-        let body = chunks(&[12_213]).concat();
+        let body = chunks(&[12_000, 213]).concat();
         srv.recv_frame(frames::data(7, &body[..12_212])).await;
         srv.send_frame(frames::window_update(0, 1)).await;
-        srv.recv_frame(frames::data(7, &body[12_212..]).eos()).await;
+        srv.recv_frame(frames::data(7, &body[12_212..])).await;
         srv.send_frame(frames::headers(7).response(204).eos()).await;
+        srv.recv_frame(frames::data(7, b"").eos()).await;
     };
 
     let client = async move {
@@ -323,16 +326,17 @@ async fn max_send_data_frame_size_coalesces_queued_data() {
         let resp = conn.drive(resp).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-        let (resp, mut stream) = post_chunks(&mut client, &[1; 100], false);
+        let (resp, mut stream) = post_chunks(&mut client, &[1, 0].repeat(100), false);
         let mut trailers = HeaderMap::new();
         trailers.insert("zomg", "hello".parse().unwrap());
         stream.send_trailers(trailers).unwrap();
         let resp = conn.drive(resp).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-        let (resp, _stream) = post_chunks(&mut client, &[12_213], true);
+        let (resp, mut stream) = post_chunks(&mut client, &[12_000, 213], false);
         let resp = conn.drive(resp).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        stream.send_data(Bytes::new(), true).unwrap();
 
         conn.await.unwrap();
     };
@@ -345,14 +349,17 @@ async fn max_send_data_frame_size_framing() {
     // Without vectored writes each part of a merged frame would take its own
     // write, so chunks are framed on their own, within the cap. Without a
     // cap, vectored writes keep the default framing. The peer's max frame
-    // size still bounds a larger cap, and a zero cap acts as one.
+    // size still bounds a larger cap, and a zero cap acts as one. A frame
+    // copied whole from chunks under 256 bytes still gives back the rest of
+    // its last chunk.
     h2_support::trace_init!();
     const BODY: &[usize] = &[16_384, 4_096, 4_096];
-    let cases: [(Option<u32>, bool, &[usize], &[usize]); 4] = [
+    let cases: [(Option<u32>, bool, &[usize], &[usize]); 5] = [
         (Some(16_375), false, BODY, &[16_375, 9, 4_096, 4_096]),
         (None, true, BODY, &[16_384, 4_096, 4_096]),
         (Some(32_768), true, BODY, &[20_480, 4_096]),
         (Some(0), true, &[3], &[1, 1, 1]),
+        (Some(300), true, &[100, 100, 200, 100], &[300, 200]),
     ];
 
     for (cap, vectored, body, lens) in cases {
