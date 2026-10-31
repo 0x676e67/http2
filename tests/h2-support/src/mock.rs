@@ -424,7 +424,12 @@ impl AsyncWrite for Mock {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<Result<usize, io::Error>> {
-        let buf: Vec<u8> = bufs.iter().flat_map(|buf| buf.iter().copied()).collect();
+        // Short writes end inside the parts of merged DATA frames
+        let buf: Vec<u8> = bufs
+            .iter()
+            .flat_map(|buf| buf.iter().copied())
+            .take(1_000)
+            .collect();
         self.poll_write(cx, &buf)
     }
 
