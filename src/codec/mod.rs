@@ -5,6 +5,7 @@ mod framed_write;
 pub use self::error::{SendError, UserError};
 
 use self::framed_read::FramedRead;
+pub(crate) use self::framed_write::CHAIN_THRESHOLD;
 use self::framed_write::FramedWrite;
 
 use crate::frame::{self, Data, Frame};
