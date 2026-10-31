@@ -249,3 +249,188 @@ async fn write_zero_returns_write_zero_err() {
 
     join(srv, client).await;
 }
+
+#[tokio::test]
+async fn max_send_data_frame_size_coalesces_queued_data() {
+    // A capped DATA frame takes the chunks queued behind it without waiting
+    // for more, even when the peer allows larger frames. Each chunk has its
+    // own byte value.
+    h2_support::trace_init!();
+    const BODY1: [usize; 5] = [16_384, 16_384, 16_384, 16_358, 4_096];
+    const BODY3: [usize; 5] = [4_096, 4_096, 4_096, 4_096, 32_768];
+    let (io, mut srv) = mock::new_vectored();
+
+    let srv = async move {
+        let settings = srv
+            .assert_client_handshake_with_settings(frames::settings().max_frame_size(65_536))
+            .await;
+        assert_default_settings!(settings);
+
+        // 16_384-byte chunks fill 16_375-byte frames. The windows end the
+        // fifth frame inside the last chunk, whose rest keeps END_STREAM.
+        srv.recv_frame(frames::headers(1).request("POST", "https://example.com/"))
+            .await;
+        let body = chunks(&BODY1).concat();
+        recv_data(&mut srv, 1, &body, &[16_375, 16_375, 16_375, 16_375, 35]).await;
+        srv.send_frame(frames::window_update(0, 65_535)).await;
+        srv.send_frame(frames::window_update(1, 4_071)).await;
+        srv.recv_frame(frames::data(1, &body[65_535..]).eos()).await;
+        srv.send_frame(frames::headers(1).response(204).eos()).await;
+
+        // 4 KiB chunks fill frames. An empty END_STREAM chunk waits behind
+        // a partly sent chunk, then merges even when no room is left.
+        srv.recv_frame(frames::headers(3).request("POST", "https://example.com/"))
+            .await;
+        let body = chunks(&BODY3).concat();
+        recv_data(&mut srv, 3, &body, &[16_375, 16_375, 16_375]).await;
+        srv.recv_frame(frames::data(3, &body[49_125..]).eos()).await;
+        srv.send_frame(frames::headers(3).response(204).eos()).await;
+
+        // 1-byte chunks stop at the part limit, which empty chunks do not
+        // count toward. Trailers stop the merge and keep their place.
+        srv.recv_frame(frames::headers(5).request("POST", "https://example.com/"))
+            .await;
+        let body = chunks(&[1, 0].repeat(100)).concat();
+        recv_data(&mut srv, 5, &body, &[63, 37]).await;
+        srv.recv_frame(frames::headers(5).field("zomg", "hello").eos())
+            .await;
+        srv.send_frame(frames::headers(5).response(204).eos()).await;
+
+        // Merged frames took their full length from the connection window,
+        // so the merge stops at the 12_212 bytes left, under the stream
+        // window, and 1 byte waits for WINDOW_UPDATE. Running out of queued
+        // DATA does not end the stream.
+        srv.recv_frame(frames::headers(7).request("POST", "https://example.com/"))
+            .await;
+        let body = chunks(&[12_000, 213]).concat();
+        srv.recv_frame(frames::data(7, &body[..12_212])).await;
+        srv.send_frame(frames::window_update(0, 1)).await;
+        srv.recv_frame(frames::data(7, &body[12_212..])).await;
+        srv.send_frame(frames::headers(7).response(204).eos()).await;
+        srv.recv_frame(frames::data(7, b"").eos()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .max_send_data_frame_size(16_375)
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+
+        let (resp, _stream) = post_chunks(&mut client, &BODY1, true);
+        let resp = conn.drive(resp).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let (resp, mut stream) = post_chunks(&mut client, &BODY3, false);
+        stream.send_data(Bytes::new(), true).unwrap();
+        let resp = conn.drive(resp).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let (resp, mut stream) = post_chunks(&mut client, &[1, 0].repeat(100), false);
+        let mut trailers = HeaderMap::new();
+        trailers.insert("zomg", "hello".parse().unwrap());
+        stream.send_trailers(trailers).unwrap();
+        let resp = conn.drive(resp).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let (resp, mut stream) = post_chunks(&mut client, &[12_000, 213], false);
+        let resp = conn.drive(resp).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        stream.send_data(Bytes::new(), true).unwrap();
+
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn max_send_data_frame_size_framing() {
+    // Without vectored writes each part of a merged frame would take its own
+    // write, so chunks are framed on their own, within the cap. Without a
+    // cap, vectored writes keep the default framing. The peer's max frame
+    // size still bounds a larger cap, and a zero cap acts as one. A frame
+    // copied whole from chunks under 256 bytes still gives back the rest of
+    // its last chunk.
+    h2_support::trace_init!();
+    const BODY: &[usize] = &[16_384, 4_096, 4_096];
+    let cases: [(Option<u32>, bool, &[usize], &[usize]); 5] = [
+        (Some(16_375), false, BODY, &[16_375, 9, 4_096, 4_096]),
+        (None, true, BODY, &[16_384, 4_096, 4_096]),
+        (Some(32_768), true, BODY, &[20_480, 4_096]),
+        (Some(0), true, &[3], &[1, 1, 1]),
+        (Some(300), true, &[100, 100, 200, 100], &[300, 200]),
+    ];
+
+    for (cap, vectored, body, lens) in cases {
+        let (io, mut srv) = if vectored {
+            mock::new_vectored()
+        } else {
+            mock::new()
+        };
+
+        let srv = async move {
+            let settings = srv
+                .assert_client_handshake_with_settings(frames::settings().max_frame_size(20_480))
+                .await;
+            assert_default_settings!(settings);
+            srv.codec_mut().set_max_recv_frame_size(20_480);
+            srv.recv_frame(frames::headers(1).request("POST", "https://example.com/"))
+                .await;
+            let body = chunks(body).concat();
+            let (last, lens) = lens.split_last().unwrap();
+            recv_data(&mut srv, 1, &body, lens).await;
+            srv.recv_frame(frames::data(1, &body[body.len() - last..]).eos())
+                .await;
+            srv.send_frame(frames::headers(1).response(204).eos()).await;
+        };
+
+        let client = async move {
+            let mut builder = client::Builder::new();
+            if let Some(cap) = cap {
+                builder.max_send_data_frame_size(cap);
+            }
+            let (mut client, mut conn) =
+                builder.handshake::<_, Bytes>(io).await.expect("handshake");
+
+            let (resp, _stream) = post_chunks(&mut client, body, true);
+            let resp = conn.drive(resp).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+            conn.await.unwrap();
+        };
+
+        join(srv, client).await;
+    }
+}
+
+/// Chunks of the given lengths, filled with 1, 2, 3, ...
+fn chunks(lens: &[usize]) -> Vec<Bytes> {
+    lens.iter()
+        .zip(1u8..)
+        .map(|(&len, byte)| vec![byte; len].into())
+        .collect()
+}
+
+/// Sends a POST whose body chunks are all queued before the connection runs.
+fn post_chunks(
+    client: &mut client::SendRequest<Bytes>,
+    lens: &[usize],
+    eos: bool,
+) -> (client::ResponseFuture, SendStream<Bytes>) {
+    let request = Request::post("https://example.com/").body(()).unwrap();
+    let (resp, mut stream) = client.send_request(request, false).unwrap();
+    for (i, chunk) in chunks(lens).into_iter().enumerate() {
+        stream.send_data(chunk, eos && i + 1 == lens.len()).unwrap();
+    }
+    (resp, stream)
+}
+
+/// Receives the start of `body` as DATA frames of the given lengths.
+async fn recv_data(srv: &mut mock::Handle, id: u32, body: &[u8], lens: &[usize]) {
+    let mut start = 0;
+    for &len in lens {
+        srv.recv_frame(frames::data(id, &body[start..start + len]))
+            .await;
+        start += len;
+    }
+}

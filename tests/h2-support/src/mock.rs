@@ -22,6 +22,7 @@ use std::{cmp, io};
 #[derive(Debug)]
 pub struct Mock {
     pipe: Pipe,
+    vectored: bool,
 }
 
 #[derive(Debug)]
@@ -69,6 +70,13 @@ pub fn new() -> (Mock, Handle) {
     new_with_write_capacity(usize::MAX)
 }
 
+/// Create a new mock and handle that accepts vectored writes
+pub fn new_vectored() -> (Mock, Handle) {
+    let (mut mock, handle) = new();
+    mock.vectored = true;
+    (mock, handle)
+}
+
 /// Create a new mock and handle allowing up to `cap` bytes to be written.
 pub fn new_with_write_capacity(cap: usize) -> (Mock, Handle) {
     let inner = Arc::new(Mutex::new(Inner {
@@ -86,6 +94,7 @@ pub fn new_with_write_capacity(cap: usize) -> (Mock, Handle) {
         pipe: Pipe {
             inner: inner.clone(),
         },
+        vectored: false,
     };
 
     let handle = Handle {
@@ -406,6 +415,24 @@ impl AsyncRead for Mock {
 }
 
 impl AsyncWrite for Mock {
+    fn is_write_vectored(&self) -> bool {
+        self.vectored
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        // Short writes end inside the parts of merged DATA frames
+        let buf: Vec<u8> = bufs
+            .iter()
+            .flat_map(|buf| buf.iter().copied())
+            .take(1_000)
+            .collect();
+        self.poll_write(cx, &buf)
+    }
+
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

@@ -50,6 +50,9 @@ struct Encoder<B> {
     /// Max frame size, this is specified by the peer
     max_frame_size: FrameSize,
 
+    /// Local cap on DATA payloads; `max_frame_size` still applies
+    max_data_frame_size: Option<FrameSize>,
+
     /// Chain payloads bigger than this.
     chain_threshold: usize,
 
@@ -100,6 +103,7 @@ where
                 next: None,
                 last_data_frame: None,
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
+                max_data_frame_size: None,
                 chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
             },
@@ -138,6 +142,11 @@ where
     /// underlying I/O object.
     pub(crate) fn has_capacity(&self) -> bool {
         self.encoder.has_capacity()
+    }
+
+    /// Returns whether the upstream writer takes vectored writes.
+    pub(crate) fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     /// Buffer a frame.
@@ -293,6 +302,17 @@ where
                     // Encode the frame head to the buffer
                     head.encode(len, self.buf.get_mut());
 
+                    // Only capped DATA is coalesced from several chunks
+                    if self.max_data_frame_size.is_some() {
+                        self.copy_small_chunks(&mut v);
+
+                        // Copied whole, like a smaller frame
+                        if !v.payload().has_remaining() {
+                            self.last_data_frame = Some(v);
+                            return Ok(());
+                        }
+                    }
+
                     if self.buf.get_ref().remaining() < self.chain_threshold {
                         let extra_bytes = self.chain_threshold - self.buf.remaining();
                         self.buf.get_mut().put(v.payload_mut().take(extra_bytes));
@@ -353,6 +373,25 @@ where
         Ok(())
     }
 
+    /// Copies the leading payload chunks under the chain threshold while they
+    /// fit the buffer, as smaller frames are copied, so they do not end the
+    /// write.
+    fn copy_small_chunks(&mut self, frame: &mut frame::Data<B>) {
+        let buf = self.buf.get_mut();
+
+        loop {
+            let chunk = frame.payload().chunk();
+            let n = chunk.len();
+
+            if n == 0 || n >= self.chain_threshold || n > buf.capacity() - buf.len() {
+                return;
+            }
+
+            buf.extend_from_slice(chunk);
+            frame.payload_mut().advance(n);
+        }
+    }
+
     fn has_capacity(&self) -> bool {
         self.has_capacity_after(0)
     }
@@ -387,6 +426,19 @@ impl<T, B> FramedWrite<T, B> {
     pub fn set_max_frame_size(&mut self, val: usize) {
         assert!(val <= frame::MAX_MAX_FRAME_SIZE as usize);
         self.encoder.max_frame_size = val as FrameSize;
+    }
+
+    /// Returns the max DATA payload size if a local cap was set
+    pub(crate) fn max_data_frame_size(&self) -> Option<usize> {
+        self.encoder
+            .max_data_frame_size
+            .map(|max| max.min(self.encoder.max_frame_size) as usize)
+    }
+
+    /// Caps DATA payloads whatever the peer's max frame size.
+    pub(crate) fn set_max_data_frame_size(&mut self, val: usize) {
+        self.encoder.max_data_frame_size =
+            Some(val.clamp(1, frame::MAX_MAX_FRAME_SIZE as usize) as FrameSize);
     }
 
     /// Set the peer's header table size.
@@ -436,5 +488,80 @@ mod unstable {
         pub fn get_ref(&self) -> &T {
             &self.inner
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::StreamId;
+    use bytes::{Bytes, buf::Chain};
+    use std::task::Waker;
+
+    /// Records the length of each write.
+    #[derive(Default)]
+    struct Writes(Vec<usize>);
+
+    impl AsyncWrite for Writes {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.push(buf.len());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let n = bufs.iter().map(|buf| buf.len()).sum();
+            self.0.push(n);
+            Poll::Ready(Ok(n))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn data(a: usize, b: usize) -> Frame<Chain<Bytes, Bytes>> {
+        let payload = Bytes::from(vec![0; a]).chain(Bytes::from(vec![0; b]));
+        frame::Data::new(StreamId::from(1), payload).into()
+    }
+
+    #[test]
+    fn capped_data_frames_copy_small_leading_chunks() {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut codec = FramedWrite::new(Writes::default());
+
+        // Without a cap, frames of 256 bytes or more end the write
+        codec.buffer(data(100, 200)).unwrap();
+        assert!(!codec.has_capacity());
+        assert!(codec.flush(&mut cx).is_ready());
+
+        // With one, chunks under 256 bytes are copied while they fit, so
+        // frames share a write until the buffer fills
+        codec.set_max_data_frame_size(16_375);
+        while codec.has_capacity() {
+            codec.buffer(data(255, 255)).unwrap();
+        }
+        assert!(codec.flush(&mut cx).is_ready());
+
+        codec.buffer(data(255, 256)).unwrap();
+        assert!(!codec.has_capacity());
+        assert!(codec.flush(&mut cx).is_ready());
+
+        assert_eq!(codec.get_mut().0, [309, 32 * 519, 520]);
     }
 }
