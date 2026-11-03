@@ -5,6 +5,7 @@ use crate::frame::Reason;
 
 use crate::codec::UserError;
 use crate::codec::UserError::*;
+use crate::codec::WRITE_SLICES;
 
 use crate::tracing;
 
@@ -72,10 +73,9 @@ enum InFlightData {
 
 /// Max payload parts of a coalesced DATA frame.
 ///
-/// Plus the frame head, contiguous parts fit the 64 slices that
-/// `poll_write_buf` passes to one vectored write, and tiny chunks cannot
-/// build a long part list.
-const MAX_DATA_FRAME_PARTS: usize = 63;
+/// Plus the frame head, contiguous parts fit the [`WRITE_SLICES`] of one
+/// vectored write, and tiny chunks cannot build a long part list.
+const MAX_DATA_FRAME_PARTS: usize = WRITE_SLICES - 1;
 
 pub(crate) struct Prioritized<B> {
     // The buffer

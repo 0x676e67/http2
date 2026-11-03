@@ -6,6 +6,7 @@ pub use self::error::{SendError, UserError};
 
 use self::framed_read::FramedRead;
 use self::framed_write::FramedWrite;
+pub(crate) use self::framed_write::WRITE_SLICES;
 
 use crate::frame::{self, Data, Frame};
 use crate::proto::Error;
