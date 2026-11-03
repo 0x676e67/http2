@@ -822,8 +822,9 @@ impl Builder {
     /// sequences of octets. Otherwise, as by default, each `send_data` chunk
     /// is framed on its own, since each part would take its own write.
     ///
-    /// With 16,375 bytes, a frame and its 9-byte header add up to 2^14 bytes,
-    /// the max plaintext of a TLS record.
+    /// With vectored I/O, a frame starts a write of its own unless it is made
+    /// only of chunks under 256 bytes, so with 16,375 bytes a frame and its
+    /// 9-byte header fill one TLS record of 2^14 bytes.
     ///
     /// [RFC 9113 §4.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2
     pub fn max_send_data_frame_size(&mut self, max: u32) -> &mut Self {

@@ -50,6 +50,11 @@ struct Encoder<B> {
     /// Local cap on DATA payloads; `max_frame_size` still applies
     max_data_frame_size: Option<FrameSize>,
 
+    /// Offset in `buf` of the chained capped DATA frame's head, when frames
+    /// are buffered before it; those are written first so the frame starts a
+    /// write
+    data_head: Option<usize>,
+
     /// Chain payloads bigger than this.
     chain_threshold: usize,
 
@@ -101,6 +106,7 @@ where
                 last_data_frame: None,
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
                 max_data_frame_size: None,
+                data_head: None,
                 chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
             },
@@ -165,19 +171,28 @@ where
 
         loop {
             while !self.encoder.is_empty() {
-                let n = match self.encoder.next {
-                    Some(Next::Data(ref mut frame)) => {
-                        tracing::trace!(queued_data_frame = true);
-                        let mut buf = (&mut self.encoder.buf).chain(frame.payload_mut());
-                        ready!(poll_write_buf(Pin::new(&mut self.inner), cx, &mut buf))?
-                    }
-                    _ => {
-                        tracing::trace!(queued_data_frame = false);
-                        ready!(poll_write_buf(
-                            Pin::new(&mut self.inner),
-                            cx,
-                            &mut self.encoder.buf
-                        ))?
+                let pos = self.encoder.buf.position() as usize;
+                let n = if let Some(at) = self.encoder.data_head.filter(|&at| pos < at) {
+                    // Frames buffered before a capped DATA frame go in a
+                    // write of their own
+                    tracing::trace!(frames_before_capped_data = true);
+                    let mut buf = (&mut self.encoder.buf).take(at - pos);
+                    ready!(poll_write_buf(Pin::new(&mut self.inner), cx, &mut buf))?
+                } else {
+                    match self.encoder.next {
+                        Some(Next::Data(ref mut frame)) => {
+                            tracing::trace!(queued_data_frame = true);
+                            let mut buf = (&mut self.encoder.buf).chain(frame.payload_mut());
+                            ready!(poll_write_buf(Pin::new(&mut self.inner), cx, &mut buf))?
+                        }
+                        _ => {
+                            tracing::trace!(queued_data_frame = false);
+                            ready!(poll_write_buf(
+                                Pin::new(&mut self.inner),
+                                cx,
+                                &mut self.encoder.buf
+                            ))?
+                        }
                     }
                 };
                 if n == 0 {
@@ -250,6 +265,7 @@ where
         // Clear internal buffer
         self.buf.set_position(0);
         self.buf.get_mut().clear();
+        self.data_head = None;
 
         // The data frame has been written, so unset it
         match self.next.take() {
@@ -288,6 +304,7 @@ where
 
                 if len >= self.chain_threshold {
                     let head = v.head();
+                    let at = self.buf.get_ref().len();
 
                     // Encode the frame head to the buffer
                     head.encode(len, self.buf.get_mut());
@@ -300,6 +317,12 @@ where
                         if !v.payload().has_remaining() {
                             self.last_data_frame = Some(v);
                             return Ok(());
+                        }
+
+                        // Start the frame's write at its head, so a frame
+                        // within one TLS record is not split across two
+                        if at > self.buf.position() as usize {
+                            self.data_head = Some(at);
                         }
                     }
 
@@ -473,9 +496,17 @@ mod tests {
     use bytes::{Bytes, buf::Chain};
     use std::task::Waker;
 
-    /// Records the length of each write.
+    /// Records the length of each write, taking at most `.1` bytes per write.
     #[derive(Default)]
-    struct Writes(Vec<usize>);
+    struct Writes(Vec<usize>, Option<usize>);
+
+    impl Writes {
+        fn take(&mut self, n: usize) -> Poll<io::Result<usize>> {
+            let n = self.1.map_or(n, |max| n.min(max));
+            self.0.push(n);
+            Poll::Ready(Ok(n))
+        }
+    }
 
     impl AsyncWrite for Writes {
         fn poll_write(
@@ -483,8 +514,7 @@ mod tests {
             _: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
-            self.0.push(buf.len());
-            Poll::Ready(Ok(buf.len()))
+            self.take(buf.len())
         }
 
         fn poll_write_vectored(
@@ -492,9 +522,7 @@ mod tests {
             _: &mut Context<'_>,
             bufs: &[io::IoSlice<'_>],
         ) -> Poll<io::Result<usize>> {
-            let n = bufs.iter().map(|buf| buf.len()).sum();
-            self.0.push(n);
-            Poll::Ready(Ok(n))
+            self.take(bufs.iter().map(|buf| buf.len()).sum())
         }
 
         fn is_write_vectored(&self) -> bool {
@@ -526,7 +554,8 @@ mod tests {
         assert!(codec.flush(&mut cx).is_ready());
 
         // With one, chunks under 256 bytes are copied while they fit, so
-        // frames share a write until the buffer fills
+        // frames share a write until the buffer fills; the frame that no
+        // longer fits starts a write of its own
         codec.set_max_data_frame_size(16_375);
         while codec.has_capacity() {
             codec.buffer(data(255, 255)).unwrap();
@@ -537,6 +566,37 @@ mod tests {
         assert!(!codec.has_capacity());
         assert!(codec.flush(&mut cx).is_ready());
 
-        assert_eq!(codec.get_mut().0, [309, 32 * 519, 520]);
+        assert_eq!(codec.get_mut().0, [309, 31 * 519, 519, 520]);
+    }
+
+    #[test]
+    fn capped_data_frames_start_a_write() {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut codec = FramedWrite::new(Writes::default());
+        let ping = || -> Frame<Chain<Bytes, Bytes>> { frame::Ping::new([0; 8]).into() };
+
+        // Without a cap, a chained frame shares the write of the frames before it
+        codec.buffer(ping()).unwrap();
+        codec.buffer(data(16_000, 375)).unwrap();
+        assert!(codec.flush(&mut cx).is_ready());
+
+        // With one, those frames are written first, so the frame fills a record
+        codec.set_max_data_frame_size(16_375);
+        codec.buffer(ping()).unwrap();
+        codec.buffer(data(16_000, 375)).unwrap();
+        assert!(codec.flush(&mut cx).is_ready());
+
+        assert_eq!(codec.get_mut().0, [16_401, 17, 16_384]);
+
+        // Short writes still stop at the frame's head
+        codec.get_mut().0.clear();
+        codec.get_mut().1 = Some(10);
+        codec.buffer(ping()).unwrap();
+        codec.buffer(data(16_000, 375)).unwrap();
+        assert!(codec.flush(&mut cx).is_ready());
+
+        let writes = &codec.get_mut().0;
+        assert_eq!(writes[..3], [10, 7, 10]);
+        assert_eq!(writes.iter().sum::<usize>(), 17 + 16_384);
     }
 }
