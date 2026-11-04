@@ -820,19 +820,19 @@ impl Builder {
     /// stream is also coalesced into frames of up to that size, at most 63
     /// non-empty chunks each, without waiting for more, as DATA frames carry
     /// arbitrary sequences of octets ([RFC 9113 §6.1]). Otherwise, as by
-    /// default, each `send_data` chunk is framed on its own, since each chunk
-    /// would take its own write.
+    /// default, each `send_data` chunk is framed on its own.
     ///
-    /// A capped frame can start a write of its own, after the frames before
-    /// it, where that adds no TLS record ([RFC 8446 §5.1]). So with vectored
-    /// writes and 16,375 bytes, a frame and its 9-byte header fill one record
-    /// of 2^14 bytes; a transport that takes the write only in part can still
-    /// seal one more record.
+    /// Each capped frame starts a write and shares none: the frames buffered
+    /// before it are written first, and later ones wait until it is written.
+    /// Small frames, and frames between other frames, thus take more writes
+    /// and TLS records than without a cap. With vectored writes and 16,375
+    /// bytes, a full frame, its 9-byte header included, fills one TLS record
+    /// of 2^14 bytes ([RFC 8446 §5.1]); a transport that takes the write only
+    /// in part can still seal one more record.
     ///
     /// Without vectored writes, a frame with a contiguous chunk of 1 KiB or
-    /// more takes at least two writes, so frames do not line up with records
-    /// and more records can be sent than without a cap. Use it with I/O
-    /// objects that support vectored writes.
+    /// more takes at least two writes, so frames do not line up with records.
+    /// Use it with I/O objects that support vectored writes.
     ///
     /// [RFC 9113 §4.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2
     /// [RFC 9113 §6.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.1

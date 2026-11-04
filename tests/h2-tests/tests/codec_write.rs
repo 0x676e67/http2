@@ -346,12 +346,11 @@ async fn max_send_data_frame_size_coalesces_queued_data() {
 
 #[tokio::test]
 async fn max_send_data_frame_size_framing() {
-    // Without vectored writes each part of a coalesced frame would take its own
-    // write, so chunks are framed on their own, within the cap. Without a
-    // cap, vectored writes keep the default framing. The peer's max frame
-    // size still bounds a larger cap, and a zero cap acts as one. A frame
-    // copied whole from chunks under 256 bytes still gives back the rest of
-    // its last chunk.
+    // Without vectored writes, chunks are framed on their own, within the
+    // cap. Without a cap, vectored writes keep the default framing. The
+    // peer's max frame size still bounds a larger cap, and a zero cap acts as
+    // one. A frame copied whole from chunks under 256 bytes still gives back
+    // the rest of its last chunk.
     h2_support::trace_init!();
     const BODY: &[usize] = &[16_384, 4_096, 4_096];
     let cases: [(Option<u32>, bool, &[usize], &[usize]); 5] = [

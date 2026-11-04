@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::io::poll_write_buf;
 
-use std::io::{self, Cursor, IoSlice};
+use std::io::{self, Cursor};
 
 // A macro to get around a method needing to borrow &mut self
 macro_rules! limited_write_buf {
@@ -48,8 +48,8 @@ struct Encoder<B> {
     max_frame_size: FrameSize,
 
     /// Local cap on DATA payloads; `max_frame_size` still applies. Capped
-    /// frames copy their small leading chunks and can start a write of their
-    /// own.
+    /// frames are always chained, copy their small leading chunks and share
+    /// no write with other frames.
     max_data_frame_size: Option<FrameSize>,
 
     /// Whether the upstream writer takes vectored writes
@@ -64,23 +64,10 @@ struct Encoder<B> {
 
 #[derive(Debug)]
 enum Next<B> {
-    /// A chained DATA frame, and its start in `buf` if the bytes before it
-    /// may go alone; see `split_before_data`
-    Data(frame::Data<B>, Option<DataStart>),
+    /// A chained DATA frame, and the offset of its head in `buf` when it is
+    /// capped; see `split_before_data`
+    Data(frame::Data<B>, Option<usize>),
     Continuation(frame::Continuation),
-}
-
-/// Where a chained capped DATA frame starts in `buf`, after unwritten bytes,
-/// and the length of its first write.
-///
-/// Both stay fixed while those bytes are written: nothing is buffered behind
-/// the frame, and a chained write takes `buf` first.
-#[derive(Debug)]
-struct DataStart {
-    /// Offset of the frame head in `buf`
-    at: usize,
-    /// Length of the frame's first write
-    first_write: usize,
 }
 
 /// Initialize the connection with this amount of write buffer.
@@ -98,12 +85,6 @@ const CHAIN_THRESHOLD: usize = 256;
 /// A larger value in this scenario will reduce the number of small and
 /// fragmented data being sent, and hereby improve the throughput.
 const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
-
-/// Max plaintext of a TLS record ([RFC 8446 §5.1]); TLS layers seal each
-/// write into records of up to this size.
-///
-/// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
-const TLS_RECORD_SIZE: usize = 1 << 14;
 
 /// Max slices `poll_write_buf` passes to one vectored write (tokio-util's
 /// private `MAX_BUFS`).
@@ -196,8 +177,7 @@ where
         loop {
             while !self.encoder.is_empty() {
                 let n = match (self.encoder.split_before_data(), &mut self.encoder.next) {
-                    // The bytes before a capped DATA frame go alone when that
-                    // adds no TLS record
+                    // The bytes before a capped DATA frame go alone
                     (Some(before), _) => {
                         tracing::trace!(frames_before_capped_data = true);
                         let mut buf = (&mut self.encoder.buf).take(before);
@@ -323,7 +303,11 @@ where
                     return Err(PayloadTooBig);
                 }
 
-                if len >= self.chain_threshold {
+                // A capped frame is always chained, so it shares no write with
+                // other frames
+                let capped = self.max_data_frame_size.is_some();
+
+                if len >= self.chain_threshold || capped {
                     let head = v.head();
                     let at = self.buf.get_ref().len();
 
@@ -331,15 +315,9 @@ where
                     head.encode(len, self.buf.get_mut());
 
                     // Capped DATA can carry many chunks: copy the small
-                    // leading ones, as smaller frames are copied
-                    if self.max_data_frame_size.is_some() {
+                    // leading ones
+                    if capped {
                         self.copy_small_chunks(&mut v);
-                    }
-
-                    // Copied whole, like a smaller frame
-                    if !v.payload().has_remaining() {
-                        self.last_data_frame = Some(v);
-                        return Ok(());
                     }
 
                     if self.buf.get_ref().remaining() < self.chain_threshold {
@@ -347,9 +325,8 @@ where
                         self.buf.get_mut().put(v.payload_mut().take(extra_bytes));
                     }
 
-                    // Save the data frame
-                    let start = self.data_start(at, &v);
-                    self.next = Some(Next::Data(v, start));
+                    // Save the data frame, with where a capped one starts
+                    self.next = Some(Next::Data(v, capped.then_some(at)));
                 } else {
                     v.encode_chunk(self.buf.get_mut());
 
@@ -404,8 +381,8 @@ where
     }
 
     /// Copies the payload's leading chunks under the chain threshold while
-    /// they fit the buffer, so a frame made only of such chunks does not end
-    /// the write.
+    /// they fit the buffer, so they go with the frame head instead of taking
+    /// slices or writes of their own.
     fn copy_small_chunks(&mut self, frame: &mut frame::Data<B>) {
         let buf = self.buf.get_mut();
 
@@ -422,49 +399,14 @@ where
         }
     }
 
-    /// Returns the start of a capped DATA frame chained at `at` after
-    /// unwritten bytes, unless a vectored first write would list only part of
-    /// its payload.
-    fn data_start(&self, at: usize, frame: &frame::Data<B>) -> Option<DataStart> {
-        if self.max_data_frame_size.is_none() || at <= self.buf.position() as usize {
-            return None;
-        }
-
-        // The frame's first write takes its buffered bytes and, with vectored
-        // I/O, the payload slices listed beside them
-        let mut first_write = self.buf.get_ref().len().saturating_sub(at);
-        if self.vectored {
-            let mut slices = [IoSlice::new(&[]); DATA_WRITE_SLICES];
-            let n = frame.payload().chunks_vectored(&mut slices);
-            let listed = slices[..n].iter().map(|slice| slice.len()).sum::<usize>();
-
-            // Payload left for a later write can cost a record once the
-            // transport cuts the write, even on a record boundary
-            if listed < frame.payload().remaining() {
-                return None;
-            }
-            first_write += listed;
-        }
-
-        Some(DataStart { at, first_write })
-    }
-
-    /// Returns how many bytes are buffered before the chained capped DATA
-    /// frame when writing them alone adds no TLS record, so the frame starts
-    /// a record instead of straddling one needlessly.
-    ///
-    /// Records are counted as if each write is taken whole; a transport that
-    /// takes part of the frame's first write can still seal one more record.
+    /// Returns how many bytes are still buffered before the chained capped
+    /// DATA frame, so they are written first and the frame starts a write.
     fn split_before_data(&self) -> Option<usize> {
-        let Some(Next::Data(_, Some(DataStart { at, first_write }))) = self.next else {
+        let Some(Next::Data(_, Some(at))) = self.next else {
             return None;
         };
-        let before = at
-            .checked_sub(self.buf.position() as usize)
-            .filter(|&before| before > 0)?;
-
-        let records = |n: usize| n.div_ceil(TLS_RECORD_SIZE);
-        (records(before) + records(first_write) == records(before + first_write)).then_some(before)
+        at.checked_sub(self.buf.position() as usize)
+            .filter(|&before| before > 0)
     }
 
     fn has_capacity(&self) -> bool {
@@ -475,7 +417,11 @@ where
 
     fn is_empty(&self) -> bool {
         match self.next {
-            Some(Next::Data(ref frame, _)) => !frame.payload().has_remaining(),
+            // A chained payload is written after `buf`, which may hold a
+            // capped frame whole
+            Some(Next::Data(ref frame, _)) => {
+                !frame.payload().has_remaining() && !self.buf.has_remaining()
+            }
             _ => !self.buf.has_remaining(),
         }
     }
@@ -513,8 +459,8 @@ impl<T, B> FramedWrite<T, B> {
     }
 
     /// Returns the max parts of a capped DATA frame coalesced from queued
-    /// chunks, so one vectored write lists them all, or `None` if queued DATA
-    /// is not coalesced, as plain writes would send each part alone.
+    /// chunks, so one vectored write lists them all, or `None` without a cap or
+    /// vectored writes.
     pub(crate) fn max_data_frame_parts(&self) -> Option<usize> {
         (self.encoder.max_data_frame_size.is_some() && self.encoder.vectored)
             .then_some(DATA_WRITE_SLICES)
@@ -565,6 +511,7 @@ mod tests {
     use crate::frame::{Reason, StreamId};
     use bytes::Bytes;
     use std::collections::VecDeque;
+    use std::io::IoSlice;
     use std::task::Waker;
 
     /// Keeps the length of each write, taking at most `max` bytes per write.
@@ -668,99 +615,74 @@ mod tests {
     }
 
     #[test]
-    fn capped_data_frames_copy_small_leading_chunks() {
+    fn capped_data_frames_take_a_write_of_their_own() {
+        // Without a cap, frames under 256 bytes are copied and share the write
+        // of the frames around them, and a chained frame shares the write of
+        // the frames before it
         let mut codec = FramedWrite::new(Writes::default());
+        send(&mut codec, [ping(), data(&[100]), ping(), data(&[16_375])]);
+        assert_eq!(codec.get_mut().lens, [16_527]);
 
-        // Without a cap, frames of 256 bytes or more end the write
-        codec.buffer(data(&[100, 200])).unwrap();
-        assert!(!codec.has_capacity());
-        send(&mut codec, []);
-
-        // With one, chunks under 256 bytes are copied while they fit, so
-        // frames share a write until the buffer fills. The frame it cannot
-        // hold whole is chained, and goes alone as it would straddle a record
-        codec.set_max_data_frame_size(16_375);
-        while codec.has_capacity() {
-            codec.buffer(data(&[255, 255])).unwrap();
-        }
-        send(&mut codec, []);
-
-        // A chunk of 256 bytes is chained
-        codec.buffer(data(&[255, 256])).unwrap();
-        assert!(!codec.has_capacity());
-        send(&mut codec, []);
-
-        assert_eq!(codec.get_mut().lens, [309, 31 * 519, 519, 520]);
-    }
-
-    #[test]
-    fn capped_data_frames_start_a_write_adding_no_record() {
-        // Without a cap, a chained frame shares the write of the frames before it
-        let mut codec = FramedWrite::new(Writes::default());
-        send(&mut codec, [ping(), data(&[16_375])]);
-
-        // With one, those frames are written first when the frame would
-        // otherwise straddle two TLS records, which adds no record
-        codec.set_max_data_frame_size(16_375);
-        for len in [16_375, 16_359, 16_358] {
-            send(&mut codec, [ping(), data(&[len])]);
-        }
-        assert_eq!(
-            codec.get_mut().lens,
-            [16_401, 17, 16_384, 17, 16_368, 16_384]
-        );
-
-        // With a cap past one record, records are counted the same way: the
-        // split adds no record at 32_759 bytes but would at 20_480
+        // With one, the frames before a DATA frame are written first and later
+        // ones wait, also for small and empty frames
         codec.get_mut().lens.clear();
-        codec.set_max_frame_size(32_768);
-        codec.set_max_data_frame_size(32_768);
-        send(&mut codec, [ping(), data(&[32_759])]);
-        send(&mut codec, [ping(), data(&[20_480])]);
-        assert_eq!(codec.get_mut().lens, [17, 32_768, 20_506]);
-
-        // After a short write, the rest goes alone only while that still adds
-        // no record
-        codec.get_mut().max = Some(10);
-        for (len, leading) in [(16_375, [10, 7, 10]), (16_359, [10, 10, 10])] {
-            codec.get_mut().lens.clear();
-            send(&mut codec, [ping(), data(&[len])]);
-
-            let lens = &codec.get_mut().lens;
-            assert_eq!(lens[..3], leading);
-            assert_eq!(lens.iter().sum::<usize>(), 17 + 9 + len);
+        codec.set_max_data_frame_size(16_375);
+        for len in [100, 0, 16_375] {
+            codec.buffer(ping()).unwrap();
+            codec.buffer(data(&[len])).unwrap();
+            assert!(!codec.has_capacity());
+            send(&mut codec, []);
         }
+        assert_eq!(codec.get_mut().lens, [17, 109, 17, 9, 17, 16_384]);
 
-        // Plain writes carry only the frame's buffered bytes first: they share
-        // the write of the frames before it when they fit its last record, and
-        // go alone when they would straddle one. GOAWAY frames grow the buffer
-        // past a record here
-        let go_away = |len| {
-            let debug_data = Bytes::from(vec![0; len]);
-            frame::GoAway::with_debug_data(StreamId::zero(), Reason::NO_ERROR, debug_data).into()
-        };
+        // After a short write, the rest still goes alone
+        codec.get_mut().lens.clear();
+        codec.get_mut().max = Some(10);
+        send(&mut codec, [ping(), data(&[16_375])]);
+        let lens = &codec.get_mut().lens;
+        assert_eq!(lens[..3], [10, 7, 10]);
+        assert_eq!(lens.iter().sum::<usize>(), 17 + 9 + 16_375);
+
+        // Plain writes split the same way; the frame's buffered bytes and
+        // the rest of its payload then take a write each
         let mut codec = FramedWrite::new(Writes {
             plain: true,
             ..Writes::default()
         });
         codec.set_max_data_frame_size(16_375);
         send(&mut codec, [ping(), data(&[16_375])]);
-        send(&mut codec, [go_away(24_541), ping(), data(&[16_375])]);
-        send(&mut codec, [go_away(16_342), ping(), data(&[16_375])]);
-        assert_eq!(
-            codec.get_mut().lens,
-            [1_024, 15_377, 24_584, 16_375, 16_376, 9, 16_375]
-        );
+        assert_eq!(codec.get_mut().lens, [17, 1_007, 15_377]);
+    }
 
-        // A vectored write lists 63 payload slices beside the buffer, so the
-        // frame starts a write with 63 slices but not with 64, which would
-        // leave one for a later write
+    #[test]
+    fn capped_data_frames_copy_small_leading_chunks() {
+        // Chunks under 256 bytes are copied with the frame head while they
+        // fit, so many of them take one write. Larger ones are listed beside
+        // the buffer, 63 at most, so the rest takes another write
         let mut codec = FramedWrite::new(Writes::default());
         codec.set_max_data_frame_size(16_375);
-        for last in [&[70][..], &[60, 10]] {
-            let lens = [&[16_000][..], &[5; 61], last].concat();
-            send(&mut codec, [ping(), data(&lens)]);
-        }
-        assert_eq!(codec.get_mut().lens, [17, 16_384, 16_391, 10]);
+        send(&mut codec, [data(&[255; 64])]);
+        send(&mut codec, [data(&[256; 64])]);
+        assert_eq!(codec.get_mut().lens, [16_329, 16_137, 256]);
+
+        // Plain writes copy chunks under 1 KiB while they fit, which then take
+        // no write of their own
+        let mut codec = FramedWrite::new(Writes {
+            plain: true,
+            ..Writes::default()
+        });
+        codec.set_max_data_frame_size(16_375);
+        send(&mut codec, [data(&[1_023, 2_000])]);
+        send(&mut codec, [data(&[1_024, 2_000])]);
+        assert_eq!(codec.get_mut().lens, [1_032, 2_000, 1_024, 9, 2_000]);
+
+        // A chunk that no longer fits the buffer stays in the payload instead
+        // of growing the buffer
+        codec.get_mut().lens.clear();
+        let debug_data = Bytes::from(vec![0; 15_334]);
+        let go_away =
+            frame::GoAway::with_debug_data(StreamId::zero(), Reason::NO_ERROR, debug_data);
+        send(&mut codec, [go_away.into(), data(&[1_000, 1_000])]);
+        assert_eq!(codec.get_mut().lens, [15_351, 1_009, 1_000]);
     }
 }
