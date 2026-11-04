@@ -827,8 +827,12 @@ impl Builder {
     /// it, where that adds no TLS record ([RFC 8446 §5.1]). So with vectored
     /// writes and 16,375 bytes, a frame and its 9-byte header fill one record
     /// of 2^14 bytes; a transport that takes the write only in part can still
-    /// seal one more record. Without vectored writes, a frame with a
-    /// contiguous chunk of 1 KiB or more takes at least two writes.
+    /// seal one more record.
+    ///
+    /// Without vectored writes, a frame with a contiguous chunk of 1 KiB or
+    /// more takes at least two writes, so frames do not line up with records
+    /// and more records can be sent than without a cap. Use it with I/O
+    /// objects that support vectored writes.
     ///
     /// [RFC 9113 §4.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2
     /// [RFC 9113 §6.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.1
