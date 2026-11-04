@@ -1568,6 +1568,7 @@ where
                             headers_pseudo_order: None,
                             priorities: None,
                             preface_ping: None,
+                            preface_ping_timeout: None,
                         },
                     );
 

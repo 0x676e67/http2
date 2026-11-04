@@ -28,10 +28,12 @@ pub(crate) struct PingPong {
 /// Payloads carry a big-endian counter starting at 1. At most one of this and
 /// a user PING awaits an ACK, since a peer may stop reading while it cannot
 /// write one. Any ACK answers this PING, as in Chrome, and a missing ACK is
-/// not acted on.
+/// acted on only once `timeout` passes.
 #[derive(Debug)]
 pub(crate) struct PrefacePing {
     threshold: Duration,
+    /// Time an unanswered PING may go without reads.
+    timeout: Option<Duration>,
     last_read: Instant,
     next_id: u64,
     state: PrefacePingState,
@@ -42,10 +44,10 @@ pub(crate) struct PrefacePing {
 #[derive(Debug)]
 enum PrefacePingState {
     Idle,
-    /// Armed by a frame but not buffered yet.
-    Pending(PingPayload),
-    /// Buffered and waiting for the ACK.
-    InFlight,
+    /// Armed by a frame at this instant but not buffered yet.
+    Pending(PingPayload, Instant),
+    /// Buffered and waiting for the ACK, with the instant it was armed.
+    InFlight(Instant),
 }
 
 #[derive(Debug)]
@@ -100,11 +102,11 @@ const USER_STATE_CLOSED: usize = 4;
 // ===== impl PingPong =====
 
 impl PingPong {
-    pub(crate) fn new(preface_ping: Option<Duration>) -> Self {
+    pub(crate) fn new(preface_ping: Option<Duration>, timeout: Option<Duration>) -> Self {
         PingPong {
             pending_ping: None,
             user_pings: None,
-            preface_ping: preface_ping.map(PrefacePing::new),
+            preface_ping: preface_ping.map(|threshold| PrefacePing::new(threshold, timeout)),
             pending_pongs: SmallVec::new(),
         }
     }
@@ -301,6 +303,11 @@ impl PingPong {
             preface_ping.last_read = Instant::now();
         }
     }
+
+    /// Returns when an unanswered preface PING times out.
+    pub(crate) fn preface_ping_deadline(&self) -> Option<Instant> {
+        self.preface_ping.as_ref()?.deadline()
+    }
 }
 
 impl ReceivedPing {
@@ -315,9 +322,10 @@ impl PrefacePing {
     /// Encoded size of a PING frame.
     pub(crate) const FRAME_LEN: usize = frame::HEADER_LEN + 8;
 
-    fn new(threshold: Duration) -> Self {
+    fn new(threshold: Duration, timeout: Option<Duration>) -> Self {
         PrefacePing {
             threshold,
+            timeout,
             last_read: Instant::now(),
             next_id: 1,
             state: PrefacePingState::Idle,
@@ -337,7 +345,7 @@ impl PrefacePing {
 
     /// Arms the next PING; callers check `is_due` first.
     pub(crate) fn arm(&mut self) {
-        self.state = PrefacePingState::Pending(self.next_id.to_be_bytes());
+        self.state = PrefacePingState::Pending(self.next_id.to_be_bytes(), Instant::now());
         self.next_id = self.next_id.wrapping_add(1);
     }
 
@@ -347,22 +355,33 @@ impl PrefacePing {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        if let PrefacePingState::Pending(payload) = self.state {
+        if let PrefacePingState::Pending(payload, armed) = self.state {
             if !dst.has_send_capacity() {
                 return false;
             }
 
             dst.buffer(Ping::new(payload).into())
                 .expect("invalid ping frame");
-            self.state = PrefacePingState::InFlight;
+            self.state = PrefacePingState::InFlight(armed);
         }
 
         true
     }
 
+    /// Returns `timeout` after the PING is armed or the last read, whichever
+    /// is later, as Chrome times a PING from when it is queued.
+    fn deadline(&self) -> Option<Instant> {
+        match self.state {
+            PrefacePingState::Pending(_, armed) | PrefacePingState::InFlight(armed) => self
+                .timeout
+                .and_then(|timeout| armed.max(self.last_read).checked_add(timeout)),
+            PrefacePingState::Idle => None,
+        }
+    }
+
     /// Takes an ACK with any payload while the PING is in flight.
     fn recv_ack(&mut self) -> bool {
-        let in_flight = matches!(self.state, PrefacePingState::InFlight);
+        let in_flight = matches!(self.state, PrefacePingState::InFlight(_));
         if in_flight {
             self.state = PrefacePingState::Idle;
         }

@@ -2,6 +2,7 @@ use futures::channel::oneshot;
 use futures::StreamExt;
 use h2_support::assert_ping;
 use h2_support::prelude::*;
+use std::pin::Pin;
 use std::task::Poll;
 
 #[tokio::test]
@@ -506,6 +507,244 @@ async fn preface_ping_and_user_ping_take_turns() {
     };
 
     join(srv, client).await;
+}
+
+#[tokio::test]
+async fn preface_ping_timeout() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let get = |id| {
+        frames::headers(id)
+            .request("GET", "https://http2.akamai.com/")
+            .eos()
+    };
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(get(1)).await;
+        srv.recv_frame(frames::ping(1u64.to_be_bytes())).await;
+        srv.send_frame(frames::ping(1u64.to_be_bytes()).pong())
+            .await;
+        srv.send_frame(frames::headers(1).response(204).eos()).await;
+        srv.recv_frame(get(3)).await;
+        srv.recv_frame(frames::ping(2u64.to_be_bytes())).await;
+        // Past the PING's own deadline, while nothing polls the client.
+        idle_ms(500).await;
+        srv.send_frame(frames::headers(3).response(204).eos()).await;
+        srv.recv_frame(frames::go_away(0).protocol_error().data("Failed ping."))
+            .await;
+        srv.recv_eof().await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .preface_ping(Duration::from_millis(100))
+            .preface_ping_timeout(Duration::from_millis(400))
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        let mut get = || {
+            let request = Request::get("https://http2.akamai.com/").body(()).unwrap();
+            client.send_request(request, true).unwrap().0
+        };
+
+        // The ACK ends the timeout of the first PING.
+        conn.drive(idle_ms(200)).await;
+        let response = get();
+        let response = conn.drive(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(conn.preface_ping_deadline(), None);
+        conn.drive(idle_ms(500)).await;
+
+        // A read restarts the timeout of the second, which then runs out.
+        let response = get();
+        conn.drive(util::yield_once()).await;
+        let armed = conn.preface_ping_deadline().unwrap();
+        let response = conn.drive(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let deadline = conn.preface_ping_deadline().unwrap();
+        assert!(deadline > armed);
+        tokio::time::sleep_until(deadline.into()).await;
+        let err = conn.await.unwrap_err();
+        assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn preface_ping_timeout_while_write_blocked() {
+    h2_support::trace_init!();
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Close {
+        Timeout,
+        User,
+        Idle,
+        PeerError,
+    }
+
+    // A large header block leaves no room for the PING and the GOAWAY.
+    for (large, close) in [
+        (true, Close::Timeout),
+        (false, Close::Timeout),
+        (true, Close::User),
+        (false, Close::User),
+        (true, Close::Idle),
+        (false, Close::Idle),
+        (false, Close::PeerError),
+    ] {
+        // Room for the preface, SETTINGS and SETTINGS ACK only.
+        let (io, mut srv) = mock::new_with_write_capacity(42);
+        let headers = if large { build_large_headers() } else { vec![] };
+        let get = headers.iter().fold(
+            frames::headers(1).request("GET", "https://http2.akamai.com/"),
+            |frame, &(name, ref value)| frame.field(name, &value[..]),
+        );
+        let mut sent: Vec<frame::Frame> = vec![];
+        let mut received: Vec<frame::Frame> = vec![];
+        match close {
+            Close::Idle if large => sent.extend([
+                frames::headers(1).response(204).eos().into(),
+                frames::window_update(0, 1).into(),
+            ]),
+            Close::Idle => sent.push(frames::window_update(0, 1).into()),
+            Close::PeerError => sent.push(frames::window_update(0, 0).into()),
+            _ => {}
+        }
+        if matches!(close, Close::User | Close::PeerError) {
+            received.push(get.eos().into());
+            if !large {
+                received.push(frames::ping(1u64.to_be_bytes()).into());
+            }
+            let go_away = frames::go_away(0);
+            let go_away = if close == Close::User {
+                go_away
+            } else {
+                go_away.protocol_error()
+            };
+            received.push(go_away.into());
+        }
+        // Each lets the peer send its next frame, and the last one read.
+        let (mut steps, step_rx): (Vec<_>, Vec<_>) =
+            (0..=sent.len()).map(|_| oneshot::channel::<()>()).unzip();
+        steps.reverse();
+
+        let srv = async move {
+            let settings = srv.assert_client_handshake().await;
+            assert_default_settings!(settings);
+            let mut step_rx = step_rx.into_iter();
+            for frame in sent {
+                step_rx.next().unwrap().await.unwrap();
+                srv.send_frame(frame).await;
+            }
+            let _ = step_rx.next().unwrap().await;
+            srv.unbounded_bytes().await;
+            for frame in received {
+                srv.recv_frame(frame).await;
+            }
+            srv.recv_eof().await;
+        };
+
+        let client = async move {
+            let (mut client, mut conn) = client::Builder::new()
+                .preface_ping(Duration::from_millis(100))
+                .preface_ping_timeout(Duration::from_millis(200))
+                .handshake::<_, Bytes>(io)
+                .await
+                .expect("handshake");
+            conn.drive(idle_ms(200)).await;
+            let mut go = || steps.pop().unwrap().send(()).unwrap();
+
+            // The PING armed by the request waits behind the blocked socket,
+            // and its timeout runs meanwhile.
+            let request = headers
+                .iter()
+                .fold(
+                    Request::get("https://http2.akamai.com/"),
+                    |request, &(name, ref value)| request.header(name, &value[..]),
+                )
+                .body(())
+                .unwrap();
+            let (response, _) = client.send_request(request, true).unwrap();
+            conn.drive(util::yield_once()).await;
+            let deadline = conn.preface_ping_deadline().unwrap();
+
+            match close {
+                Close::Timeout => {
+                    // The connection ends without waiting for the peer to read.
+                    tokio::time::sleep_until(deadline.into()).await;
+                    let err = conn.drive(response).await.unwrap_err();
+                    assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
+                    assert!(err.is_library());
+                    assert_eq!(conn.preface_ping_deadline(), None);
+                    let err = conn.await.unwrap_err();
+                    assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
+                }
+                Close::User => {
+                    // A GOAWAY of the user's own is kept, waiting for room
+                    // or, already buffered, for the flush.
+                    tokio::time::sleep_until(deadline.into()).await;
+                    conn.abrupt_shutdown(Reason::NO_ERROR);
+                    conn.drive(util::yield_once()).await;
+                    assert_eq!(conn.preface_ping_deadline(), None);
+                    go();
+                    conn.await.unwrap();
+                }
+                Close::Idle => {
+                    // Once the stream is gone, the idle close starts, waiting
+                    // for room or for the flush.
+                    if large {
+                        go();
+                        let response = conn.drive(response).await.unwrap();
+                        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                    } else {
+                        drop(response);
+                    }
+                    drop(client);
+                    for _ in 0..2 {
+                        let polled = poll_fn(|cx| Poll::Ready(Pin::new(&mut conn).poll(cx))).await;
+                        assert!(polled.is_pending());
+                    }
+                    if !large {
+                        // Closing already, so this GOAWAY is never written.
+                        conn.abrupt_shutdown(Reason::CANCEL);
+                    }
+                    // Input dropped meanwhile moves the deadline, where the
+                    // close ends with its own NO_ERROR.
+                    let closing = conn.preface_ping_deadline().unwrap();
+                    conn.take_read_activity();
+                    go();
+                    idle_ms(10).await;
+                    let polled = poll_fn(|cx| Poll::Ready(Pin::new(&mut conn).poll(cx))).await;
+                    assert!(polled.is_pending());
+                    assert!(conn.take_read_activity());
+                    let deadline = conn.preface_ping_deadline().unwrap();
+                    assert!(deadline > closing);
+                    tokio::time::sleep_until(deadline.into()).await;
+                    conn.await.unwrap();
+                }
+                Close::PeerError => {
+                    // The frame that fails the connection is read after the
+                    // deadline, which it moves, so the GOAWAY waits for the
+                    // flush.
+                    tokio::time::sleep_until(deadline.into()).await;
+                    go();
+                    idle_ms(10).await;
+                    let err = conn.drive(response).await.unwrap_err();
+                    assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
+                    assert!(conn.preface_ping_deadline().unwrap() > deadline);
+                    go();
+                    let err = conn.await.unwrap_err();
+                    assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
+                }
+            }
+        };
+
+        join(srv, client).await;
+    }
 }
 
 #[tokio::test]

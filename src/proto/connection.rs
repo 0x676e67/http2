@@ -11,7 +11,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::vec::IntoIter;
 use tokio::io::{AsyncRead, ReadBuf};
 
@@ -96,6 +96,7 @@ pub(crate) struct Config {
     pub headers_priority_policy: HeadersPriorityPolicy,
     pub priorities: Option<Priorities>,
     pub preface_ping: Option<Duration>,
+    pub preface_ping_timeout: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -209,7 +210,7 @@ where
                 error: None,
                 go_away: GoAway::new(),
                 pending_refusal: None,
-                ping_pong: PingPong::new(config.preface_ping),
+                ping_pong: PingPong::new(config.preface_ping, config.preface_ping_timeout),
                 read_activity: false,
                 settings: Settings::new(config.settings),
                 streams,
@@ -308,7 +309,7 @@ where
     /// may wait for us to read before it reads them.
     ///
     /// The bytes skip the codec, as no frame is read after this, but still
-    /// count as read activity.
+    /// count as reads, for read activity and the preface PING timeout.
     // Out of line, so the scratch buffer stays off the stack of `poll`.
     #[cold]
     #[inline(never)]
@@ -319,6 +320,7 @@ where
             match Pin::new(self.codec.get_mut()).poll_read(cx, &mut buf) {
                 Poll::Ready(Ok(())) if !buf.filled().is_empty() => {
                     self.inner.read_activity = true;
+                    self.inner.ping_pong.record_read();
                 }
                 // Stop on EOF or an error, and wait for the write side.
                 _ => return,
@@ -493,15 +495,38 @@ where
                 }
                 // When open, continue to poll a frame
                 State::Open => {
-                    let result = match self.poll2(cx) {
+                    let polled = self.poll2(cx);
+                    // Reads reset the idle time before a preface PING can be
+                    // armed below, and move its timeout, even if they close
+                    // the connection.
+                    if self.codec.take_read_activity() {
+                        self.inner.ping_pong.record_read();
+                        self.inner.read_activity = true;
+                    }
+
+                    let result = match polled {
                         Poll::Ready(result) => result,
                         // The connection is not ready to make progress
                         Poll::Pending => {
-                            // Reads reset the idle time before a preface PING
-                            // can be armed below.
-                            if self.codec.take_read_activity() {
-                                self.inner.ping_pong.record_read();
-                                self.inner.read_activity = true;
+                            // A preface PING left unanswered with no reads for
+                            // its timeout fails the connection, as in Chrome. A
+                            // GOAWAY still waiting for room when it expires,
+                            // this one included, moves to closing without being
+                            // written and keeps its reason.
+                            if self.preface_ping_expired() {
+                                let reason = self
+                                    .inner
+                                    .go_away
+                                    .going_away()
+                                    .map_or(Reason::PROTOCOL_ERROR, |going_away| {
+                                        going_away.reason()
+                                    });
+                                self.inner.as_dyn().handle_go_away(
+                                    reason,
+                                    Bytes::from_static(b"Failed ping."),
+                                    Initiator::Library,
+                                );
+                                continue;
                             }
 
                             // Frames that may rely on received SETTINGS
@@ -533,8 +558,9 @@ where
                 }
                 State::Closing(reason, initiator) => {
                     tracing::trace!("connection closing after flush");
-                    // Flush/shutdown the codec
-                    if self.codec.shutdown(cx)?.is_pending() {
+                    // Flush/shutdown the codec, without waiting for a peer
+                    // that timed out a preface PING.
+                    if self.codec.shutdown(cx)?.is_pending() && !self.preface_ping_expired() {
                         self.discard_input(cx);
                         return Poll::Pending;
                     }
@@ -615,8 +641,24 @@ where
 
     /// Returns whether bytes were read since the last call.
     pub(crate) fn take_read_activity(&mut self) -> bool {
-        // A poll that closes the connection skips the transfer in `poll`.
+        // Reads not yet moved here by `poll` stay in the codec.
         std::mem::take(&mut self.inner.read_activity) | self.codec.take_read_activity()
+    }
+
+    /// Returns when the unanswered preface PING times out, unless a GOAWAY of
+    /// the user's own waits to be written.
+    pub(crate) fn preface_ping_deadline(&self) -> Option<Instant> {
+        let checked = match self.inner.state {
+            State::Open => !self.inner.go_away.is_user_initiated(),
+            State::Closing(..) => !self.inner.go_away.is_user_buffered(),
+            _ => false,
+        };
+        checked.then(|| self.inner.ping_pong.preface_ping_deadline())?
+    }
+
+    fn preface_ping_expired(&self) -> bool {
+        self.preface_ping_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
     }
 
     /// Returns the remote extended CONNECT setting, or `None` before its initial SETTINGS.
