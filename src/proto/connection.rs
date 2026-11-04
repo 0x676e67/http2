@@ -11,7 +11,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::vec::IntoIter;
 use tokio::io::{AsyncRead, ReadBuf};
 
@@ -96,6 +96,7 @@ pub(crate) struct Config {
     pub headers_priority_policy: HeadersPriorityPolicy,
     pub priorities: Option<Priorities>,
     pub preface_ping: Option<Duration>,
+    pub preface_ping_timeout: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -209,7 +210,7 @@ where
                 error: None,
                 go_away: GoAway::new(),
                 pending_refusal: None,
-                ping_pong: PingPong::new(config.preface_ping),
+                ping_pong: PingPong::new(config.preface_ping, config.preface_ping_timeout),
                 read_activity: false,
                 settings: Settings::new(config.settings),
                 streams,
@@ -504,6 +505,26 @@ where
                                 self.inner.read_activity = true;
                             }
 
+                            // A preface PING left unanswered with no reads for
+                            // its timeout fails the connection, as in Chrome. A
+                            // GOAWAY that finds no room, this one on the next
+                            // pass, closes without it and keeps its reason.
+                            if self.preface_ping_expired() {
+                                let reason = self
+                                    .inner
+                                    .go_away
+                                    .going_away()
+                                    .map_or(Reason::PROTOCOL_ERROR, |going_away| {
+                                        going_away.reason()
+                                    });
+                                self.inner.as_dyn().handle_go_away(
+                                    reason,
+                                    Bytes::from_static(b"Failed ping."),
+                                    Initiator::Library,
+                                );
+                                continue;
+                            }
+
                             // Frames that may rely on received SETTINGS
                             // follow their ACK.
                             ready!(self.inner.settings.poll_send_acks(cx, &mut self.codec))?;
@@ -533,8 +554,9 @@ where
                 }
                 State::Closing(reason, initiator) => {
                     tracing::trace!("connection closing after flush");
-                    // Flush/shutdown the codec
-                    if self.codec.shutdown(cx)?.is_pending() {
+                    // Flush/shutdown the codec, without waiting for a peer
+                    // that timed out a preface PING.
+                    if self.codec.shutdown(cx)?.is_pending() && !self.preface_ping_expired() {
                         self.discard_input(cx);
                         return Poll::Pending;
                     }
@@ -617,6 +639,25 @@ where
     pub(crate) fn take_read_activity(&mut self) -> bool {
         // A poll that closes the connection skips the transfer in `poll`.
         std::mem::take(&mut self.inner.read_activity) | self.codec.take_read_activity()
+    }
+
+    /// Returns when the unanswered preface PING times out, unless a GOAWAY of
+    /// the user's own waits to be written.
+    pub(crate) fn preface_ping_deadline(&self) -> Option<Instant> {
+        let checked = match self.inner.state {
+            State::Open => !self.inner.go_away.is_user_initiated(),
+            State::Closing(..) => !self.inner.go_away.is_user_sent(),
+            _ => false,
+        };
+        if !checked {
+            return None;
+        }
+        self.inner.ping_pong.preface_ping_deadline()
+    }
+
+    fn preface_ping_expired(&self) -> bool {
+        self.preface_ping_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
     }
 
     /// Returns the remote extended CONNECT setting, or `None` before its initial SETTINGS.

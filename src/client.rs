@@ -156,7 +156,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 // The fixed 24-byte sequence that starts the client connection preface. The
@@ -372,6 +372,9 @@ pub struct Builder {
 
     /// Read-idle threshold for the preface PING
     preface_ping: Option<Duration>,
+
+    /// Time an unanswered preface PING may go without reads
+    preface_ping_timeout: Option<Duration>,
 
     /// Initial target receive window size for locally initiated streams.
     initial_target_stream_window_size: Option<u32>,
@@ -699,6 +702,7 @@ impl Builder {
             headers_priority: None,
             priorities: None,
             preface_ping: None,
+            preface_ping_timeout: None,
             initial_target_stream_window_size: None,
         }
     }
@@ -1445,11 +1449,30 @@ impl Builder {
     /// big-endian counter starting at 1. It is skipped while the previous one
     /// or a user PING awaits an ACK, and user PINGs are held back until it is
     /// acknowledged. An ACK with any payload acknowledges it, as in Chrome,
-    /// and a missing ACK does not close the connection.
+    /// and a missing ACK closes the connection only with
+    /// [`preface_ping_timeout`](Self::preface_ping_timeout).
     ///
     /// See [RFC 9113 section 6.7](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.7).
     pub fn preface_ping(&mut self, threshold: Duration) -> &mut Self {
         self.preface_ping = Some(threshold);
+        self
+    }
+
+    /// Closes the connection once a preface PING is unanswered and nothing has
+    /// been read for `timeout`, counted from when the PING is queued or the
+    /// last read, whichever is later.
+    ///
+    /// As in Chrome, which uses 10 seconds for this and the threshold, the
+    /// connection then sends GOAWAY with `PROTOCOL_ERROR` and the debug data
+    /// `Failed ping.`, and its streams fail. It ends at once if that cannot be
+    /// written then, as the peer has stopped reading. A connection already
+    /// closing stops waiting for the peer then too and keeps its reason, but a
+    /// GOAWAY from [`Connection::abrupt_shutdown`] is waited for until written.
+    /// The connection has no timer, so poll it at
+    /// [`Connection::preface_ping_deadline`]. Without
+    /// [`preface_ping`](Self::preface_ping) this does nothing.
+    pub fn preface_ping_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.preface_ping_timeout = Some(timeout);
         self
     }
 }
@@ -1583,6 +1606,7 @@ where
                 headers_priority_policy,
                 priorities: builder.priorities,
                 preface_ping: builder.preface_ping,
+                preface_ping_timeout: builder.preface_ping_timeout,
             },
         );
         let send_request = SendRequest {
@@ -1661,6 +1685,17 @@ where
     /// count, so this measures read idleness for keep-alive logic.
     pub fn take_read_activity(&mut self) -> bool {
         self.inner.take_read_activity()
+    }
+
+    /// Returns when the unanswered preface PING times out, with
+    /// [`Builder::preface_ping_timeout`] set and no GOAWAY from
+    /// [`abrupt_shutdown`](Self::abrupt_shutdown) waiting to be written.
+    ///
+    /// Reads move it later until the connection starts closing, and the
+    /// connection checks it only when polled. It is a [`std::time::Instant`],
+    /// which a paused runtime clock does not advance.
+    pub fn preface_ping_deadline(&self) -> Option<Instant> {
+        self.inner.preface_ping_deadline()
     }
 
     /// Sets the connection to a GOAWAY state.

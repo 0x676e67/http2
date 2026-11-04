@@ -15,6 +15,8 @@ pub(super) struct GoAway {
     going_away: Option<GoingAway>,
     /// Whether the user started the GOAWAY by calling `abrupt_shutdown`.
     is_user_initiated: bool,
+    /// Whether a GOAWAY the user asked for has been buffered.
+    is_user_sent: bool,
     /// A GOAWAY frame that must be buffered in the Codec immediately.
     pending: Option<frame::GoAway>,
 }
@@ -43,6 +45,7 @@ impl GoAway {
             close_now: false,
             going_away: None,
             is_user_initiated: false,
+            is_user_sent: false,
             pending: None,
         }
     }
@@ -105,6 +108,10 @@ impl GoAway {
         self.is_user_initiated
     }
 
+    pub fn is_user_sent(&self) -> bool {
+        self.is_user_sent
+    }
+
     /// Returns the going away info, if any.
     pub fn going_away(&self) -> Option<&GoingAway> {
         self.going_away.as_ref()
@@ -151,6 +158,7 @@ impl GoAway {
 
             let reason = frame.reason();
             dst.buffer(frame.into()).expect("invalid GOAWAY frame");
+            self.is_user_sent |= self.is_user_initiated;
 
             return Poll::Ready(Some(Ok(reason)));
         } else if self.should_close_now() {
