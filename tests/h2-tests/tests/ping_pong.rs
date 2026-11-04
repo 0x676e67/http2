@@ -592,50 +592,58 @@ async fn preface_ping_timeout_while_write_blocked() {
         (false, Close::Timeout),
         (true, Close::User),
         (false, Close::User),
-        (false, Close::Idle),
         (true, Close::Idle),
+        (false, Close::Idle),
         (false, Close::PeerError),
     ] {
         // Room for the preface, SETTINGS and SETTINGS ACK only.
         let (io, mut srv) = mock::new_with_write_capacity(42);
-        let (tx, rx) = oneshot::channel();
-        let (peer_tx, peer_rx) = oneshot::channel();
-
         let headers = if large { build_large_headers() } else { vec![] };
         let get = headers.iter().fold(
             frames::headers(1).request("GET", "https://http2.akamai.com/"),
             |frame, &(name, ref value)| frame.field(name, &value[..]),
         );
+        let mut sent: Vec<frame::Frame> = vec![];
+        let mut received: Vec<frame::Frame> = vec![];
+        match close {
+            Close::Idle if large => sent.extend([
+                frames::headers(1).response(204).eos().into(),
+                frames::window_update(0, 1).into(),
+            ]),
+            Close::Idle => sent.push(frames::window_update(0, 1).into()),
+            Close::PeerError => sent.push(frames::window_update(0, 0).into()),
+            _ => {}
+        }
+        if matches!(close, Close::User | Close::PeerError) {
+            received.push(get.eos().into());
+            if !large {
+                received.push(frames::ping(1u64.to_be_bytes()).into());
+            }
+            let go_away = frames::go_away(0);
+            let go_away = if close == Close::User {
+                go_away
+            } else {
+                go_away.protocol_error()
+            };
+            received.push(go_away.into());
+        }
+        // Each lets the peer send its next frame, and the last one read.
+        let (mut steps, step_rx): (Vec<_>, Vec<_>) =
+            (0..=sent.len()).map(|_| oneshot::channel::<()>()).unzip();
+        steps.reverse();
 
         let srv = async move {
             let settings = srv.assert_client_handshake().await;
             assert_default_settings!(settings);
-            match close {
-                // Answer the request whose header block still fills the codec.
-                Close::Idle if large => {
-                    peer_rx.await.unwrap();
-                    srv.send_frame(frames::headers(1).response(204).eos()).await;
-                }
-                Close::PeerError => {
-                    peer_rx.await.unwrap();
-                    srv.send_frame(frames::window_update(0, 0)).await;
-                }
-                _ => {}
+            let mut step_rx = step_rx.into_iter();
+            for frame in sent {
+                step_rx.next().unwrap().await.unwrap();
+                srv.send_frame(frame).await;
             }
-            rx.await.unwrap();
+            let _ = step_rx.next().unwrap().await;
             srv.unbounded_bytes().await;
-            if matches!(close, Close::User | Close::PeerError) {
-                srv.recv_frame(get.eos()).await;
-                if !large {
-                    srv.recv_frame(frames::ping(1u64.to_be_bytes())).await;
-                }
-                let go_away = frames::go_away(0);
-                let go_away = if close == Close::User {
-                    go_away
-                } else {
-                    go_away.protocol_error()
-                };
-                srv.recv_frame(go_away).await;
+            for frame in received {
+                srv.recv_frame(frame).await;
             }
             srv.recv_eof().await;
         };
@@ -648,6 +656,7 @@ async fn preface_ping_timeout_while_write_blocked() {
                 .await
                 .expect("handshake");
             conn.drive(idle_ms(200)).await;
+            let mut go = || steps.pop().unwrap().send(()).unwrap();
 
             // The PING armed by the request waits behind the blocked socket,
             // and its timeout runs meanwhile.
@@ -673,7 +682,6 @@ async fn preface_ping_timeout_while_write_blocked() {
                     assert_eq!(conn.preface_ping_deadline(), None);
                     let err = conn.await.unwrap_err();
                     assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
-                    tx.send(()).unwrap();
                 }
                 Close::User => {
                     // A GOAWAY of the user's own is kept, waiting for room
@@ -682,15 +690,14 @@ async fn preface_ping_timeout_while_write_blocked() {
                     conn.abrupt_shutdown(Reason::NO_ERROR);
                     conn.drive(util::yield_once()).await;
                     assert_eq!(conn.preface_ping_deadline(), None);
-                    tx.send(()).unwrap();
+                    go();
                     conn.await.unwrap();
                 }
                 Close::Idle => {
                     // Once the stream is gone, the idle close starts, waiting
-                    // for room or for the flush, and stops waiting for the
-                    // peer at the deadline with its own NO_ERROR.
+                    // for room or for the flush.
                     if large {
-                        peer_tx.send(()).unwrap();
+                        go();
                         let response = conn.drive(response).await.unwrap();
                         assert_eq!(response.status(), StatusCode::NO_CONTENT);
                     } else {
@@ -705,107 +712,35 @@ async fn preface_ping_timeout_while_write_blocked() {
                         // Closing already, so this GOAWAY is never written.
                         conn.abrupt_shutdown(Reason::CANCEL);
                     }
+                    // Input dropped meanwhile moves the deadline, where the
+                    // close ends with its own NO_ERROR.
+                    let closing = conn.preface_ping_deadline().unwrap();
+                    conn.take_read_activity();
+                    go();
+                    idle_ms(10).await;
+                    let polled = poll_fn(|cx| Poll::Ready(Pin::new(&mut conn).poll(cx))).await;
+                    assert!(polled.is_pending());
+                    assert!(conn.take_read_activity());
                     let deadline = conn.preface_ping_deadline().unwrap();
+                    assert!(deadline > closing);
                     tokio::time::sleep_until(deadline.into()).await;
                     conn.await.unwrap();
-                    tx.send(()).unwrap();
                 }
                 Close::PeerError => {
                     // The frame that fails the connection is read after the
                     // deadline, which it moves, so the GOAWAY waits for the
                     // flush.
                     tokio::time::sleep_until(deadline.into()).await;
-                    peer_tx.send(()).unwrap();
+                    go();
                     idle_ms(10).await;
                     let err = conn.drive(response).await.unwrap_err();
                     assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
                     assert!(conn.preface_ping_deadline().unwrap() > deadline);
-                    tx.send(()).unwrap();
+                    go();
                     let err = conn.await.unwrap_err();
                     assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
                 }
             }
-        };
-
-        join(srv, client).await;
-    }
-}
-
-#[tokio::test]
-async fn preface_ping_timeout_counts_dropped_reads() {
-    h2_support::trace_init!();
-
-    // The idle GOAWAY waits for room with a large header block and for the
-    // flush with a small one; either way the peer's frames are dropped unread.
-    for large in [true, false] {
-        // Room for the preface, SETTINGS and SETTINGS ACK only.
-        let (io, mut srv) = mock::new_with_write_capacity(42);
-        let (opened_tx, opened_rx) = oneshot::channel();
-        let (closing_tx, closing_rx) = oneshot::channel();
-        let (sent_tx, sent_rx) = oneshot::channel();
-        let (closed_tx, closed_rx) = oneshot::channel();
-
-        let headers = if large { build_large_headers() } else { vec![] };
-
-        let srv = async move {
-            let settings = srv.assert_client_handshake().await;
-            assert_default_settings!(settings);
-            opened_rx.await.unwrap();
-            srv.send_frame(frames::headers(1).response(204).eos()).await;
-            closing_rx.await.unwrap();
-            for _ in 0..3 {
-                idle_ms(25).await;
-                srv.send_frame(frames::window_update(0, 1)).await;
-            }
-            sent_tx.send(()).unwrap();
-            closed_rx.await.unwrap();
-            srv.unbounded_bytes().await;
-            srv.recv_eof().await;
-        };
-
-        let client = async move {
-            let (mut client, mut conn) = client::Builder::new()
-                .preface_ping(Duration::from_millis(100))
-                .preface_ping_timeout(Duration::from_millis(500))
-                .handshake::<_, Bytes>(io)
-                .await
-                .expect("handshake");
-            conn.drive(idle_ms(200)).await;
-
-            let request = headers
-                .iter()
-                .fold(
-                    Request::get("https://http2.akamai.com/"),
-                    |request, &(name, ref value)| request.header(name, &value[..]),
-                )
-                .body(())
-                .unwrap();
-            let (response, _) = client.send_request(request, true).unwrap();
-            conn.drive(util::yield_once()).await;
-            opened_tx.send(()).unwrap();
-            let response = conn.drive(response).await.unwrap();
-            assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-            // Once the stream is gone, the idle close starts.
-            drop((client, response));
-            for _ in 0..2 {
-                let polled = poll_fn(|cx| Poll::Ready(Pin::new(&mut conn).poll(cx))).await;
-                assert!(polled.is_pending());
-            }
-            let closing = conn.preface_ping_deadline().unwrap();
-            conn.take_read_activity();
-
-            closing_tx.send(()).unwrap();
-            conn.drive(sent_rx).await.unwrap();
-            let polled = poll_fn(|cx| Poll::Ready(Pin::new(&mut conn).poll(cx))).await;
-            assert!(polled.is_pending());
-            assert!(conn.take_read_activity());
-            let deadline = conn.preface_ping_deadline().unwrap();
-            assert!(deadline > closing);
-
-            tokio::time::sleep_until(deadline.into()).await;
-            conn.await.unwrap();
-            closed_tx.send(()).unwrap();
         };
 
         join(srv, client).await;

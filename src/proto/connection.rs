@@ -653,10 +653,7 @@ where
             State::Closing(..) => !self.inner.go_away.is_user_buffered(),
             _ => false,
         };
-        if !checked {
-            return None;
-        }
-        self.inner.ping_pong.preface_ping_deadline()
+        checked.then(|| self.inner.ping_pong.preface_ping_deadline())?
     }
 
     fn preface_ping_expired(&self) -> bool {

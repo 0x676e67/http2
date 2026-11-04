@@ -1460,22 +1460,15 @@ impl Builder {
 
     /// Closes the connection once a preface PING is unanswered and nothing has
     /// been read for `timeout`, counted from when the PING is queued or the
-    /// last read, whichever is later. Bytes dropped while the connection
-    /// closes count as reads too.
+    /// last read, whichever is later; Chrome uses 10 seconds.
     ///
-    /// As in Chrome, which uses 10 seconds for this and the threshold, the
-    /// connection then sends GOAWAY with `PROTOCOL_ERROR` and the debug data
-    /// `Failed ping.`, and its streams fail. If that, or a GOAWAY it already
-    /// sends, cannot be written, it stops waiting for the peer by the same
-    /// rule and keeps that GOAWAY's reason. A GOAWAY from
-    /// [`Connection::abrupt_shutdown`] called while the connection is open is
-    /// written without this timeout, and one requested once it is already
-    /// closing is never written.
-    ///
-    /// The connection has no timer: the task driving it sleeps until
-    /// [`Connection::preface_ping_deadline`], polls it, and reads the deadline
-    /// again, since reads move it. Without [`preface_ping`](Self::preface_ping)
-    /// this does nothing.
+    /// The connection then sends GOAWAY with `PROTOCOL_ERROR` and the debug
+    /// data `Failed ping.` and fails its streams. If a GOAWAY, this one
+    /// included, cannot be written by then, it ends without it and keeps its
+    /// reason, unless the GOAWAY comes from [`Connection::abrupt_shutdown`]
+    /// while open. The connection has no timer, so poll it at
+    /// [`Connection::preface_ping_deadline`]. Without
+    /// [`preface_ping`](Self::preface_ping) this does nothing.
     pub fn preface_ping_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.preface_ping_timeout = Some(timeout);
         self
@@ -1692,15 +1685,11 @@ where
         self.inner.take_read_activity()
     }
 
-    /// Returns when the unanswered preface PING times out, with
-    /// [`Builder::preface_ping_timeout`] set and no GOAWAY from
-    /// [`abrupt_shutdown`](Self::abrupt_shutdown), called while open, still to
-    /// be written.
+    /// Returns when the unanswered preface PING times out, unless a GOAWAY from
+    /// [`abrupt_shutdown`](Self::abrupt_shutdown) while open waits to be written.
     ///
-    /// Any bytes read move it later, even ones dropped while closing, and the
-    /// connection checks it only when polled: sleep until it, poll, and read
-    /// it again. It is a [`std::time::Instant`], which a paused runtime clock
-    /// does not advance.
+    /// Any bytes read, even ones dropped while closing, move it later, so read
+    /// it again after each poll. A paused runtime clock does not advance it.
     pub fn preface_ping_deadline(&self) -> Option<Instant> {
         self.inner.preface_ping_deadline()
     }
