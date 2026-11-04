@@ -3,7 +3,6 @@ use super::*;
 
 use crate::frame::Reason;
 
-use crate::codec::DATA_WRITE_SLICES;
 use crate::codec::UserError;
 use crate::codec::UserError::*;
 
@@ -70,13 +69,6 @@ enum InFlightData {
     /// There was a `DATA` frame, but the stream's queue was since cleared.
     Drop,
 }
-
-/// Max payload parts of a coalesced DATA frame.
-///
-/// Contiguous parts fit the [`DATA_WRITE_SLICES`] of one vectored write, so
-/// one write can carry the frame, and tiny chunks cannot build a long part
-/// list.
-const MAX_DATA_FRAME_PARTS: usize = DATA_WRITE_SLICES;
 
 pub(crate) struct Prioritized<B> {
     // The buffer
@@ -534,12 +526,12 @@ impl Prioritize {
         // Reclaim any frame that has previously been written
         self.reclaim_frame(buffer, store, dst);
 
-        // The max DATA frame length, and whether queued DATA is coalesced up
-        // to it
+        // The max DATA frame length, and the max parts of a frame coalesced
+        // from queued DATA, if it is
         let max_frame_len = dst
             .max_send_data_frame_size()
             .unwrap_or_else(|| dst.max_send_frame_size());
-        let coalesce = dst.coalesce_send_data();
+        let max_frame_parts = dst.max_send_data_frame_parts();
 
         tracing::trace!("buffer_pending");
 
@@ -562,7 +554,7 @@ impl Prioritize {
                 self.try_assign_capacity(&mut stream);
             }
 
-            match self.pop_frame(buffer, store, max_frame_len, coalesce, counts, recv)? {
+            match self.pop_frame(buffer, store, max_frame_len, max_frame_parts, counts, recv)? {
                 Some(frame) => {
                     tracing::trace!(?frame, "writing");
 
@@ -731,7 +723,7 @@ impl Prioritize {
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
         max_len: usize,
-        coalesce: bool,
+        max_parts: Option<usize>,
         counts: &mut Counts,
         recv: &mut Recv,
     ) -> io::Result<Option<Frame<Prioritized<B>>>>
@@ -859,11 +851,12 @@ impl Prioritize {
                     // DATA queued behind a fully taken chunk joins this frame,
                     // without waiting for more, up to the cap and the window.
                     // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.1
-                    if coalesce && whole && !eos {
+                    if let Some(max_parts) = max_parts.filter(|_| whole && !eos) {
                         let window =
                             cmp::min(stream_capacity.as_size(), stream.send_flow.window_size());
                         let room = cmp::min(max_len, window as usize).saturating_sub(sz);
-                        let added = Prioritized::coalesce(&mut frame, room, buffer, &mut stream);
+                        let added =
+                            Prioritized::coalesce(&mut frame, room, max_parts, buffer, &mut stream);
                         len += added as WindowSize;
                     }
 
@@ -1078,14 +1071,15 @@ impl<B: Buf> Prioritized<B> {
         self.rest.pop().unwrap_or(self.inner)
     }
 
-    /// Appends the stream's queued DATA chunks to `frame`, up to `room` bytes,
-    /// and returns the bytes added.
+    /// Appends the stream's queued DATA chunks to `frame`, up to `room` bytes
+    /// and `max_parts` parts, and returns the bytes added.
     ///
-    /// Stops at a non-DATA frame, the part limit, a partly taken chunk or
-    /// END_STREAM, which then ends `frame`.
+    /// Stops at a non-DATA frame, the room or part limit, a partly taken chunk
+    /// or END_STREAM, which then ends `frame`.
     fn coalesce(
         frame: &mut frame::Data<Self>,
         mut room: usize,
+        max_parts: usize,
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
     ) -> usize {
@@ -1096,7 +1090,7 @@ impl<B: Buf> Prioritized<B> {
                 // Empty chunks add no part, so they join even a full frame
                 Some(Frame::Data(queued))
                     if !queued.payload().has_remaining()
-                        || (room > 0 && frame.payload().rest.len() + 1 < MAX_DATA_FRAME_PARTS) =>
+                        || (room > 0 && frame.payload().rest.len() + 1 < max_parts) =>
                 {
                     queued
                 }

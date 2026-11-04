@@ -5,7 +5,6 @@ mod framed_write;
 pub use self::error::{SendError, UserError};
 
 use self::framed_read::FramedRead;
-pub(crate) use self::framed_write::DATA_WRITE_SLICES;
 use self::framed_write::FramedWrite;
 
 use crate::frame::{self, Data, Frame};
@@ -110,6 +109,12 @@ impl<T, B> Codec<T, B> {
         self.framed_write().set_max_data_frame_size(val)
     }
 
+    /// Returns the max parts of a DATA frame coalesced from queued chunks, or
+    /// `None` if queued DATA is not coalesced.
+    pub(crate) fn max_send_data_frame_parts(&self) -> Option<usize> {
+        self.inner.get_ref().max_data_frame_parts()
+    }
+
     /// Set the peer's header table size size.
     pub fn set_send_header_table_size(&mut self, val: usize) {
         self.framed_write().set_header_table_size(val)
@@ -160,11 +165,6 @@ where
     /// underlying I/O object.
     pub(crate) fn has_send_capacity(&mut self) -> bool {
         self.framed_write().has_capacity()
-    }
-
-    /// Returns whether queued DATA is coalesced into capped frames.
-    pub(crate) fn coalesce_send_data(&self) -> bool {
-        self.inner.get_ref().coalesce_data()
     }
 
     /// Buffer a frame.

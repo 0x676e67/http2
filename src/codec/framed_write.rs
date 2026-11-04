@@ -110,7 +110,7 @@ const TLS_RECORD_SIZE: usize = 1 << 14;
 const WRITE_SLICES: usize = 64;
 
 /// Max payload slices one vectored write lists beside the write buffer.
-pub(crate) const DATA_WRITE_SLICES: usize = WRITE_SLICES - 1;
+const DATA_WRITE_SLICES: usize = WRITE_SLICES - 1;
 
 // TODO: Make generic
 impl<T, B> FramedWrite<T, B>
@@ -173,12 +173,6 @@ where
     /// underlying I/O object.
     pub(crate) fn has_capacity(&self) -> bool {
         self.encoder.has_capacity()
-    }
-
-    /// Returns whether queued DATA is coalesced into capped frames: only with
-    /// vectored writes, as plain writes send each chunk alone.
-    pub(crate) fn coalesce_data(&self) -> bool {
-        self.encoder.max_data_frame_size.is_some() && self.inner.is_write_vectored()
     }
 
     /// Buffer a frame.
@@ -516,6 +510,14 @@ impl<T, B> FramedWrite<T, B> {
     pub(crate) fn set_max_data_frame_size(&mut self, val: usize) {
         self.encoder.max_data_frame_size =
             Some(val.clamp(1, frame::MAX_MAX_FRAME_SIZE as usize) as FrameSize);
+    }
+
+    /// Returns the max parts of a capped DATA frame coalesced from queued
+    /// chunks, so one vectored write lists them all, or `None` if queued DATA
+    /// is not coalesced, as plain writes would send each part alone.
+    pub(crate) fn max_data_frame_parts(&self) -> Option<usize> {
+        (self.encoder.max_data_frame_size.is_some() && self.encoder.vectored)
+            .then_some(DATA_WRITE_SLICES)
     }
 
     /// Set the peer's header table size.
