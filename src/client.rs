@@ -1466,11 +1466,15 @@ impl Builder {
     /// connection then sends GOAWAY with `PROTOCOL_ERROR` and the debug data
     /// `Failed ping.`, and its streams fail. It ends at once if that cannot be
     /// written then, as the peer has stopped reading. A connection already
-    /// closing stops waiting for the peer then too and keeps its reason, but a
-    /// GOAWAY from [`Connection::abrupt_shutdown`] is waited for until written.
-    /// The connection has no timer, so poll it at
-    /// [`Connection::preface_ping_deadline`]. Without
-    /// [`preface_ping`](Self::preface_ping) this does nothing.
+    /// closing stops waiting for the peer then too and keeps its reason. A
+    /// GOAWAY buffered by [`Connection::abrupt_shutdown`] is still flushed
+    /// without this timeout, while one requested once the connection is
+    /// already closing is never written.
+    ///
+    /// The connection has no timer: the task driving it sleeps until
+    /// [`Connection::preface_ping_deadline`], polls it, and reads the deadline
+    /// again, since reads move it. Without [`preface_ping`](Self::preface_ping)
+    /// this does nothing.
     pub fn preface_ping_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.preface_ping_timeout = Some(timeout);
         self
@@ -1688,12 +1692,13 @@ where
     }
 
     /// Returns when the unanswered preface PING times out, with
-    /// [`Builder::preface_ping_timeout`] set and no GOAWAY from
-    /// [`abrupt_shutdown`](Self::abrupt_shutdown) waiting to be written.
+    /// [`Builder::preface_ping_timeout`] set and no GOAWAY buffered by
+    /// [`abrupt_shutdown`](Self::abrupt_shutdown) waiting to be flushed.
     ///
     /// Reads move it later until the connection starts closing, and the
-    /// connection checks it only when polled. It is a [`std::time::Instant`],
-    /// which a paused runtime clock does not advance.
+    /// connection checks it only when polled: sleep until it, poll, and read
+    /// it again. It is a [`std::time::Instant`], which a paused runtime clock
+    /// does not advance.
     pub fn preface_ping_deadline(&self) -> Option<Instant> {
         self.inner.preface_ping_deadline()
     }
