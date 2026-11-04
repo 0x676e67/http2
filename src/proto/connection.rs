@@ -494,17 +494,19 @@ where
                 }
                 // When open, continue to poll a frame
                 State::Open => {
-                    let result = match self.poll2(cx) {
+                    let polled = self.poll2(cx);
+                    // Reads reset the idle time before a preface PING can be
+                    // armed below, and move its timeout, even if they close
+                    // the connection.
+                    if self.codec.take_read_activity() {
+                        self.inner.ping_pong.record_read();
+                        self.inner.read_activity = true;
+                    }
+
+                    let result = match polled {
                         Poll::Ready(result) => result,
                         // The connection is not ready to make progress
                         Poll::Pending => {
-                            // Reads reset the idle time before a preface PING
-                            // can be armed below.
-                            if self.codec.take_read_activity() {
-                                self.inner.ping_pong.record_read();
-                                self.inner.read_activity = true;
-                            }
-
                             // A preface PING left unanswered with no reads for
                             // its timeout fails the connection, as in Chrome. A
                             // GOAWAY that finds no room, this one on the next
@@ -637,7 +639,7 @@ where
 
     /// Returns whether bytes were read since the last call.
     pub(crate) fn take_read_activity(&mut self) -> bool {
-        // A poll that closes the connection skips the transfer in `poll`.
+        // Reads not yet moved here by `poll` stay in the codec.
         std::mem::take(&mut self.inner.read_activity) | self.codec.take_read_activity()
     }
 

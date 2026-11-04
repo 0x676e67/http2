@@ -583,6 +583,7 @@ async fn preface_ping_timeout_while_write_blocked() {
         Timeout,
         User,
         Idle,
+        PeerError,
     }
 
     // A large header block leaves no room for the PING and the GOAWAY.
@@ -593,11 +594,12 @@ async fn preface_ping_timeout_while_write_blocked() {
         (false, Close::User),
         (false, Close::Idle),
         (true, Close::Idle),
+        (false, Close::PeerError),
     ] {
         // Room for the preface, SETTINGS and SETTINGS ACK only.
         let (io, mut srv) = mock::new_with_write_capacity(42);
         let (tx, rx) = oneshot::channel();
-        let (opened_tx, opened_rx) = oneshot::channel();
+        let (peer_tx, peer_rx) = oneshot::channel();
 
         let headers = if large { build_large_headers() } else { vec![] };
         let get = headers.iter().fold(
@@ -608,19 +610,32 @@ async fn preface_ping_timeout_while_write_blocked() {
         let srv = async move {
             let settings = srv.assert_client_handshake().await;
             assert_default_settings!(settings);
-            if close == Close::Idle && large {
+            match close {
                 // Answer the request whose header block still fills the codec.
-                opened_rx.await.unwrap();
-                srv.send_frame(frames::headers(1).response(204).eos()).await;
+                Close::Idle if large => {
+                    peer_rx.await.unwrap();
+                    srv.send_frame(frames::headers(1).response(204).eos()).await;
+                }
+                Close::PeerError => {
+                    peer_rx.await.unwrap();
+                    srv.send_frame(frames::window_update(0, 0)).await;
+                }
+                _ => {}
             }
             rx.await.unwrap();
             srv.unbounded_bytes().await;
-            if close == Close::User {
+            if matches!(close, Close::User | Close::PeerError) {
                 srv.recv_frame(get.eos()).await;
                 if !large {
                     srv.recv_frame(frames::ping(1u64.to_be_bytes())).await;
                 }
-                srv.recv_frame(frames::go_away(0)).await;
+                let go_away = frames::go_away(0);
+                let go_away = if close == Close::User {
+                    go_away
+                } else {
+                    go_away.protocol_error()
+                };
+                srv.recv_frame(go_away).await;
             }
             srv.recv_eof().await;
         };
@@ -675,7 +690,7 @@ async fn preface_ping_timeout_while_write_blocked() {
                     // for room or for the flush, and stops waiting for the
                     // peer at the deadline with its own NO_ERROR.
                     if large {
-                        opened_tx.send(()).unwrap();
+                        peer_tx.send(()).unwrap();
                         let response = conn.drive(response).await.unwrap();
                         assert_eq!(response.status(), StatusCode::NO_CONTENT);
                     } else {
@@ -694,6 +709,20 @@ async fn preface_ping_timeout_while_write_blocked() {
                     tokio::time::sleep_until(deadline.into()).await;
                     conn.await.unwrap();
                     tx.send(()).unwrap();
+                }
+                Close::PeerError => {
+                    // The frame that fails the connection is read after the
+                    // deadline, which it moves, so the GOAWAY waits for the
+                    // flush.
+                    tokio::time::sleep_until(deadline.into()).await;
+                    peer_tx.send(()).unwrap();
+                    idle_ms(10).await;
+                    let err = conn.drive(response).await.unwrap_err();
+                    assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
+                    assert!(conn.preface_ping_deadline().unwrap() > deadline);
+                    tx.send(()).unwrap();
+                    let err = conn.await.unwrap_err();
+                    assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
                 }
             }
         };
