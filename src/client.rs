@@ -1460,16 +1460,17 @@ impl Builder {
 
     /// Closes the connection once a preface PING is unanswered and nothing has
     /// been read for `timeout`, counted from when the PING is queued or the
-    /// last read, whichever is later.
+    /// last read, whichever is later. Bytes dropped while the connection
+    /// closes count as reads too.
     ///
     /// As in Chrome, which uses 10 seconds for this and the threshold, the
     /// connection then sends GOAWAY with `PROTOCOL_ERROR` and the debug data
-    /// `Failed ping.`, and its streams fail. It ends at once if that cannot be
-    /// written then, as the peer has stopped reading. A connection already
-    /// closing stops waiting for the peer then too and keeps its reason. A
-    /// GOAWAY buffered by [`Connection::abrupt_shutdown`] is still flushed
-    /// without this timeout, while one requested once the connection is
-    /// already closing is never written.
+    /// `Failed ping.`, and its streams fail. If that, or a GOAWAY it already
+    /// sends, cannot be written, it stops waiting for the peer by the same
+    /// rule and keeps that GOAWAY's reason. A GOAWAY from
+    /// [`Connection::abrupt_shutdown`] called while the connection is open is
+    /// written without this timeout, and one requested once it is already
+    /// closing is never written.
     ///
     /// The connection has no timer: the task driving it sleeps until
     /// [`Connection::preface_ping_deadline`], polls it, and reads the deadline
@@ -1692,10 +1693,11 @@ where
     }
 
     /// Returns when the unanswered preface PING times out, with
-    /// [`Builder::preface_ping_timeout`] set and no GOAWAY buffered by
-    /// [`abrupt_shutdown`](Self::abrupt_shutdown) waiting to be flushed.
+    /// [`Builder::preface_ping_timeout`] set and no GOAWAY from
+    /// [`abrupt_shutdown`](Self::abrupt_shutdown), called while open, still to
+    /// be written.
     ///
-    /// Reads move it later until the connection starts closing, and the
+    /// Any bytes read move it later, even ones dropped while closing, and the
     /// connection checks it only when polled: sleep until it, poll, and read
     /// it again. It is a [`std::time::Instant`], which a paused runtime clock
     /// does not advance.

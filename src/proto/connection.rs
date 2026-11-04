@@ -309,22 +309,21 @@ where
     /// may wait for us to read before it reads them.
     ///
     /// The bytes skip the codec, as no frame is read after this, but still
-    /// count as read activity. Returns whether any were read.
+    /// count as reads, for read activity and the preface PING timeout.
     // Out of line, so the scratch buffer stays off the stack of `poll`.
     #[cold]
     #[inline(never)]
-    fn discard_input(&mut self, cx: &mut Context) -> bool {
+    fn discard_input(&mut self, cx: &mut Context) {
         let mut scratch = [0; 8 * 1024];
-        let mut read = false;
         loop {
             let mut buf = ReadBuf::new(&mut scratch);
             match Pin::new(self.codec.get_mut()).poll_read(cx, &mut buf) {
                 Poll::Ready(Ok(())) if !buf.filled().is_empty() => {
                     self.inner.read_activity = true;
-                    read = true;
+                    self.inner.ping_pong.record_read();
                 }
                 // Stop on EOF or an error, and wait for the write side.
-                _ => return read,
+                _ => return,
             }
         }
     }
@@ -511,8 +510,9 @@ where
                         Poll::Pending => {
                             // A preface PING left unanswered with no reads for
                             // its timeout fails the connection, as in Chrome. A
-                            // GOAWAY that finds no room, this one on the next
-                            // pass, closes without it and keeps its reason.
+                            // GOAWAY still waiting for room when it expires,
+                            // this one included, moves to closing without being
+                            // written and keeps its reason.
                             if self.preface_ping_expired() {
                                 let reason = self
                                     .inner
@@ -588,11 +588,9 @@ where
             // - poll_go_away may buffer a graceful shutdown GOAWAY frame
             // - If it has, we've also added a PING to be sent in poll_ready
             let go_away = self.poll_go_away(cx);
-            // Only a GOAWAY that closes the connection waits for room. The
-            // connection is still open, so the dropped bytes move the preface
-            // PING timeout like any other read.
-            if go_away.is_pending() && self.discard_input(cx) {
-                self.inner.ping_pong.record_read();
+            if go_away.is_pending() {
+                // Only a GOAWAY that closes the connection waits for room.
+                self.discard_input(cx);
             }
             if let Some(reason) = ready!(go_away?) {
                 if self.inner.go_away.should_close_now() {
@@ -652,7 +650,7 @@ where
     pub(crate) fn preface_ping_deadline(&self) -> Option<Instant> {
         let checked = match self.inner.state {
             State::Open => !self.inner.go_away.is_user_initiated(),
-            State::Closing(..) => !self.inner.go_away.is_user_sent(),
+            State::Closing(..) => !self.inner.go_away.is_user_buffered(),
             _ => false,
         };
         if !checked {

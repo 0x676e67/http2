@@ -732,75 +732,84 @@ async fn preface_ping_timeout_while_write_blocked() {
 }
 
 #[tokio::test]
-async fn preface_ping_timeout_counts_reads_while_go_away_waits() {
+async fn preface_ping_timeout_counts_dropped_reads() {
     h2_support::trace_init!();
-    // Room for the preface, SETTINGS and SETTINGS ACK only.
-    let (io, mut srv) = mock::new_with_write_capacity(42);
-    let (opened_tx, opened_rx) = oneshot::channel();
-    let (blocked_tx, blocked_rx) = oneshot::channel();
-    let (closed_tx, closed_rx) = oneshot::channel();
 
-    let headers = build_large_headers();
+    // The idle GOAWAY waits for room with a large header block and for the
+    // flush with a small one; either way the peer's frames are dropped unread.
+    for large in [true, false] {
+        // Room for the preface, SETTINGS and SETTINGS ACK only.
+        let (io, mut srv) = mock::new_with_write_capacity(42);
+        let (opened_tx, opened_rx) = oneshot::channel();
+        let (closing_tx, closing_rx) = oneshot::channel();
+        let (sent_tx, sent_rx) = oneshot::channel();
+        let (closed_tx, closed_rx) = oneshot::channel();
 
-    let srv = async move {
-        let settings = srv.assert_client_handshake().await;
-        assert_default_settings!(settings);
-        // Answer the request whose header block still fills the codec.
-        opened_rx.await.unwrap();
-        srv.send_frame(frames::headers(1).response(204).eos()).await;
-        // Keep sending while the client's idle GOAWAY waits for room.
-        blocked_rx.await.unwrap();
-        for _ in 0..4 {
-            srv.send_frame(frames::window_update(0, 1)).await;
-            idle_ms(50).await;
-        }
-        closed_rx.await.unwrap();
-        srv.unbounded_bytes().await;
-        srv.recv_eof().await;
-    };
+        let headers = if large { build_large_headers() } else { vec![] };
 
-    let client = async move {
-        let (mut client, mut conn) = client::Builder::new()
-            .preface_ping(Duration::from_millis(100))
-            .preface_ping_timeout(Duration::from_millis(300))
-            .handshake::<_, Bytes>(io)
-            .await
-            .expect("handshake");
-        conn.drive(idle_ms(200)).await;
+        let srv = async move {
+            let settings = srv.assert_client_handshake().await;
+            assert_default_settings!(settings);
+            opened_rx.await.unwrap();
+            srv.send_frame(frames::headers(1).response(204).eos()).await;
+            closing_rx.await.unwrap();
+            for _ in 0..3 {
+                idle_ms(25).await;
+                srv.send_frame(frames::window_update(0, 1)).await;
+            }
+            sent_tx.send(()).unwrap();
+            closed_rx.await.unwrap();
+            srv.unbounded_bytes().await;
+            srv.recv_eof().await;
+        };
 
-        let request = headers
-            .iter()
-            .fold(
-                Request::get("https://http2.akamai.com/"),
-                |request, &(name, ref value)| request.header(name, &value[..]),
-            )
-            .body(())
-            .unwrap();
-        let (response, _) = client.send_request(request, true).unwrap();
-        conn.drive(util::yield_once()).await;
-        opened_tx.send(()).unwrap();
-        let response = conn.drive(response).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        drop(response);
-        let after_response = conn.preface_ping_deadline().unwrap();
+        let client = async move {
+            let (mut client, mut conn) = client::Builder::new()
+                .preface_ping(Duration::from_millis(100))
+                .preface_ping_timeout(Duration::from_millis(500))
+                .handshake::<_, Bytes>(io)
+                .await
+                .expect("handshake");
+            conn.drive(idle_ms(200)).await;
 
-        // The idle GOAWAY finds no room, so the peer's frames are dropped
-        // unread, but still move the deadline.
-        drop(client);
-        conn.drive(util::yield_once()).await;
-        assert_eq!(conn.preface_ping_deadline(), Some(after_response));
-        blocked_tx.send(()).unwrap();
-        conn.drive(idle_ms(250)).await;
-        let deadline = conn.preface_ping_deadline().unwrap();
-        assert!(deadline > after_response);
-        assert!(conn.take_read_activity());
+            let request = headers
+                .iter()
+                .fold(
+                    Request::get("https://http2.akamai.com/"),
+                    |request, &(name, ref value)| request.header(name, &value[..]),
+                )
+                .body(())
+                .unwrap();
+            let (response, _) = client.send_request(request, true).unwrap();
+            conn.drive(util::yield_once()).await;
+            opened_tx.send(()).unwrap();
+            let response = conn.drive(response).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-        tokio::time::sleep_until(deadline.into()).await;
-        conn.await.unwrap();
-        closed_tx.send(()).unwrap();
-    };
+            // Once the stream is gone, the idle close starts.
+            drop((client, response));
+            for _ in 0..2 {
+                let polled = poll_fn(|cx| Poll::Ready(Pin::new(&mut conn).poll(cx))).await;
+                assert!(polled.is_pending());
+            }
+            let closing = conn.preface_ping_deadline().unwrap();
+            conn.take_read_activity();
 
-    join(srv, client).await;
+            closing_tx.send(()).unwrap();
+            conn.drive(sent_rx).await.unwrap();
+            let polled = poll_fn(|cx| Poll::Ready(Pin::new(&mut conn).poll(cx))).await;
+            assert!(polled.is_pending());
+            assert!(conn.take_read_activity());
+            let deadline = conn.preface_ping_deadline().unwrap();
+            assert!(deadline > closing);
+
+            tokio::time::sleep_until(deadline.into()).await;
+            conn.await.unwrap();
+            closed_tx.send(()).unwrap();
+        };
+
+        join(srv, client).await;
+    }
 }
 
 #[tokio::test]
