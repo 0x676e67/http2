@@ -338,7 +338,9 @@ async fn preface_ping_after_read_idle() {
 #[tokio::test]
 async fn preface_ping_waits_for_write_capacity() {
     h2_support::trace_init!();
-    let (io, mut srv) = mock::new();
+    // Room for the preface, SETTINGS and SETTINGS ACK only.
+    let (io, mut srv) = mock::new_with_write_capacity(42);
+    let (tx, rx) = oneshot::channel();
 
     let large = build_large_headers();
     let get = large.iter().fold(
@@ -349,10 +351,13 @@ async fn preface_ping_waits_for_write_capacity() {
     let srv = async move {
         let settings = srv.assert_client_handshake().await;
         assert_default_settings!(settings);
-        // Block the socket inside the header block, so the armed PING waits.
-        srv.buffer_bytes(1).await;
-        // The PONG for a PING sent meanwhile follows the armed PING.
+        // The armed PING waits on the blocked socket. An ACK read meanwhile
+        // leaves it armed, and the PONG for a PING read meanwhile follows it.
+        rx.await.unwrap();
+        srv.send_frame(frames::ping([5; 8]).pong()).await;
         srv.send_frame(frames::ping([9; 8])).await;
+        util::yield_once().await;
+        srv.unbounded_bytes().await;
         srv.recv_frame(get.eos()).await;
         srv.recv_frame(frames::ping(1u64.to_be_bytes())).await;
         srv.recv_frame(frames::ping([9; 8]).pong()).await;
@@ -376,6 +381,8 @@ async fn preface_ping_waits_for_write_capacity() {
             .body(())
             .unwrap();
         let (response, _) = client.send_request(request, true).unwrap();
+        conn.drive(util::yield_once()).await;
+        tx.send(()).unwrap();
         let response = conn.drive(response).await.unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         conn.await.unwrap();
@@ -447,13 +454,13 @@ async fn preface_ping_and_user_ping_take_turns() {
         srv.recv_frame(get(1)).await;
         srv.send_frame(frames::ping([7; 8]).pong()).await;
         srv.send_frame(frames::headers(1).response(204).eos()).await;
-        // A user PING waits for the ACK of a preface PING.
+        // A user PING waits for the ACK of a preface PING, whatever its
+        // payload.
         srv.recv_frame(get(3)).await;
         srv.recv_frame(frames::ping(1u64.to_be_bytes())).await;
         srv.send_frame(frames::headers(3).response(204).eos()).await;
         srv.recv_frame(get(5)).await;
-        srv.send_frame(frames::ping(1u64.to_be_bytes()).pong())
-            .await;
+        srv.send_frame(frames::ping([0xff; 8]).pong()).await;
         srv.recv_frame(frames::ping(1u64.to_be_bytes())).await;
         srv.send_frame(frames::ping(1u64.to_be_bytes()).pong())
             .await;

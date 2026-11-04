@@ -27,7 +27,8 @@ pub(crate) struct PingPong {
 ///
 /// Payloads carry a big-endian counter starting at 1. At most one of this and
 /// a user PING awaits an ACK, since a peer may stop reading while it cannot
-/// write one; a missing ACK is not acted on.
+/// write one. Any ACK answers this PING, as in Chrome, and a missing ACK is
+/// not acted on.
 #[derive(Debug)]
 pub(crate) struct PrefacePing {
     threshold: Duration,
@@ -44,7 +45,7 @@ enum PrefacePingState {
     /// Armed by a frame but not buffered yet.
     Pending(PingPayload),
     /// Buffered and waiting for the ACK.
-    InFlight(PingPayload),
+    InFlight,
 }
 
 #[derive(Debug)]
@@ -140,11 +141,13 @@ impl PingPong {
         assert!(self.pending_pongs.len() < MAX_PENDING_PONGS);
 
         if ping.is_ack() {
-            // Equal payloads are matched in write order. The preface and user
-            // PINGs never await an ACK together, and no user PING is written
+            // Only clients send preface PINGs and only servers the shutdown
+            // PING, and the preface and user PINGs never await an ACK
+            // together, so any ACK answers a preface PING in flight. Equal
+            // payloads are matched in write order, and no user PING is written
             // while the shutdown PING is pending.
             if let Some(ref mut preface_ping) = self.preface_ping
-                && preface_ping.recv_ack(ping.payload())
+                && preface_ping.recv_ack()
             {
                 tracing::trace!("recv PING PREFACE ack");
                 return ReceivedPing::Unknown;
@@ -351,20 +354,19 @@ impl PrefacePing {
 
             dst.buffer(Ping::new(payload).into())
                 .expect("invalid ping frame");
-            self.state = PrefacePingState::InFlight(payload);
+            self.state = PrefacePingState::InFlight;
         }
 
         true
     }
 
-    fn recv_ack(&mut self, payload: &PingPayload) -> bool {
-        match self.state {
-            PrefacePingState::InFlight(ref sent) if sent == payload => {
-                self.state = PrefacePingState::Idle;
-                true
-            }
-            _ => false,
+    /// Takes an ACK with any payload while the PING is in flight.
+    fn recv_ack(&mut self) -> bool {
+        let in_flight = matches!(self.state, PrefacePingState::InFlight);
+        if in_flight {
+            self.state = PrefacePingState::Idle;
         }
+        in_flight
     }
 }
 
