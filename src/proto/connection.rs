@@ -309,20 +309,22 @@ where
     /// may wait for us to read before it reads them.
     ///
     /// The bytes skip the codec, as no frame is read after this, but still
-    /// count as read activity.
+    /// count as read activity. Returns whether any were read.
     // Out of line, so the scratch buffer stays off the stack of `poll`.
     #[cold]
     #[inline(never)]
-    fn discard_input(&mut self, cx: &mut Context) {
+    fn discard_input(&mut self, cx: &mut Context) -> bool {
         let mut scratch = [0; 8 * 1024];
+        let mut read = false;
         loop {
             let mut buf = ReadBuf::new(&mut scratch);
             match Pin::new(self.codec.get_mut()).poll_read(cx, &mut buf) {
                 Poll::Ready(Ok(())) if !buf.filled().is_empty() => {
                     self.inner.read_activity = true;
+                    read = true;
                 }
                 // Stop on EOF or an error, and wait for the write side.
-                _ => return,
+                _ => return read,
             }
         }
     }
@@ -586,9 +588,11 @@ where
             // - poll_go_away may buffer a graceful shutdown GOAWAY frame
             // - If it has, we've also added a PING to be sent in poll_ready
             let go_away = self.poll_go_away(cx);
-            if go_away.is_pending() {
-                // Only a GOAWAY that closes the connection waits for room.
-                self.discard_input(cx);
+            // Only a GOAWAY that closes the connection waits for room. The
+            // connection is still open, so the dropped bytes move the preface
+            // PING timeout like any other read.
+            if go_away.is_pending() && self.discard_input(cx) {
+                self.inner.ping_pong.record_read();
             }
             if let Some(reason) = ready!(go_away?) {
                 if self.inner.go_away.should_close_now() {
