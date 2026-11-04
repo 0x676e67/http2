@@ -424,7 +424,7 @@ impl AsyncWrite for Mock {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<Result<usize, io::Error>> {
-        // Short writes end inside the parts of merged DATA frames
+        // Short writes end inside the parts of coalesced DATA frames
         let buf: Vec<u8> = bufs
             .iter()
             .flat_map(|buf| buf.iter().copied())

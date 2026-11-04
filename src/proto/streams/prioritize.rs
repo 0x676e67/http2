@@ -3,9 +3,9 @@ use super::*;
 
 use crate::frame::Reason;
 
+use crate::codec::DATA_WRITE_SLICES;
 use crate::codec::UserError;
 use crate::codec::UserError::*;
-use crate::codec::WRITE_SLICES;
 
 use crate::tracing;
 
@@ -73,19 +73,20 @@ enum InFlightData {
 
 /// Max payload parts of a coalesced DATA frame.
 ///
-/// Plus the frame head, contiguous parts fit the [`WRITE_SLICES`] of one
-/// vectored write, and tiny chunks cannot build a long part list.
-const MAX_DATA_FRAME_PARTS: usize = WRITE_SLICES - 1;
+/// Contiguous parts fit the [`DATA_WRITE_SLICES`] of one vectored write, so
+/// one write can carry the frame, and tiny chunks cannot build a long part
+/// list.
+const MAX_DATA_FRAME_PARTS: usize = DATA_WRITE_SLICES;
 
 pub(crate) struct Prioritized<B> {
     // The buffer
     inner: Take<B>,
 
-    // Queued chunks coalesced after the buffer. Only the last part can be
+    // Queued chunks coalesced after `inner`. Only the last part can be
     // partly taken.
     rest: Vec<Take<B>>,
 
-    // Whether the last merged chunk ends the stream
+    // Whether the frame's last chunk ends the stream
     end_of_stream: bool,
 
     // The stream that this is associated with
@@ -533,11 +534,12 @@ impl Prioritize {
         // Reclaim any frame that has previously been written
         self.reclaim_frame(buffer, store, dst);
 
-        // The max DATA frame length. A local cap also coalesces queued DATA,
-        // but only on vectored transports: other writes send each part alone.
-        let data_cap = dst.max_send_data_frame_size();
-        let max_frame_len = data_cap.unwrap_or_else(|| dst.max_send_frame_size());
-        let coalesce = data_cap.is_some() && dst.is_write_vectored();
+        // The max DATA frame length, and whether queued DATA is coalesced up
+        // to it
+        let max_frame_len = dst
+            .max_send_data_frame_size()
+            .unwrap_or_else(|| dst.max_send_frame_size());
+        let coalesce = dst.coalesce_send_data();
 
         tracing::trace!("buffer_pending");
 
@@ -650,15 +652,10 @@ impl Prioritize {
             }
         }
 
-        let mut frame = frame.map(|mut prioritized| {
+        let mut frame = frame.map(|prioritized| {
             // TODO: Ensure fully written
             eos = prioritized.end_of_stream;
-            // Earlier parts were taken whole, so only the last can have bytes left
-            prioritized
-                .rest
-                .pop()
-                .unwrap_or(prioritized.inner)
-                .into_inner()
+            prioritized.into_last().into_inner()
         });
 
         if frame.payload().has_remaining() {
@@ -843,8 +840,9 @@ impl Prioritize {
                     }
 
                     let eos = frame.is_end_stream();
+                    let whole = sz == len as usize;
 
-                    if sz > len as usize {
+                    if !whole {
                         frame.set_end_stream(false);
                     }
 
@@ -861,14 +859,12 @@ impl Prioritize {
                     // DATA queued behind a fully taken chunk joins this frame,
                     // without waiting for more, up to the cap and the window.
                     // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.1
-                    if coalesce && sz == len as usize && !eos {
+                    if coalesce && whole && !eos {
                         let window =
                             cmp::min(stream_capacity.as_size(), stream.send_flow.window_size());
                         let room = cmp::min(max_len, window as usize).saturating_sub(sz);
-                        let (added, end_stream) =
-                            frame.payload_mut().coalesce(room, &mut stream, buffer);
+                        let added = Prioritized::coalesce(&mut frame, room, buffer, &mut stream);
                         len += added as WindowSize;
-                        frame.set_end_stream(end_stream);
                     }
 
                     tracing::trace!(len, "sending data frame");
@@ -1005,13 +1001,7 @@ where
     B: Buf,
 {
     fn remaining(&self) -> usize {
-        let n = self.inner.remaining();
-
-        if self.rest.is_empty() {
-            return n;
-        }
-
-        n + self.rest.iter().map(Buf::remaining).sum::<usize>()
+        self.inner.remaining() + self.rest.iter().map(Buf::remaining).sum::<usize>()
     }
 
     fn chunk(&self) -> &[u8] {
@@ -1083,54 +1073,65 @@ impl<B: Buf> Prioritized<B> {
         self.rest.last().unwrap_or(&self.inner)
     }
 
-    /// Appends the stream's queued DATA chunks, up to `room` bytes.
+    /// Takes the last part.
+    fn into_last(mut self) -> Take<B> {
+        self.rest.pop().unwrap_or(self.inner)
+    }
+
+    /// Appends the stream's queued DATA chunks to `frame`, up to `room` bytes,
+    /// and returns the bytes added.
     ///
-    /// Stops at a non-DATA frame, a partly taken chunk or END_STREAM. Returns
-    /// the bytes added and whether the frame now ends the stream.
+    /// Stops at a non-DATA frame, the part limit, a partly taken chunk or
+    /// END_STREAM, which then ends `frame`.
     fn coalesce(
-        &mut self,
+        frame: &mut frame::Data<Self>,
         mut room: usize,
-        stream: &mut store::Ptr,
         buffer: &mut Buffer<Frame<B>>,
-    ) -> (usize, bool) {
+        stream: &mut store::Ptr,
+    ) -> usize {
         let mut added = 0;
 
         loop {
-            let frame = match stream.pending_send.pop_front(buffer) {
-                // Empty chunks add no part, so they merge even into a full frame
-                Some(Frame::Data(frame))
-                    if !frame.payload().has_remaining()
-                        || (room > 0 && self.rest.len() + 1 < MAX_DATA_FRAME_PARTS) =>
+            let queued = match stream.pending_send.pop_front(buffer) {
+                // Empty chunks add no part, so they join even a full frame
+                Some(Frame::Data(queued))
+                    if !queued.payload().has_remaining()
+                        || (room > 0 && frame.payload().rest.len() + 1 < MAX_DATA_FRAME_PARTS) =>
                 {
-                    frame
+                    queued
                 }
-                // Trailers and DATA past the room keep their place
-                Some(frame) => {
-                    stream.pending_send.push_front(buffer, frame);
-                    return (added, false);
+                // Trailers and DATA past the room or part limit keep their place
+                Some(queued) => {
+                    stream.pending_send.push_front(buffer, queued);
+                    break;
                 }
-                None => return (added, false),
+                None => break,
             };
 
-            let sz = frame.payload().remaining();
+            let sz = queued.payload().remaining();
             let len = cmp::min(sz, room);
-            self.end_of_stream = frame.is_end_stream();
+            let eos = queued.is_end_stream();
+            let payload = frame.payload_mut();
+            payload.end_of_stream = eos;
 
             if len > 0 {
-                self.rest.push(frame.into_payload().take(len));
+                payload.rest.push(queued.into_payload().take(len));
                 added += len;
                 room -= len;
             }
 
             // The rest of a partly taken chunk is pushed back on reclaim
             if len < sz {
-                return (added, false);
+                break;
             }
 
-            if self.end_of_stream {
-                return (added, true);
+            if eos {
+                frame.set_end_stream(true);
+                break;
             }
         }
+
+        added
     }
 }
 

@@ -5,8 +5,8 @@ mod framed_write;
 pub use self::error::{SendError, UserError};
 
 use self::framed_read::FramedRead;
+pub(crate) use self::framed_write::DATA_WRITE_SLICES;
 use self::framed_write::FramedWrite;
-pub(crate) use self::framed_write::WRITE_SLICES;
 
 use crate::frame::{self, Data, Frame};
 use crate::proto::Error;
@@ -105,7 +105,7 @@ impl<T, B> Codec<T, B> {
         self.inner.get_ref().max_data_frame_size()
     }
 
-    /// Caps DATA payloads sent to the peer, whatever its max frame size.
+    /// Caps DATA payloads sent to the peer; its max frame size still applies.
     pub(crate) fn set_max_send_data_frame_size(&mut self, val: usize) {
         self.framed_write().set_max_data_frame_size(val)
     }
@@ -162,9 +162,9 @@ where
         self.framed_write().has_capacity()
     }
 
-    /// Returns whether the underlying I/O object takes vectored writes.
-    pub(crate) fn is_write_vectored(&self) -> bool {
-        self.inner.get_ref().is_write_vectored()
+    /// Returns whether queued DATA is coalesced into capped frames.
+    pub(crate) fn coalesce_send_data(&self) -> bool {
+        self.inner.get_ref().coalesce_data()
     }
 
     /// Buffer a frame.

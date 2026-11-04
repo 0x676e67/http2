@@ -818,17 +818,21 @@ impl Builder {
     ///
     /// When the I/O object supports vectored writes, the DATA queued on a
     /// stream is also coalesced into frames of up to that size, at most 63
-    /// chunks each, without waiting for more, as DATA frames carry arbitrary
-    /// sequences of octets. Otherwise, as by default, each `send_data` chunk
-    /// is framed on its own, since each part would take its own write.
+    /// non-empty chunks each, without waiting for more, as DATA frames carry
+    /// arbitrary sequences of octets ([RFC 9113 §6.1]). Otherwise, as by
+    /// default, each `send_data` chunk is framed on its own, since each chunk
+    /// would take its own write.
     ///
-    /// With vectored I/O, a frame that one write can carry starts a write of
-    /// its own when that adds no TLS record, unless it is made only of chunks
-    /// under 256 bytes. So with 16,375 bytes a frame and its 9-byte header
-    /// fill one TLS record of 2^14 bytes; a transport that takes the write only
-    /// in part can still seal one more record.
+    /// A capped frame can start a write of its own, after the frames before
+    /// it, where that adds no TLS record ([RFC 8446 §5.1]). So with vectored
+    /// writes and 16,375 bytes, a frame and its 9-byte header fill one record
+    /// of 2^14 bytes; a transport that takes the write only in part can still
+    /// seal one more record. Without vectored writes, a frame with a
+    /// contiguous chunk of 1 KiB or more takes at least two writes.
     ///
     /// [RFC 9113 §4.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2
+    /// [RFC 9113 §6.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.1
+    /// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
     pub fn max_send_data_frame_size(&mut self, max: u32) -> &mut Self {
         self.max_send_data_frame_size = Some(max);
         self

@@ -278,7 +278,7 @@ async fn max_send_data_frame_size_coalesces_queued_data() {
         srv.send_frame(frames::headers(1).response(204).eos()).await;
 
         // 4 KiB chunks fill frames. An empty END_STREAM chunk waits behind
-        // a partly sent chunk, then merges even when no room is left.
+        // a partly sent chunk, then joins a frame with no room left.
         srv.recv_frame(frames::headers(3).request("POST", "https://example.com/"))
             .await;
         let body = chunks(&BODY3).concat();
@@ -287,7 +287,7 @@ async fn max_send_data_frame_size_coalesces_queued_data() {
         srv.send_frame(frames::headers(3).response(204).eos()).await;
 
         // 1-byte chunks stop at the part limit, which empty chunks do not
-        // count toward. Trailers stop the merge and keep their place.
+        // count toward. Trailers stop coalescing and keep their place.
         srv.recv_frame(frames::headers(5).request("POST", "https://example.com/"))
             .await;
         let body = chunks(&[1, 0].repeat(100)).concat();
@@ -296,8 +296,8 @@ async fn max_send_data_frame_size_coalesces_queued_data() {
             .await;
         srv.send_frame(frames::headers(5).response(204).eos()).await;
 
-        // Merged frames took their full length from the connection window,
-        // so the merge stops at the 12_212 bytes left, under the stream
+        // Coalesced frames took their full length from the connection window,
+        // so coalescing stops at the 12_212 bytes left, under the stream
         // window, and 1 byte waits for WINDOW_UPDATE. Running out of queued
         // DATA does not end the stream.
         srv.recv_frame(frames::headers(7).request("POST", "https://example.com/"))
@@ -346,7 +346,7 @@ async fn max_send_data_frame_size_coalesces_queued_data() {
 
 #[tokio::test]
 async fn max_send_data_frame_size_framing() {
-    // Without vectored writes each part of a merged frame would take its own
+    // Without vectored writes each part of a coalesced frame would take its own
     // write, so chunks are framed on their own, within the cap. Without a
     // cap, vectored writes keep the default framing. The peer's max frame
     // size still bounds a larger cap, and a zero cap acts as one. A frame
@@ -403,10 +403,10 @@ async fn max_send_data_frame_size_framing() {
     }
 }
 
-/// Chunks of the given lengths, filled with 1, 2, 3, ...
+/// Chunks of the given lengths, filled with 1, 2, 3, ..., 255, 1, ...
 fn chunks(lens: &[usize]) -> Vec<Bytes> {
     lens.iter()
-        .zip(1u8..)
+        .zip((1..=u8::MAX).cycle())
         .map(|(&len, byte)| vec![byte; len].into())
         .collect()
 }
