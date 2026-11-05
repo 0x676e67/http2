@@ -97,11 +97,11 @@ const DEFAULT_BUFFER_CAPACITY: usize = 16 * 1_024;
 /// it, is replaced by a default one once written.
 const MAX_IDLE_BUFFER_CAPACITY: usize = 4 * DEFAULT_BUFFER_CAPACITY;
 
-/// Smallest cap on header frame payloads: a HEADERS frame's priority fields
-/// take 5 bytes ([RFC 9113 §6.2]).
+/// Smallest cap on header frame payloads, so a HEADERS frame's priority
+/// fields fit ([RFC 9113 §6.2]).
 ///
 /// [RFC 9113 §6.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.2
-const MIN_HEADER_FRAME_SIZE: usize = 5;
+const MIN_HEADER_FRAME_SIZE: usize = frame::StreamDependency::LEN;
 
 /// Chain payloads bigger than this when vectored I/O is enabled. The remote
 /// will never advertise a max frame size less than this (well, the spec says
