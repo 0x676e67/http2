@@ -336,6 +336,9 @@ pub struct Builder {
     /// Maximum amount of bytes to "buffer" for writing per stream.
     max_send_buffer_size: usize,
 
+    /// Cap on sent DATA payloads; the peer's max frame size still applies.
+    max_send_data_frame_size: Option<u32>,
+
     /// Maximum number of locally reset streams to keep at a time.
     reset_stream_max: usize,
 
@@ -689,6 +692,7 @@ impl Builder {
     pub fn new() -> Builder {
         Builder {
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
+            max_send_data_frame_size: None,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
             pending_accept_reset_stream_max: proto::DEFAULT_REMOTE_RESET_STREAM_MAX,
@@ -810,6 +814,41 @@ impl Builder {
     /// above.
     pub fn max_frame_size(&mut self, max: u32) -> &mut Self {
         self.settings.set_max_frame_size(Some(max));
+        self
+    }
+
+    /// Sets the max payload size of sent DATA frames.
+    ///
+    /// DATA frames stay within `max` even when the peer allows larger frames,
+    /// since endpoints need not use all available space in a frame
+    /// ([RFC 9113 §4.2]). Flow control can only make them smaller. A zero
+    /// `max` is treated as one. Very small values send many small frames,
+    /// which peers may treat as abuse. By default only the peer's
+    /// `SETTINGS_MAX_FRAME_SIZE` applies.
+    ///
+    /// When the I/O object supports vectored writes, the DATA queued on a
+    /// stream is also coalesced into frames of up to that size, at most 63
+    /// non-empty chunks each, without waiting for more, as DATA frames carry
+    /// arbitrary sequences of octets ([RFC 9113 §6.1]). Otherwise, as by
+    /// default, each `send_data` chunk is framed on its own.
+    ///
+    /// Each capped frame starts a write and shares none: the frames buffered
+    /// before it are written first, and later ones wait until it is written.
+    /// Small frames, and frames between other frames, thus take more writes
+    /// and TLS records than without a cap. With vectored writes and 16,375
+    /// bytes, a full frame, its 9-byte header included, fills one TLS record
+    /// of 2^14 bytes ([RFC 8446 §5.1]); a transport that takes the write only
+    /// in part can still seal one more record.
+    ///
+    /// Without vectored writes, a frame with a contiguous chunk of 1 KiB or
+    /// more takes at least two writes, so frames do not line up with records.
+    /// Use it with I/O objects that support vectored writes.
+    ///
+    /// [RFC 9113 §4.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2
+    /// [RFC 9113 §6.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.1
+    /// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
+    pub fn max_send_data_frame_size(&mut self, max: u32) -> &mut Self {
+        self.max_send_data_frame_size = Some(max);
         self
     }
 
@@ -1575,6 +1614,10 @@ where
 
         if let Some(max) = builder.settings.max_frame_size() {
             codec.set_max_recv_frame_size(max as usize);
+        }
+
+        if let Some(max) = builder.max_send_data_frame_size {
+            codec.set_max_send_data_frame_size(max as usize);
         }
 
         if let Some(max) = builder.settings.max_header_list_size() {

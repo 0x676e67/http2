@@ -11,7 +11,7 @@ use crate::tracing;
 use bytes::buf::Take;
 use std::{
     cmp::{self, Ordering},
-    fmt, io, mem,
+    fmt, io, iter, mem,
     task::Waker,
 };
 
@@ -74,6 +74,11 @@ pub(crate) struct Prioritized<B> {
     // The buffer
     inner: Take<B>,
 
+    // Queued chunks coalesced after `inner`. Only the last part can be
+    // partly taken.
+    rest: Vec<Take<B>>,
+
+    // Whether the frame's last chunk ends the stream
     end_of_stream: bool,
 
     // The stream that this is associated with
@@ -522,8 +527,12 @@ impl Prioritize {
         // Reclaim any frame that has previously been written
         self.reclaim_frame(buffer, store, dst);
 
-        // The max frame length
-        let max_frame_len = dst.max_send_frame_size();
+        // The max DATA frame length, and the max parts of a frame coalesced
+        // from queued DATA, if it is
+        let max_frame_len = dst
+            .max_send_data_frame_size()
+            .unwrap_or_else(|| dst.max_send_frame_size());
+        let max_frame_parts = dst.max_send_data_frame_parts();
 
         tracing::trace!("buffer_pending");
 
@@ -550,7 +559,7 @@ impl Prioritize {
                 self.try_assign_capacity(&mut stream);
             }
 
-            match self.pop_frame(buffer, store, max_frame_len, counts, recv)? {
+            match self.pop_frame(buffer, store, max_frame_len, max_frame_parts, counts, recv)? {
                 Some(frame) => {
                     tracing::trace!(?frame, "writing");
 
@@ -644,7 +653,7 @@ impl Prioritize {
     {
         tracing::trace!(
             ?frame,
-            sz = frame.payload().inner.get_ref().remaining(),
+            sz = frame.payload().last().get_ref().remaining(),
             "reclaimed"
         );
 
@@ -665,7 +674,7 @@ impl Prioritize {
         let mut frame = frame.map(|prioritized| {
             // TODO: Ensure fully written
             eos = prioritized.end_of_stream;
-            prioritized.inner.into_inner()
+            prioritized.into_last().into_inner()
         });
 
         if frame.payload().has_remaining() {
@@ -741,6 +750,7 @@ impl Prioritize {
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
         max_len: usize,
+        max_parts: Option<usize>,
         counts: &mut Counts,
         recv: &mut Recv,
     ) -> io::Result<Option<Frame<Prioritized<B>>>>
@@ -837,7 +847,7 @@ impl Prioritize {
                     let len = cmp::min(sz, max_len);
 
                     // Only send up to the stream's window capacity
-                    let len = cmp::min(len, stream_capacity.as_size() as usize) as WindowSize;
+                    let mut len = cmp::min(len, stream_capacity.as_size() as usize) as WindowSize;
 
                     // There *must* be be enough connection level
                     // capacity at this point.
@@ -849,6 +859,35 @@ impl Prioritize {
                     if len > 0 && len > stream.send_flow.window_size() {
                         stream.pending_send.push_front(buffer, frame.into());
                         continue;
+                    }
+
+                    let eos = frame.is_end_stream();
+                    let whole = sz == len as usize;
+
+                    if !whole {
+                        frame.set_end_stream(false);
+                    }
+
+                    // Wrap the frame's data payload to ensure that the
+                    // correct amount of data gets written.
+                    let mut frame = frame.map(|buf| Prioritized {
+                        inner: buf.take(len as usize),
+                        rest: Vec::new(),
+                        end_of_stream: eos,
+                        stream: stream.key(),
+                    });
+
+                    // DATA frames carry arbitrary sequences of octets, so the
+                    // DATA queued behind a fully taken chunk joins this frame,
+                    // without waiting for more, up to the cap and the window.
+                    // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.1
+                    if let Some(max_parts) = max_parts.filter(|_| whole && !eos) {
+                        let window =
+                            cmp::min(stream_capacity.as_size(), stream.send_flow.window_size());
+                        let room = cmp::min(max_len, window as usize).saturating_sub(sz);
+                        let added =
+                            Prioritized::coalesce(&mut frame, room, max_parts, buffer, &mut stream);
+                        len += added as WindowSize;
                     }
 
                     tracing::trace!(len, "sending data frame");
@@ -867,30 +906,15 @@ impl Prioritize {
                         debug_assert!(_res.is_ok());
                     }
 
-                    let (eos, len) = {
+                    {
                         let _span = tracing::trace_span!("updating connection flow");
 
                         // TODO: proper error handling
                         let _res = self.flow.send_data(len);
                         debug_assert!(_res.is_ok());
+                    }
 
-                        // Wrap the frame's data payload to ensure that the
-                        // correct amount of data gets written.
-
-                        let eos = frame.is_end_stream();
-                        let len = len as usize;
-
-                        if frame.payload().remaining() > len {
-                            frame.set_end_stream(false);
-                        }
-                        (eos, len)
-                    };
-
-                    Frame::Data(frame.map(|buf| Prioritized {
-                        inner: buf.take(len),
-                        end_of_stream: eos,
-                        stream: stream.key(),
-                    }))
+                    Frame::Data(frame)
                 }
                 Some(Frame::PushPromise(pp)) => {
                     let mut pushed = stream.store_mut().find_mut(&pp.promised_id()).unwrap();
@@ -1000,28 +1024,194 @@ where
     B: Buf,
 {
     fn remaining(&self) -> usize {
-        self.inner.remaining()
+        self.inner.remaining() + self.rest.iter().map(Buf::remaining).sum::<usize>()
     }
 
     fn chunk(&self) -> &[u8] {
-        self.inner.chunk()
+        let chunk = self.inner.chunk();
+
+        if !chunk.is_empty() || self.rest.is_empty() {
+            return chunk;
+        }
+
+        self.rest
+            .iter()
+            .map(Buf::chunk)
+            .find(|chunk| !chunk.is_empty())
+            .unwrap_or_default()
     }
 
     fn chunks_vectored<'a>(&'a self, dst: &mut [std::io::IoSlice<'a>]) -> usize {
-        self.inner.chunks_vectored(dst)
+        if self.rest.is_empty() {
+            return self.inner.chunks_vectored(dst);
+        }
+
+        let mut n = 0;
+
+        for part in iter::once(&self.inner).chain(&self.rest) {
+            let cnt = part.chunks_vectored(&mut dst[n..]);
+            let len: usize = dst[n..n + cnt].iter().map(|slice| slice.len()).sum();
+            n += cnt;
+
+            // Stop at a part not fully listed, so no bytes are skipped
+            if len < part.remaining() {
+                break;
+            }
+        }
+
+        n
     }
 
-    fn advance(&mut self, cnt: usize) {
-        self.inner.advance(cnt)
+    fn advance(&mut self, mut cnt: usize) {
+        if self.rest.is_empty() {
+            return self.inner.advance(cnt);
+        }
+
+        for part in iter::once(&mut self.inner).chain(&mut self.rest) {
+            if cnt == 0 {
+                break;
+            }
+
+            let n = cmp::min(cnt, part.remaining());
+            part.advance(n);
+            cnt -= n;
+        }
     }
 }
 
 impl<B: Buf> fmt::Debug for Prioritized<B> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("Prioritized")
-            .field("remaining", &self.inner.get_ref().remaining())
+            .field("remaining", &self.last().get_ref().remaining())
+            .field("parts", &(self.rest.len() + 1))
             .field("end_of_stream", &self.end_of_stream)
             .field("stream", &self.stream)
             .finish()
+    }
+}
+
+impl<B: Buf> Prioritized<B> {
+    /// The last part, the only one that can be partly taken.
+    fn last(&self) -> &Take<B> {
+        self.rest.last().unwrap_or(&self.inner)
+    }
+
+    /// Takes the last part.
+    fn into_last(mut self) -> Take<B> {
+        self.rest.pop().unwrap_or(self.inner)
+    }
+
+    /// Appends the stream's queued DATA chunks to `frame`, up to `room` bytes
+    /// and `max_parts` parts, and returns the bytes added.
+    ///
+    /// Stops at a non-DATA frame, the room or part limit, a partly taken chunk
+    /// or END_STREAM, which then ends `frame`.
+    fn coalesce(
+        frame: &mut frame::Data<Self>,
+        mut room: usize,
+        max_parts: usize,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+    ) -> usize {
+        let mut added = 0;
+
+        loop {
+            let queued = match stream.pending_send.pop_front(buffer) {
+                // Empty chunks add no part, so they join even a full frame
+                Some(Frame::Data(queued))
+                    if !queued.payload().has_remaining()
+                        || (room > 0 && frame.payload().rest.len() + 1 < max_parts) =>
+                {
+                    queued
+                }
+                // Trailers and DATA past the room or part limit keep their place
+                Some(queued) => {
+                    stream.pending_send.push_front(buffer, queued);
+                    break;
+                }
+                None => break,
+            };
+
+            let sz = queued.payload().remaining();
+            let len = cmp::min(sz, room);
+            let eos = queued.is_end_stream();
+            let payload = frame.payload_mut();
+            payload.end_of_stream = eos;
+
+            if len > 0 {
+                payload.rest.push(queued.into_payload().take(len));
+                added += len;
+                room -= len;
+            }
+
+            // The rest of a partly taken chunk is pushed back on reclaim
+            if len < sz {
+                break;
+            }
+
+            if eos {
+                frame.set_end_stream(true);
+                break;
+            }
+        }
+
+        added
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::buf::Chain;
+    use std::io::IoSlice;
+
+    /// Two chunks, of which the default `chunks_vectored` lists only the first.
+    struct Split(Chain<&'static [u8], &'static [u8]>);
+
+    impl Buf for Split {
+        fn remaining(&self) -> usize {
+            self.0.remaining()
+        }
+
+        fn chunk(&self) -> &[u8] {
+            self.0.chunk()
+        }
+
+        fn advance(&mut self, cnt: usize) {
+            self.0.advance(cnt)
+        }
+    }
+
+    fn part(a: &'static [u8], b: &'static [u8], len: usize) -> Take<Split> {
+        Split(a.chain(b)).take(len)
+    }
+
+    fn listed<'a>(buf: &'a Prioritized<Split>, slices: &'a mut [IoSlice<'a>]) -> Vec<&'a [u8]> {
+        let n = buf.chunks_vectored(slices);
+        slices[..n].iter().map(|slice| &**slice).collect()
+    }
+
+    #[test]
+    fn prioritized_buf_spans_parts_without_gaps() {
+        let mut store = Store::new();
+        let mut stream = store.insert(StreamId::from(1), Stream::new(StreamId::from(1), 0, 0));
+        let mut buf = Prioritized {
+            inner: part(b"ab", b"", 2),
+            rest: vec![part(b"cd", b"ef", 3), part(b"gh", b"", 2)],
+            end_of_stream: false,
+            stream: stream.key(),
+        };
+
+        // The second part is listed only up to "cd", so "gh" must wait.
+        assert_eq!(listed(&buf, &mut [IoSlice::new(&[]); 64]), [b"ab", b"cd"]);
+
+        buf.advance(4);
+        assert_eq!(
+            listed(&buf, &mut [IoSlice::new(&[]); 64]),
+            [&b"e"[..], b"gh"]
+        );
+
+        stream.unlink();
+        stream.remove();
     }
 }
