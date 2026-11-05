@@ -109,6 +109,21 @@ impl<T, B> Codec<T, B> {
         self.framed_write().set_max_data_frame_size(val)
     }
 
+    /// Caps HEADERS, PUSH_PROMISE and CONTINUATION payloads sent to the peer.
+    pub(crate) fn set_max_send_header_frame_size(&mut self, val: usize) {
+        self.framed_write().set_max_header_frame_size(val)
+    }
+
+    /// Gives each sent frame a write of its own after the initial write.
+    pub(crate) fn set_one_frame_per_write(&mut self) {
+        self.framed_write().set_one_frame_per_write()
+    }
+
+    /// Starts writing each frame alone, if set.
+    pub(crate) fn start_one_frame_per_write(&mut self) {
+        self.framed_write().start_one_frame_per_write()
+    }
+
     /// Returns the max parts of a DATA frame coalesced from queued chunks, or
     /// `None` if queued DATA is not coalesced.
     pub(crate) fn max_send_data_frame_parts(&self) -> Option<usize> {

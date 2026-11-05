@@ -2,7 +2,7 @@ use h2_support::prelude::*;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::ReadBuf;
 
@@ -431,5 +431,159 @@ async fn recv_data(srv: &mut mock::Handle, id: u32, body: &[u8], lens: &[usize])
         srv.recv_frame(frames::data(id, &body[start..start + len]))
             .await;
         start += len;
+    }
+}
+
+#[tokio::test]
+async fn one_frame_per_write() {
+    // After the initial write, each frame takes a write of its own, except
+    // that a header block, split at the cap, shares one with its CONTINUATION
+    // frames and the stream WINDOW_UPDATE after it. Without the option, the
+    // CONTINUATION frames take writes apart from the HEADERS frame.
+    use futures::StreamExt;
+
+    h2_support::trace_init!();
+    const HEADERS: u8 = 0x1;
+    const SETTINGS: u8 = 0x4;
+    const WINDOW_UPDATE: u8 = 0x8;
+    const CONTINUATION: u8 = 0x9;
+
+    for enabled in [false, true] {
+        let (io, mut srv) = mock::new();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let io = WriteLog {
+            inner: io,
+            writes: writes.clone(),
+        };
+
+        let srv = async move {
+            srv.assert_client_handshake().await;
+            while let Some(frame) = srv.next().await {
+                if matches!(frame.unwrap(), frame::Frame::Data(data) if data.is_end_stream()) {
+                    break;
+                }
+            }
+            srv.send_frame(frames::headers(1).response(204).eos()).await;
+        };
+
+        let client = async move {
+            let mut builder = client::Builder::new();
+            builder
+                .initial_connection_window_size(1 << 21)
+                .initial_stream_window_size(1 << 20)
+                .max_send_header_frame_size(16_374)
+                .max_send_data_frame_size(16_375)
+                .one_frame_per_write(enabled);
+            let (mut client, mut conn) = builder.handshake::<_, Bytes>(io).await.unwrap();
+
+            let request = build_large_headers()
+                .iter()
+                .fold(
+                    Request::post("https://example.com/"),
+                    |request, (name, value)| request.header(*name, &value[..]),
+                )
+                .body(())
+                .unwrap();
+            let (response, mut stream) = client.send_request(request, false).unwrap();
+            stream.send_data(vec![0; 40_000].into(), true).unwrap();
+
+            let response = conn.drive(response).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        };
+
+        join(srv, client).await;
+
+        // Each write ends on a frame boundary
+        let writes = writes.lock().unwrap();
+        let mut frames = writes.iter().enumerate().map(|(i, write)| {
+            let mut types = Vec::new();
+            let mut buf = &write[..];
+            if i == 0 {
+                buf = &buf[24..];
+            }
+            while !buf.is_empty() {
+                let len = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as usize;
+                if buf[3] == HEADERS || buf[3] == CONTINUATION {
+                    assert!(len <= 16_374, "header frame of {} bytes", len);
+                }
+                types.push(buf[3]);
+                buf = &buf[frame::HEADER_LEN + len..];
+            }
+            types
+        });
+
+        // The preface, SETTINGS and WINDOW_UPDATE share the first write
+        // either way
+        assert_eq!(frames.next().unwrap(), [SETTINGS, WINDOW_UPDATE]);
+        let rest: Vec<_> = frames.collect();
+        let block = rest
+            .iter()
+            .find(|types| types.contains(&HEADERS))
+            .expect("HEADERS write");
+        if enabled {
+            let (last, middle) = block[1..].split_last().unwrap();
+            assert_eq!(block[0], HEADERS);
+            assert!(!middle.is_empty() && middle.iter().all(|&t| t == CONTINUATION));
+            assert_eq!(*last, WINDOW_UPDATE);
+            assert!(rest
+                .iter()
+                .filter(|types| *types != block)
+                .all(|types| types.len() == 1));
+        } else {
+            assert!(!block.contains(&CONTINUATION), "{:?}", rest);
+        }
+    }
+}
+
+/// An IO wrapper that keeps the bytes of each write. It takes vectored
+/// writes as one plain write of the joined slices, so the mock takes each
+/// write whole.
+struct WriteLog<T> {
+    inner: T,
+    writes: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for WriteLog<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for WriteLog<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let res = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = res {
+            self.writes.lock().unwrap().push(buf[..n].to_vec());
+        }
+        res
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let buf: Vec<u8> = bufs.iter().flat_map(|buf| buf.iter().copied()).collect();
+        self.poll_write(cx, &buf)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }

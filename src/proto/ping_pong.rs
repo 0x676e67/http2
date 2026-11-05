@@ -27,8 +27,8 @@ pub(crate) struct PingPong {
 ///
 /// Payloads carry a big-endian counter starting at 1. At most one of this and
 /// a user PING awaits an ACK, since a peer may stop reading while it cannot
-/// write one. Any ACK answers this PING, as in Chrome, and a missing ACK is
-/// acted on only once `timeout` passes.
+/// write one. Any ACK answers this PING, and a missing ACK is acted on only
+/// once `timeout` passes.
 #[derive(Debug)]
 pub(crate) struct PrefacePing {
     threshold: Duration,
@@ -369,7 +369,7 @@ impl PrefacePing {
     }
 
     /// Returns `timeout` after the PING is armed or the last read, whichever
-    /// is later, as Chrome times a PING from when it is queued.
+    /// is later, so a PING is timed from when it is queued.
     fn deadline(&self) -> Option<Instant> {
         match self.state {
             PrefacePingState::Pending(_, armed) | PrefacePingState::InFlight(armed) => self

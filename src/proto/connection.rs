@@ -462,6 +462,7 @@ where
                     "client initial connection write complete; entering normal polling"
                 );
                 self.inner.state = State::Open;
+                self.codec.start_one_frame_per_write();
                 self.maybe_close_connection_if_no_streams();
                 Poll::Ready(Ok(()))
             }
@@ -509,10 +510,10 @@ where
                         // The connection is not ready to make progress
                         Poll::Pending => {
                             // A preface PING left unanswered with no reads for
-                            // its timeout fails the connection, as in Chrome. A
-                            // GOAWAY still waiting for room when it expires,
-                            // this one included, moves to closing without being
-                            // written and keeps its reason.
+                            // its timeout fails the connection. A GOAWAY still
+                            // waiting for room when it expires, this one
+                            // included, moves to closing without being written
+                            // and keeps its reason.
                             if self.preface_ping_expired() {
                                 let reason = self
                                     .inner

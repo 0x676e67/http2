@@ -14,7 +14,7 @@ use std::io::{self, Cursor};
 // A macro to get around a method needing to borrow &mut self
 macro_rules! limited_write_buf {
     ($self:expr) => {{
-        let limit = $self.max_frame_size() + frame::HEADER_LEN;
+        let limit = $self.max_header_frame_size() + frame::HEADER_LEN;
         $self.buf.get_mut().limit(limit)
     }};
 }
@@ -58,6 +58,12 @@ struct Encoder<B> {
     /// Whether the upstream writer takes vectored writes
     vectored: bool,
 
+    /// Local cap on HEADERS, PUSH_PROMISE and CONTINUATION payloads
+    max_header_frame_size: Option<FrameSize>,
+
+    /// Whether each frame takes a write of its own
+    one_frame_per_write: OneFramePerWrite,
+
     /// Chain payloads bigger than this.
     chain_threshold: usize,
 
@@ -65,10 +71,18 @@ struct Encoder<B> {
     min_buffer_capacity: usize,
 }
 
+/// When each frame takes a write of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneFramePerWrite {
+    Off,
+    On,
+    WaitingForInitialWrite,
+}
+
 #[derive(Debug)]
 enum Next<B> {
-    /// A chained DATA frame, and the offset of its head in `buf` when it is
-    /// capped; see `split_before_data`
+    /// A chained DATA frame, and the offset of its head in `buf` when it goes
+    /// alone; see `split_before_data`
     Data(frame::Data<B>, Option<usize>),
     Continuation(frame::Continuation),
 }
@@ -120,6 +134,8 @@ where
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
                 max_data_frame_size: None,
                 vectored,
+                max_header_frame_size: None,
+                one_frame_per_write: OneFramePerWrite::Off,
                 chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
             },
@@ -181,9 +197,9 @@ where
         loop {
             while !self.encoder.is_empty() {
                 let n = match (self.encoder.split_before_data(), &mut self.encoder.next) {
-                    // The bytes before a capped DATA frame go alone
+                    // The bytes before a DATA frame going alone are written first
                     (Some(before), _) => {
-                        tracing::trace!(frames_before_capped_data = true);
+                        tracing::trace!(frames_before_data = true);
                         let mut buf = (&mut self.encoder.buf).take(before);
                         ready!(poll_write_buf(Pin::new(&mut self.inner), cx, &mut buf))?
                     }
@@ -299,7 +315,9 @@ where
 
     fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
         // Ensure that we have enough capacity to accept the write.
-        assert!(self.has_capacity());
+        // A frame may follow another before the write, as a preface PING
+        // precedes DATA
+        assert!(self.has_room_after(0));
         let _span = tracing::trace_span!("FramedWrite::buffer", frame = ?item);
 
         tracing::debug!(frame = ?item, "send");
@@ -313,11 +331,12 @@ where
                     return Err(PayloadTooBig);
                 }
 
-                // A capped frame is always chained, so it shares no write with
-                // other frames
+                // A capped frame, and any frame with one frame per write, is
+                // always chained, so it shares no write with other frames
                 let capped = self.max_data_frame_size.is_some();
+                let alone = capped || self.one_frame_per_write == OneFramePerWrite::On;
 
-                if len >= self.chain_threshold || capped {
+                if len >= self.chain_threshold || alone {
                     let head = v.head();
                     let at = self.buf.get_ref().len();
 
@@ -335,8 +354,8 @@ where
                         self.buf.get_mut().put(v.payload_mut().take(extra_bytes));
                     }
 
-                    // Save the data frame, with where a capped one starts
-                    self.next = Some(Next::Data(v, capped.then_some(at)));
+                    // Save the data frame, with where one going alone starts
+                    self.next = Some(Next::Data(v, alone.then_some(at)));
                 } else {
                     v.encode_chunk(self.buf.get_mut());
 
@@ -350,7 +369,17 @@ where
             }
             Frame::Headers(v) => {
                 let mut buf = limited_write_buf!(self);
-                if let Some(continuation) = v.encode(&mut self.hpack, &mut buf) {
+                let mut continuation = v.encode(&mut self.hpack, &mut buf);
+
+                // A header block goes out in one write
+                if self.one_frame_per_write == OneFramePerWrite::On {
+                    while let Some(frame) = continuation {
+                        let mut buf = limited_write_buf!(self);
+                        continuation = frame.encode(&mut buf);
+                    }
+                }
+
+                if let Some(continuation) = continuation {
                     self.next = Some(Next::Continuation(continuation));
                 }
             }
@@ -409,8 +438,8 @@ where
         }
     }
 
-    /// Returns how many bytes are still buffered before the chained capped
-    /// DATA frame, so they are written first and the frame starts a write.
+    /// Returns how many bytes are still buffered before a chained DATA frame
+    /// that goes alone, so they are written first and the frame starts a write.
     fn split_before_data(&self) -> Option<usize> {
         let Some(Next::Data(_, Some(at))) = self.next else {
             return None;
@@ -434,7 +463,14 @@ where
         }
     }
 
+    /// With one frame per write, a frame also waits for the bytes before it to be
+    /// written.
     fn has_capacity_after(&self, len: usize) -> bool {
+        !(self.one_frame_per_write == OneFramePerWrite::On && self.buf.has_remaining())
+            && self.has_room_after(len)
+    }
+
+    fn has_room_after(&self, len: usize) -> bool {
         self.next.is_none()
             && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
                 >= self.min_buffer_capacity.saturating_add(len))
@@ -444,6 +480,11 @@ where
 impl<B> Encoder<B> {
     fn max_frame_size(&self) -> usize {
         self.max_frame_size as usize
+    }
+
+    fn max_header_frame_size(&self) -> usize {
+        self.max_header_frame_size
+            .map_or(self.max_frame_size, |max| max.min(self.max_frame_size)) as usize
     }
 }
 
@@ -478,6 +519,26 @@ impl<T, B> FramedWrite<T, B> {
     pub(crate) fn max_data_frame_parts(&self) -> Option<usize> {
         (self.encoder.max_data_frame_size.is_some() && self.encoder.vectored)
             .then_some(DATA_WRITE_SLICES)
+    }
+
+    /// Caps header block frame payloads; the peer's max frame size still
+    /// applies.
+    pub(crate) fn set_max_header_frame_size(&mut self, val: usize) {
+        self.encoder.max_header_frame_size =
+            Some(val.clamp(1, frame::MAX_MAX_FRAME_SIZE as usize) as FrameSize);
+    }
+
+    /// Gives each frame a write of its own once the client's initial
+    /// connection write is out; see `start_one_frame_per_write`.
+    pub(crate) fn set_one_frame_per_write(&mut self) {
+        self.encoder.one_frame_per_write = OneFramePerWrite::WaitingForInitialWrite;
+    }
+
+    /// Starts writing each frame alone, if set.
+    pub(crate) fn start_one_frame_per_write(&mut self) {
+        if self.encoder.one_frame_per_write == OneFramePerWrite::WaitingForInitialWrite {
+            self.encoder.one_frame_per_write = OneFramePerWrite::On;
+        }
     }
 
     /// Set the peer's header table size.
@@ -630,6 +691,19 @@ mod tests {
         frame::Ping::new([0; 8]).into()
     }
 
+    /// A HEADERS frame with a field value of `len` bytes that HPACK barely
+    /// compresses.
+    fn headers(len: usize) -> Frame<Rope> {
+        let value = (0..len)
+            .map(|i| (b'!' + (i % 90) as u8) as char)
+            .collect::<String>();
+        let mut fields = http::HeaderMap::new();
+        fields.insert("x-big", value.parse().unwrap());
+        let uri = "https://example.com/".parse().unwrap();
+        let pseudo = frame::Pseudo::request(http::Method::GET, uri, None);
+        frame::Headers::new(StreamId::from(1), pseudo, fields).into()
+    }
+
     /// Buffers the frames, then writes everything out.
     fn send<const N: usize>(codec: &mut FramedWrite<Writes, Rope>, frames: [Frame<Rope>; N]) {
         for frame in frames {
@@ -709,5 +783,54 @@ mod tests {
             frame::GoAway::with_debug_data(StreamId::zero(), Reason::NO_ERROR, debug_data);
         send(&mut codec, [go_away.into(), data(&[1_000, 1_000])]);
         assert_eq!(codec.get_mut().lens, [15_351, 1_009, 1_000]);
+    }
+
+    #[test]
+    fn one_frame_per_write_gives_each_frame_a_write() {
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // Frames share a write until one frame per write starts, as the
+        // client's initial write does
+        let mut codec = FramedWrite::new(Writes::default());
+        codec.set_one_frame_per_write();
+        codec.buffer(ping()).unwrap();
+        assert!(codec.has_capacity());
+        send(&mut codec, [ping()]);
+
+        // Then each frame goes alone, and a header block in one write with
+        // its CONTINUATION frames, which the cap splits
+        codec.start_one_frame_per_write();
+        codec.set_max_header_frame_size(16_374);
+        for frame in [ping(), headers(20_000), ping()] {
+            assert!(codec.poll_ready(&mut cx).is_ready());
+            codec.buffer(frame).unwrap();
+            assert!(!codec.has_capacity());
+        }
+        send(&mut codec, []);
+
+        // A frame can still follow another before the write, as a preface
+        // PING precedes DATA; the DATA frame then starts its own write, also
+        // a small one without a cap
+        send(&mut codec, [ping(), data(&[100])]);
+        codec.set_max_data_frame_size(16_375);
+        send(&mut codec, [ping(), data(&[16_375])]);
+
+        let lens = &codec.get_mut().lens;
+        assert_eq!(lens[..2], [34, 17]);
+        assert!(lens[2] > 16_383 + frame::HEADER_LEN);
+        assert_eq!(lens[3..], [17, 17, 109, 17, 16_384]);
+    }
+
+    #[test]
+    fn max_header_frame_size_bounds_header_frames() {
+        // Each header frame takes a write here, so the first write is the
+        // HEADERS frame: the cap applies within the peer's max frame size,
+        // and a zero cap acts as one
+        for (cap, len) in [(16_374, 16_374), (20_000, 16_384), (0, 1)] {
+            let mut codec = FramedWrite::new(Writes::default());
+            codec.set_max_header_frame_size(cap);
+            send(&mut codec, [headers(20_000)]);
+            assert_eq!(codec.get_mut().lens[0], frame::HEADER_LEN + len);
+        }
     }
 }
