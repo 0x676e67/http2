@@ -863,9 +863,10 @@ impl Builder {
     /// Sets the max payload size of sent HEADERS and CONTINUATION frames.
     ///
     /// A header block is split into frames of at most `max` bytes even when
-    /// the peer allows larger frames ([RFC 9113 §4.2]). A zero `max` is
-    /// treated as one. By default only the peer's `SETTINGS_MAX_FRAME_SIZE`
-    /// applies.
+    /// the peer allows larger frames ([RFC 9113 §4.2]). A `max` under 5 is
+    /// treated as 5, which fits the HEADERS priority fields. Small values split
+    /// a block into many CONTINUATION frames, which peers may limit or treat
+    /// as abuse. By default only the peer's `SETTINGS_MAX_FRAME_SIZE` applies.
     ///
     /// [RFC 9113 §4.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2
     pub fn max_send_header_frame_size(&mut self, max: u32) -> &mut Self {
@@ -880,6 +881,8 @@ impl Builder {
     /// written alone, except that a header block goes out in one write with
     /// its CONTINUATION frames and the stream WINDOW_UPDATE that follows it.
     /// Over TLS, a write is sealed into its own records ([RFC 8446 §5.1]).
+    /// Without vectored writes, a DATA frame over about 1 KiB can still take
+    /// more than one write.
     ///
     /// Each frame costs a write, so this lowers throughput when many small
     /// frames are queued at once. Disabled by default.

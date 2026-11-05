@@ -93,6 +93,16 @@ enum Next<B> {
 /// frame that big.
 const DEFAULT_BUFFER_CAPACITY: usize = 16 * 1_024;
 
+/// A write buffer grown past this, as a header block buffered whole can grow
+/// it, is replaced by a default one once written.
+const MAX_IDLE_BUFFER_CAPACITY: usize = 4 * DEFAULT_BUFFER_CAPACITY;
+
+/// Smallest cap on header frame payloads: a HEADERS frame's priority fields
+/// take 5 bytes ([RFC 9113 §6.2]).
+///
+/// [RFC 9113 §6.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.2
+const MIN_HEADER_FRAME_SIZE: usize = 5;
+
 /// Chain payloads bigger than this when vectored I/O is enabled. The remote
 /// will never advertise a max frame size less than this (well, the spec says
 /// the max frame size can't be less than 16kb, so not even close).
@@ -293,6 +303,9 @@ where
         // Clear internal buffer
         self.buf.set_position(0);
         self.buf.get_mut().clear();
+        if self.buf.get_ref().capacity() > MAX_IDLE_BUFFER_CAPACITY {
+            *self.buf.get_mut() = BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY);
+        }
 
         // The data frame has been written, so unset it
         match self.next.take() {
@@ -314,10 +327,16 @@ where
     }
 
     fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
-        // Ensure that we have enough capacity to accept the write.
-        // A frame may follow another before the write, as a preface PING
-        // precedes DATA
+        // Ensure that we have enough capacity to accept the write. A frame
+        // may follow another before the write, as a preface PING precedes
+        // DATA; with one frame per write only DATA may, and it goes alone
         assert!(self.has_room_after(0));
+        debug_assert!(
+            self.one_frame_per_write != OneFramePerWrite::On
+                || !self.buf.has_remaining()
+                || matches!(item, Frame::Data(_)),
+            "only DATA may follow unwritten frames with one frame per write"
+        );
         let _span = tracing::trace_span!("FramedWrite::buffer", frame = ?item);
 
         tracing::debug!(frame = ?item, "send");
@@ -454,8 +473,8 @@ where
 
     fn is_empty(&self) -> bool {
         match self.next {
-            // A chained payload is written after `buf`, which may hold a
-            // capped frame whole
+            // A chained payload is written after `buf`, which may hold the
+            // whole of a frame that goes alone
             Some(Next::Data(ref frame, _)) => {
                 !frame.payload().has_remaining() && !self.buf.has_remaining()
             }
@@ -525,7 +544,7 @@ impl<T, B> FramedWrite<T, B> {
     /// applies.
     pub(crate) fn set_max_header_frame_size(&mut self, val: usize) {
         self.encoder.max_header_frame_size =
-            Some(val.clamp(1, frame::MAX_MAX_FRAME_SIZE as usize) as FrameSize);
+            Some(val.clamp(MIN_HEADER_FRAME_SIZE, frame::MAX_MAX_FRAME_SIZE as usize) as FrameSize);
     }
 
     /// Gives each frame a write of its own once the client's initial
@@ -594,7 +613,7 @@ mod unstable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{Reason, StreamId};
+    use crate::frame::{Reason, StreamDependency, StreamId};
     use bytes::Bytes;
     use std::collections::VecDeque;
     use std::io::IoSlice;
@@ -693,7 +712,7 @@ mod tests {
 
     /// A HEADERS frame with a field value of `len` bytes that HPACK barely
     /// compresses.
-    fn headers(len: usize) -> Frame<Rope> {
+    fn headers(len: usize) -> frame::Headers {
         let value = (0..len)
             .map(|i| (b'!' + (i % 90) as u8) as char)
             .collect::<String>();
@@ -701,7 +720,7 @@ mod tests {
         fields.insert("x-big", value.parse().unwrap());
         let uri = "https://example.com/".parse().unwrap();
         let pseudo = frame::Pseudo::request(http::Method::GET, uri, None);
-        frame::Headers::new(StreamId::from(1), pseudo, fields).into()
+        frame::Headers::new(StreamId::from(1), pseudo, fields)
     }
 
     /// Buffers the frames, then writes everything out.
@@ -798,15 +817,17 @@ mod tests {
         send(&mut codec, [ping()]);
 
         // Then each frame goes alone, and a header block in one write with
-        // its CONTINUATION frames, which the cap splits
+        // its CONTINUATION frames, which the cap splits. The buffer the block
+        // grew is released once written
         codec.start_one_frame_per_write();
         codec.set_max_header_frame_size(16_374);
-        for frame in [ping(), headers(20_000), ping()] {
+        for frame in [ping(), headers(200_000).into(), ping()] {
             assert!(codec.poll_ready(&mut cx).is_ready());
             codec.buffer(frame).unwrap();
             assert!(!codec.has_capacity());
         }
         send(&mut codec, []);
+        assert!(codec.encoder.buf.get_ref().capacity() <= MAX_IDLE_BUFFER_CAPACITY);
 
         // A frame can still follow another before the write, as a preface
         // PING precedes DATA; the DATA frame then starts its own write, also
@@ -825,11 +846,20 @@ mod tests {
     fn max_header_frame_size_bounds_header_frames() {
         // Each header frame takes a write here, so the first write is the
         // HEADERS frame: the cap applies within the peer's max frame size,
-        // and a zero cap acts as one
-        for (cap, len) in [(16_374, 16_374), (20_000, 16_384), (0, 1)] {
+        // and one under 5 still fits the priority fields
+        for (cap, len, priority) in [
+            (16_374, 16_374, true),
+            (20_000, 16_384, false),
+            (0, 5, false),
+            (4, 5, true),
+        ] {
+            let mut block = headers(20_000);
+            if priority {
+                block.set_stream_dependency(StreamDependency::new(StreamId::zero(), 255, true));
+            }
             let mut codec = FramedWrite::new(Writes::default());
             codec.set_max_header_frame_size(cap);
-            send(&mut codec, [headers(20_000)]);
+            send(&mut codec, [block.into()]);
             assert_eq!(codec.get_mut().lens[0], frame::HEADER_LEN + len);
         }
     }

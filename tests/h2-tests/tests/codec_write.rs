@@ -438,17 +438,21 @@ async fn recv_data(srv: &mut mock::Handle, id: u32, body: &[u8], lens: &[usize])
 async fn one_frame_per_write() {
     // After the initial write, each frame takes a write of its own, except
     // that a header block, split at the cap, shares one with its CONTINUATION
-    // frames and the stream WINDOW_UPDATE after it. Without the option, the
-    // CONTINUATION frames take writes apart from the HEADERS frame.
+    // frames and the stream WINDOW_UPDATE after it. A preface PING, due once
+    // the connection is read-idle past its threshold, goes alone ahead of the
+    // DATA frame that arms it, with or without a DATA cap. Without the option,
+    // the CONTINUATION frames take writes apart from the HEADERS frame.
     use futures::StreamExt;
 
     h2_support::trace_init!();
+    const DATA: u8 = 0x0;
     const HEADERS: u8 = 0x1;
     const SETTINGS: u8 = 0x4;
+    const PING: u8 = 0x6;
     const WINDOW_UPDATE: u8 = 0x8;
     const CONTINUATION: u8 = 0x9;
 
-    for enabled in [false, true] {
+    for (enabled, data_cap) in [(false, true), (true, true), (true, false)] {
         let (io, mut srv) = mock::new();
         let writes = Arc::new(Mutex::new(Vec::new()));
         let io = WriteLog {
@@ -472,8 +476,11 @@ async fn one_frame_per_write() {
                 .initial_connection_window_size(1 << 21)
                 .initial_stream_window_size(1 << 20)
                 .max_send_header_frame_size(16_374)
-                .max_send_data_frame_size(16_375)
+                .preface_ping(Duration::from_millis(100))
                 .one_frame_per_write(enabled);
+            if data_cap {
+                builder.max_send_data_frame_size(16_375);
+            }
             let (mut client, mut conn) = builder.handshake::<_, Bytes>(io).await.unwrap();
 
             let request = build_large_headers()
@@ -485,6 +492,10 @@ async fn one_frame_per_write() {
                 .body(())
                 .unwrap();
             let (response, mut stream) = client.send_request(request, false).unwrap();
+
+            // Idle past the threshold once the block is out, so the DATA arms
+            // the preface PING
+            conn.drive(idle_ms(200)).await;
             stream.send_data(vec![0; 40_000].into(), true).unwrap();
 
             let response = conn.drive(response).await.unwrap();
@@ -529,6 +540,9 @@ async fn one_frame_per_write() {
                 .iter()
                 .filter(|types| *types != block)
                 .all(|types| types.len() == 1));
+
+            let at = |kind| rest.iter().position(|types| types[0] == kind).unwrap();
+            assert!(at(HEADERS) < at(PING) && at(PING) < at(DATA), "{:?}", rest);
         } else {
             assert!(!block.contains(&CONTINUATION), "{:?}", rest);
         }
