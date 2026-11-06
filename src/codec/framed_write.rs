@@ -98,6 +98,12 @@ const DEFAULT_BUFFER_CAPACITY: usize = 16 * 1_024;
 /// it, is replaced by a default one once written.
 const MAX_IDLE_BUFFER_CAPACITY: usize = 4 * DEFAULT_BUFFER_CAPACITY;
 
+/// Returns the bytes the write buffer still takes, counted within its default
+/// capacity, so a grown buffer takes no more than a default one.
+fn buffer_room(buf: &BytesMut) -> usize {
+    DEFAULT_BUFFER_CAPACITY.saturating_sub(buf.len())
+}
+
 /// Smallest cap on header frame payloads, so a HEADERS frame's priority
 /// fields fit ([RFC 9113 §6.2]).
 ///
@@ -451,8 +457,8 @@ where
     }
 
     /// Copies the payload's leading chunks under the chain threshold while
-    /// they fit the buffer, so they go with the frame head instead of taking
-    /// slices or writes of their own.
+    /// they fit the buffer's room, so they go with the frame head instead of
+    /// taking slices or writes of their own.
     fn copy_small_chunks(&mut self, frame: &mut frame::Data<B>) {
         let buf = self.buf.get_mut();
 
@@ -460,7 +466,7 @@ where
             let chunk = frame.payload().chunk();
             let n = chunk.len();
 
-            if n == 0 || n >= self.chain_threshold || n > buf.capacity() - buf.len() {
+            if n == 0 || n >= self.chain_threshold || n > buffer_room(buf) {
                 return;
             }
 
@@ -501,13 +507,11 @@ where
             && self.has_room_after(len)
     }
 
-    /// Room is counted within the default capacity, so a grown buffer takes
-    /// no more bytes ahead of a frame, and a frame copied whole after them
-    /// grows it at most once.
+    /// A grown buffer takes no more bytes ahead of a frame than a default
+    /// one, so a frame copied whole after them grows it at most once.
     fn has_room_after(&self, len: usize) -> bool {
         self.next.is_none()
-            && (DEFAULT_BUFFER_CAPACITY.saturating_sub(self.buf.get_ref().len())
-                >= self.min_buffer_capacity.saturating_add(len))
+            && buffer_room(self.buf.get_ref()) >= self.min_buffer_capacity.saturating_add(len)
     }
 }
 
@@ -833,12 +837,19 @@ mod tests {
             frame::GoAway::with_debug_data(StreamId::zero(), Reason::NO_ERROR, debug_data);
         send(&mut codec, [go_away.into(), data(&[1_000, 1_000, 16_000])]);
 
-        // A frame of up to 16,384 bytes is copied whole
+        // A frame of up to 16,384 bytes is copied whole. The buffer it grew
+        // then copies no more chunks than a default one
         send(&mut codec, [data(&[1_023, 15_361])]);
+        assert!(codec.encoder.buf.get_ref().capacity() > DEFAULT_BUFFER_CAPACITY);
+        let debug_data = Bytes::from(vec![0; 15_334]);
+        let go_away =
+            frame::GoAway::with_debug_data(StreamId::zero(), Reason::NO_ERROR, debug_data);
+        send(&mut codec, [go_away.into(), data(&[1_000, 1_000, 16_000])]);
         assert_eq!(
             codec.get_mut().lens,
             [
-                1_032, 15_362, 1_024, 9, 15_361, 15_351, 1_009, 1_000, 16_000, 16_393
+                1_032, 15_362, 1_024, 9, 15_361, 15_351, 1_009, 1_000, 16_000, 16_393, 15_351,
+                1_009, 1_000, 16_000
             ]
         );
     }
