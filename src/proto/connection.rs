@@ -703,7 +703,17 @@ where
         self.go_away.go_away(frame);
     }
 
+    /// Closes the connection with a GOAWAY of `e`, unless an error GOAWAY
+    /// already closes it: that one keeps its reason, even while it waits for
+    /// room.
     fn go_away_now(&mut self, e: Reason) {
+        if self
+            .go_away
+            .going_away()
+            .is_some_and(|going_away| going_away.reason() != Reason::NO_ERROR)
+        {
+            return;
+        }
         let last_processed_id = self.streams.last_processed_id();
         let frame = frame::GoAway::new(last_processed_id, e);
         self.go_away.go_away_now(frame);
