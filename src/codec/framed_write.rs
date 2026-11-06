@@ -94,8 +94,8 @@ enum Next<B> {
 /// frame that big.
 const DEFAULT_BUFFER_CAPACITY: usize = 16 * 1_024;
 
-/// A write buffer grown past this, as a header block buffered whole or a DATA
-/// frame copied whole can grow it, is replaced by a default one once written.
+/// A write buffer grown past this, as a header block buffered whole can grow
+/// it, is replaced by a default one once written.
 const MAX_IDLE_BUFFER_CAPACITY: usize = 4 * DEFAULT_BUFFER_CAPACITY;
 
 /// Smallest cap on header frame payloads, so a HEADERS frame's priority
