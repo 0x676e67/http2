@@ -310,10 +310,10 @@ impl Headers {
 
         // Read the stream dependency
         let stream_dep = if flags.is_priority() {
-            if src.len() < 5 {
+            if src.len() < StreamDependency::LEN {
                 return Err(Error::MalformedMessage);
             }
-            let stream_dep = StreamDependency::load(&src[..5])?;
+            let stream_dep = StreamDependency::load(&src[..StreamDependency::LEN])?;
 
             if stream_dep.dependency_id == head.stream_id() {
                 // RFC 9113 section 4.3 requires decoding the complete field
@@ -323,8 +323,8 @@ impl Headers {
                 is_malformed = true;
             }
 
-            // Drop the next 5 bytes
-            src.advance(5);
+            // Drop the stream dependency
+            src.advance(StreamDependency::LEN);
 
             Some(stream_dep)
         } else {

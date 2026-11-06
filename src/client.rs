@@ -339,6 +339,12 @@ pub struct Builder {
     /// Cap on sent DATA payloads; the peer's max frame size still applies.
     max_send_data_frame_size: Option<u32>,
 
+    /// Cap on sent header block frame payloads.
+    max_send_header_frame_size: Option<u32>,
+
+    /// Whether each frame after the initial write takes a write of its own.
+    one_frame_per_write: bool,
+
     /// Maximum number of locally reset streams to keep at a time.
     reset_stream_max: usize,
 
@@ -693,6 +699,8 @@ impl Builder {
         Builder {
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             max_send_data_frame_size: None,
+            max_send_header_frame_size: None,
+            one_frame_per_write: false,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
             pending_accept_reset_stream_max: proto::DEFAULT_REMOTE_RESET_STREAM_MAX,
@@ -849,6 +857,39 @@ impl Builder {
     /// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
     pub fn max_send_data_frame_size(&mut self, max: u32) -> &mut Self {
         self.max_send_data_frame_size = Some(max);
+        self
+    }
+
+    /// Sets the max payload size of sent HEADERS and CONTINUATION frames.
+    ///
+    /// A header block is split into frames of at most `max` bytes even when
+    /// the peer allows larger frames ([RFC 9113 §4.2]). A `max` under 5 is
+    /// treated as 5, which fits the HEADERS priority fields. Small values split
+    /// a block into many CONTINUATION frames, which peers may limit or treat
+    /// as abuse. By default only the peer's `SETTINGS_MAX_FRAME_SIZE` applies.
+    ///
+    /// [RFC 9113 §4.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2
+    pub fn max_send_header_frame_size(&mut self, max: u32) -> &mut Self {
+        self.max_send_header_frame_size = Some(max);
+        self
+    }
+
+    /// Sets whether each frame takes a write of its own.
+    ///
+    /// The connection preface, SETTINGS and the initial WINDOW_UPDATE and
+    /// PRIORITY frames still share the first write. After it, each frame is
+    /// written alone, except that a header block goes out in one write with
+    /// its CONTINUATION frames and the stream WINDOW_UPDATE that follows it.
+    /// Over TLS, a write is sealed into its own records ([RFC 8446 §5.1]).
+    /// Without vectored writes, a DATA frame over about 1 KiB can still take
+    /// more than one write.
+    ///
+    /// Each frame costs a write, so this lowers throughput when many small
+    /// frames are queued at once. Disabled by default.
+    ///
+    /// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
+    pub fn one_frame_per_write(&mut self, enabled: bool) -> &mut Self {
+        self.one_frame_per_write = enabled;
         self
     }
 
@@ -1487,8 +1528,8 @@ impl Builder {
     /// The PING follows HEADERS but precedes DATA, and its payload is a
     /// big-endian counter starting at 1. It is skipped while the previous one
     /// or a user PING awaits an ACK, and user PINGs are held back until it is
-    /// acknowledged. An ACK with any payload acknowledges it, as in Chrome,
-    /// and a missing ACK closes the connection only with
+    /// acknowledged. An ACK with any payload acknowledges it, and a missing
+    /// ACK closes the connection only with
     /// [`preface_ping_timeout`](Self::preface_ping_timeout).
     ///
     /// See [RFC 9113 section 6.7](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.7).
@@ -1499,7 +1540,7 @@ impl Builder {
 
     /// Closes the connection once a preface PING is unanswered and nothing has
     /// been read for `timeout`, counted from when the PING is queued or the
-    /// last read, whichever is later; Chrome uses 10 seconds.
+    /// last read, whichever is later.
     ///
     /// The connection then sends GOAWAY with `PROTOCOL_ERROR` and the debug
     /// data `Failed ping.` and fails its streams. If a GOAWAY, this one
@@ -1618,6 +1659,14 @@ where
 
         if let Some(max) = builder.max_send_data_frame_size {
             codec.set_max_send_data_frame_size(max as usize);
+        }
+
+        if let Some(max) = builder.max_send_header_frame_size {
+            codec.set_max_send_header_frame_size(max as usize);
+        }
+
+        if builder.one_frame_per_write {
+            codec.set_one_frame_per_write();
         }
 
         if let Some(max) = builder.settings.max_header_list_size() {

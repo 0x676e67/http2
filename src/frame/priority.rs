@@ -82,9 +82,9 @@ impl Priority {
 
     pub(crate) fn encode<B: BufMut>(&self, dst: &mut B) {
         let head = Head::new(Kind::Priority, 0, self.stream_id);
-        head.encode(5, dst);
+        head.encode(StreamDependency::LEN, dst);
 
-        // Priority frame payload is exactly 5 bytes
+        // Priority frame payload is exactly the stream dependency
         // Format:
         // +---------------+
         // |E|  Dep ID (31)|
@@ -104,6 +104,12 @@ impl<B> From<Priority> for Frame<B> {
 // ===== impl StreamDependency =====
 
 impl StreamDependency {
+    /// Encoded size: the exclusive flag and a 31-bit stream dependency, then
+    /// an 8-bit weight ([RFC 9113 §6.3]).
+    ///
+    /// [RFC 9113 §6.3]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.3
+    pub(crate) const LEN: usize = 5;
+
     /// Create a new [`StreamDependency`]
     ///
     /// # Panics
@@ -124,7 +130,7 @@ impl StreamDependency {
     pub(crate) fn load(src: &[u8]) -> Result<Self, Error> {
         tracing::trace!("loading priority stream dependency; src={:?}", src);
 
-        if src.len() != 5 {
+        if src.len() != Self::LEN {
             return Err(Error::InvalidPayloadLength);
         }
 
