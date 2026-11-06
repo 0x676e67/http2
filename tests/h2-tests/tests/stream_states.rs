@@ -352,6 +352,84 @@ async fn many_small_final_data_frames_do_not_exhaust_budget() {
 }
 
 #[tokio::test]
+async fn data_payload_resets_empty_data_frame_limit() {
+    h2_support::trace_init!();
+
+    const ROUNDS: usize = 150;
+    const CHUNK_LEN: usize = 256;
+
+    let (io, mut srv) = mock::new();
+
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        for id in [1, 3, 5] {
+            srv.recv_frame(
+                frames::headers(id)
+                    .request("GET", "https://http2.akamai.com/")
+                    .eos(),
+            )
+            .await;
+        }
+        for id in [1, 3, 5] {
+            srv.send_frame(frames::headers(id).response(200)).await;
+        }
+
+        // Payload still in flight after the client cancels a stream is
+        // discarded, but it ends each run all the same.
+        srv.recv_frame(frames::reset(5).cancel()).await;
+        for _ in 0..ROUNDS {
+            srv.send_frame(frames::data(5, vec![0; 64])).await;
+            srv.send_frame(frames::data(5, [1, 0]).padded()).await;
+        }
+
+        // Payloads too small to replenish the DATA frame budget still end each
+        // run of empty and padding-only frames.
+        for _ in 0..ROUNDS {
+            srv.send_frame(frames::data(1, "")).await;
+            srv.send_frame(frames::data(1, [1, 0]).padded()).await;
+            srv.send_frame(frames::data(1, vec![0; CHUNK_LEN])).await;
+        }
+
+        // So does a payload that only arrives with END_STREAM.
+        for id in [1, 3] {
+            for _ in 0..100 {
+                srv.send_frame(frames::data(id, "")).await;
+            }
+            srv.send_frame(frames::data(id, "done").eos()).await;
+        }
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let mut responses = Vec::new();
+        for _ in 0..3 {
+            let request = Request::builder()
+                .uri("https://http2.akamai.com/")
+                .body(())
+                .unwrap();
+            responses.push(client.send_request(request, true).unwrap().0);
+        }
+        // Dropping the response cancels stream 5.
+        drop(h2.run(responses.pop().unwrap()).await.unwrap());
+
+        let mut body_lens = Vec::new();
+        for response in responses {
+            let response = h2.run(response).await.unwrap();
+            let chunks: Vec<Bytes> = h2.run(response.into_body().try_collect()).await.unwrap();
+            assert_eq!(chunks.last().unwrap(), "done");
+            body_lens.push(chunks.iter().map(Bytes::len).sum::<usize>());
+        }
+        assert_eq!(body_lens, [ROUNDS * CHUNK_LEN + 4, 4]);
+
+        drop(client);
+        h2.await.unwrap();
+    };
+
+    join(mock, h2).await;
+}
+
+#[tokio::test]
 async fn dropping_buffered_data_frames_releases_budget() {
     h2_support::trace_init!();
 
