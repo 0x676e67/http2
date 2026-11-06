@@ -368,6 +368,19 @@ where
         self.indices.is_none()
     }
 
+    /// Returns whether any queued stream satisfies `f`, checking from the head.
+    pub fn any(&self, store: &Store, f: impl Fn(&Stream) -> bool) -> bool {
+        let mut next = self.indices.map(|idxs| idxs.head);
+        while let Some(key) = next {
+            let stream = &store[key];
+            if f(stream) {
+                return true;
+            }
+            next = N::next(stream);
+        }
+        false
+    }
+
     pub fn pop_if<'a, R, F>(&mut self, store: &'a mut R, f: F) -> Option<store::Ptr<'a>>
     where
         R: Resolve,

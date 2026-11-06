@@ -1191,6 +1191,12 @@ where
         Poll::Ready(Ok(()))
     }
 
+    /// Returns whether a stream is counted or a live request waits to open.
+    pub fn has_streams_or_pending_open(&self) -> bool {
+        let me = self.inner.lock();
+        me.counts.has_streams() || me.actions.send.has_pending_open(&me.store)
+    }
+
     pub(crate) fn validate_initial_stream_window_size_update(
         &self,
         size: WindowSize,

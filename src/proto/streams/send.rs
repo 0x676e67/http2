@@ -658,6 +658,10 @@ impl Send {
         self.prioritize.clear_pending_open(store, counts);
     }
 
+    pub fn has_pending_open(&self, store: &Store) -> bool {
+        self.prioritize.has_pending_open(store)
+    }
+
     pub fn ensure_not_idle(&self, id: StreamId) -> Result<(), Reason> {
         if let Ok(next) = self.next_stream_id
             && id >= next
