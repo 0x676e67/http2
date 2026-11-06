@@ -743,3 +743,69 @@ async fn bytes_dropped_while_closing_count_as_read() {
     conn.drive(util::yield_once()).await;
     assert!(conn.take_read_activity());
 }
+
+/// Closes on idle while a library error GOAWAY waits for room: once the last
+/// handles are dropped, or after the peer's GOAWAY when the writes that follow
+/// the GOAWAY's refused write get through.
+async fn error_go_away_while_blocked(drop_handles: bool) {
+    let (io, mut peer) = mock::new();
+    let (io, drain) = buffered_io(io);
+    let (mut client, mut conn) = client::handshake(io).await.unwrap();
+    conn.drive(peer.assert_client_handshake()).await;
+
+    // An upload fills the codec, so the GOAWAY waits for room.
+    drain.pause();
+    let request = Request::post("https://example.com/").body(()).unwrap();
+    let (response, mut stream) = client.send_request(request, false).unwrap();
+    stream
+        .send_data(Bytes::from(vec![0; 32 * 1024]), true)
+        .unwrap();
+    for _ in 0..4 {
+        conn.drive(util::yield_once()).await;
+    }
+
+    if !drop_handles {
+        peer.send_frame(frames::go_away(1)).await;
+    }
+    // HEADERS cannot open a server-initiated stream, a connection
+    // PROTOCOL_ERROR (RFC 9113 §5.1.1).
+    peer.send_frame(frames::headers(2).response(200)).await;
+    for _ in 0..4 {
+        conn.drive(util::yield_once()).await;
+    }
+    if drop_handles {
+        drop((client, stream, response));
+    }
+    for _ in 0..4 {
+        conn.drive(util::yield_once()).await;
+    }
+    // With the handles kept, exactly one refused write keeps the GOAWAY
+    // waiting for room while the stream flush gets through, so the idle check
+    // runs before it is written; with 0 or 2 that check never runs.
+    drain.resume(if drop_handles { 0 } else { 1 });
+
+    let go_away = async move {
+        loop {
+            if let frame::Frame::GoAway(frame) = peer.next().await.unwrap().unwrap() {
+                return frame;
+            }
+        }
+    };
+    let (result, go_away) = join(conn, go_away).await;
+    assert_eq!(go_away.reason(), Reason::PROTOCOL_ERROR);
+    assert_eq!(result.unwrap_err().reason(), Some(Reason::PROTOCOL_ERROR));
+}
+
+#[tokio::test]
+async fn error_go_away_keeps_its_reason_when_closing_on_idle() {
+    h2_support::trace_init!();
+
+    for drop_handles in [true, false] {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            error_go_away_while_blocked(drop_handles),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("drop_handles={} timed out", drop_handles));
+    }
+}
