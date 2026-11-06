@@ -51,8 +51,9 @@ struct Encoder<B> {
     max_frame_size: FrameSize,
 
     /// Local cap on DATA payloads; `max_frame_size` still applies. Capped
-    /// frames are always chained, copy their small leading chunks and share
-    /// no write with other frames.
+    /// frames are always chained, share no write with other frames and copy
+    /// their small leading chunks, or without vectored writes their whole
+    /// payload up to `MAX_COPIED_DATA_FRAME_SIZE`.
     max_data_frame_size: Option<FrameSize>,
 
     /// Whether the upstream writer takes vectored writes
@@ -119,6 +120,11 @@ const WRITE_SLICES: usize = 64;
 
 /// Max payload slices one vectored write lists beside the write buffer.
 const DATA_WRITE_SLICES: usize = WRITE_SLICES - 1;
+
+/// Without vectored writes, a DATA frame going alone with at most this much
+/// payload, the default max frame size, is copied whole into the buffer so
+/// it takes one write; `max_data_frame_parts` coalesces only up to it.
+const MAX_COPIED_DATA_FRAME_SIZE: usize = frame::DEFAULT_MAX_FRAME_SIZE as usize;
 
 // TODO: Make generic
 impl<T, B> FramedWrite<T, B>
@@ -362,15 +368,21 @@ where
                     // Encode the frame head to the buffer
                     head.encode(len, self.buf.get_mut());
 
-                    // Capped DATA can carry many chunks: copy the small
-                    // leading ones
-                    if capped {
-                        self.copy_small_chunks(&mut v);
-                    }
+                    if alone && !self.vectored && len <= MAX_COPIED_DATA_FRAME_SIZE {
+                        // Without vectored writes, each chunk would take a
+                        // write: copy them all, growing the buffer if needed
+                        self.buf.get_mut().put(v.payload_mut());
+                    } else {
+                        // Capped DATA can carry many chunks: copy the small
+                        // leading ones
+                        if capped {
+                            self.copy_small_chunks(&mut v);
+                        }
 
-                    if self.buf.get_ref().remaining() < self.chain_threshold {
-                        let extra_bytes = self.chain_threshold - self.buf.remaining();
-                        self.buf.get_mut().put(v.payload_mut().take(extra_bytes));
+                        if self.buf.get_ref().remaining() < self.chain_threshold {
+                            let extra_bytes = self.chain_threshold - self.buf.remaining();
+                            self.buf.get_mut().put(v.payload_mut().take(extra_bytes));
+                        }
                     }
 
                     // Save the data frame, with where one going alone starts
@@ -489,9 +501,12 @@ where
             && self.has_room_after(len)
     }
 
+    /// Room is counted within the default capacity, so a grown buffer takes
+    /// no more bytes ahead of a frame, and a frame copied whole after them
+    /// grows it at most once.
     fn has_room_after(&self, len: usize) -> bool {
         self.next.is_none()
-            && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
+            && (DEFAULT_BUFFER_CAPACITY.saturating_sub(self.buf.get_ref().len())
                 >= self.min_buffer_capacity.saturating_add(len))
     }
 }
@@ -533,11 +548,11 @@ impl<T, B> FramedWrite<T, B> {
     }
 
     /// Returns the max parts of a capped DATA frame coalesced from queued
-    /// chunks, so one vectored write lists them all, or `None` without a cap or
-    /// vectored writes.
+    /// chunks, so one write takes them all, or `None` without a cap, or
+    /// without vectored writes when a capped frame is too large to copy.
     pub(crate) fn max_data_frame_parts(&self) -> Option<usize> {
-        (self.encoder.max_data_frame_size.is_some() && self.encoder.vectored)
-            .then_some(DATA_WRITE_SLICES)
+        let max = self.max_data_frame_size()?;
+        (self.encoder.vectored || max <= MAX_COPIED_DATA_FRAME_SIZE).then_some(DATA_WRITE_SLICES)
     }
 
     /// Caps header block frame payloads; the peer's max frame size still
@@ -761,15 +776,32 @@ mod tests {
         assert_eq!(lens[..3], [10, 7, 10]);
         assert_eq!(lens.iter().sum::<usize>(), 17 + 9 + 16_375);
 
-        // Plain writes split the same way; the frame's buffered bytes and
-        // the rest of its payload then take a write each
+        // Plain writes chain an uncapped frame as before. With a cap they
+        // split the same way, and the frame is copied whole, growing the
+        // buffer, so it still takes one write
         let mut codec = FramedWrite::new(Writes {
             plain: true,
             ..Writes::default()
         });
+        send(&mut codec, [data(&[16_375])]);
         codec.set_max_data_frame_size(16_375);
         send(&mut codec, [ping(), data(&[16_375])]);
-        assert_eq!(codec.get_mut().lens, [17, 1_007, 15_377]);
+        assert_eq!(codec.get_mut().lens, [1_024, 15_360, 17, 16_384]);
+
+        // The grown buffer takes no more bytes ahead of a frame than a
+        // default one
+        let debug_data = Bytes::from(vec![0; 15_335]);
+        let go_away =
+            frame::GoAway::with_debug_data(StreamId::zero(), Reason::NO_ERROR, debug_data);
+        codec.buffer(go_away.into()).unwrap();
+        assert!(!codec.has_capacity());
+
+        // Chunks are coalesced only while capped frames, within the peer's
+        // max frame size, are at most 16,384 bytes
+        codec.set_max_data_frame_size(16_385);
+        assert_eq!(codec.max_data_frame_parts(), Some(DATA_WRITE_SLICES));
+        codec.set_max_frame_size(20_000);
+        assert_eq!(codec.max_data_frame_parts(), None);
     }
 
     #[test]
@@ -783,25 +815,32 @@ mod tests {
         send(&mut codec, [data(&[256; 64])]);
         assert_eq!(codec.get_mut().lens, [16_329, 16_137, 256]);
 
-        // Plain writes copy chunks under 1 KiB while they fit, which then take
-        // no write of their own
+        // Plain writes copy the chunks under 1 KiB of a frame over 16,384
+        // bytes while they fit, which then take no write of their own
         let mut codec = FramedWrite::new(Writes {
             plain: true,
             ..Writes::default()
         });
-        codec.set_max_data_frame_size(16_375);
-        send(&mut codec, [data(&[1_023, 2_000])]);
-        send(&mut codec, [data(&[1_024, 2_000])]);
-        assert_eq!(codec.get_mut().lens, [1_032, 2_000, 1_024, 9, 2_000]);
+        codec.set_max_frame_size(20_000);
+        codec.set_max_data_frame_size(20_000);
+        send(&mut codec, [data(&[1_023, 15_362])]);
+        send(&mut codec, [data(&[1_024, 15_361])]);
 
         // A chunk that no longer fits the buffer stays in the payload instead
         // of growing the buffer
-        codec.get_mut().lens.clear();
         let debug_data = Bytes::from(vec![0; 15_334]);
         let go_away =
             frame::GoAway::with_debug_data(StreamId::zero(), Reason::NO_ERROR, debug_data);
-        send(&mut codec, [go_away.into(), data(&[1_000, 1_000])]);
-        assert_eq!(codec.get_mut().lens, [15_351, 1_009, 1_000]);
+        send(&mut codec, [go_away.into(), data(&[1_000, 1_000, 16_000])]);
+
+        // A frame of up to 16,384 bytes is copied whole
+        send(&mut codec, [data(&[1_023, 15_361])]);
+        assert_eq!(
+            codec.get_mut().lens,
+            [
+                1_032, 15_362, 1_024, 9, 15_361, 15_351, 1_009, 1_000, 16_000, 16_393
+            ]
+        );
     }
 
     #[test]
