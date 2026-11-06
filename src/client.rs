@@ -834,23 +834,24 @@ impl Builder {
     /// which peers may treat as abuse. By default only the peer's
     /// `SETTINGS_MAX_FRAME_SIZE` applies.
     ///
-    /// When the I/O object supports vectored writes, the DATA queued on a
-    /// stream is also coalesced into frames of up to that size, at most 63
-    /// non-empty chunks each, without waiting for more, as DATA frames carry
-    /// arbitrary sequences of octets ([RFC 9113 §6.1]). Otherwise, as by
-    /// default, each `send_data` chunk is framed on its own.
+    /// The DATA queued on a stream is also coalesced into frames of up to
+    /// that size, at most 63 non-empty chunks each, without waiting for more,
+    /// as DATA frames carry arbitrary sequences of octets ([RFC 9113 §6.1]).
+    /// Without vectored writes, this needs capped frames of at most 16,384
+    /// bytes; otherwise, as by default, each `send_data` chunk is framed on
+    /// its own.
     ///
     /// Each capped frame starts a write and shares none: the frames buffered
     /// before it are written first, and later ones wait until it is written.
     /// Small frames, and frames between other frames, thus take more writes
-    /// and TLS records than without a cap. With vectored writes and 16,375
-    /// bytes, a full frame, its 9-byte header included, fills one TLS record
-    /// of 2^14 bytes ([RFC 8446 §5.1]); a transport that takes the write only
-    /// in part can still seal one more record.
+    /// and TLS records than without a cap. With 16,375 bytes, a full frame,
+    /// its 9-byte header included, fills one TLS record of 2^14 bytes
+    /// ([RFC 8446 §5.1]); a transport that takes the write only in part can
+    /// still seal one more record.
     ///
-    /// Without vectored writes, a frame with a contiguous chunk of 1 KiB or
-    /// more takes at least two writes, so frames do not line up with records.
-    /// Use it with I/O objects that support vectored writes.
+    /// Without vectored writes, a frame of up to 16,384 bytes is copied into
+    /// the write buffer so it takes one write. A larger frame with a
+    /// contiguous chunk of 1 KiB or more takes at least two writes.
     ///
     /// [RFC 9113 §4.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2
     /// [RFC 9113 §6.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.1
@@ -881,8 +882,8 @@ impl Builder {
     /// written alone, except that a header block goes out in one write with
     /// its CONTINUATION frames and the stream WINDOW_UPDATE that follows it.
     /// Over TLS, a write is sealed into its own records ([RFC 8446 §5.1]).
-    /// Without vectored writes, a DATA frame over about 1 KiB can still take
-    /// more than one write.
+    /// Without vectored writes, a DATA frame of up to 16,384 bytes is copied
+    /// so it takes one write; a larger one can take more.
     ///
     /// Each frame costs a write, so this lowers throughput when many small
     /// frames are queued at once. Disabled by default.

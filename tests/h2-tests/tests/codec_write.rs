@@ -346,15 +346,17 @@ async fn max_send_data_frame_size_coalesces_queued_data() {
 
 #[tokio::test]
 async fn max_send_data_frame_size_framing() {
-    // Without vectored writes, chunks are framed on their own, within the
-    // cap. Without a cap, vectored writes keep the default framing. The
+    // Without vectored writes, chunks are coalesced the same within a cap of
+    // up to 16,384 bytes, and framed on their own within a larger one.
+    // Without a cap, vectored writes keep the default framing. The
     // peer's max frame size still bounds a larger cap, and a zero cap acts as
     // one. A frame copied whole from chunks under 256 bytes still gives back
     // the rest of its last chunk.
     h2_support::trace_init!();
     const BODY: &[usize] = &[16_384, 4_096, 4_096];
-    let cases: [(Option<u32>, bool, &[usize], &[usize]); 5] = [
-        (Some(16_375), false, BODY, &[16_375, 9, 4_096, 4_096]),
+    let cases: [(Option<u32>, bool, &[usize], &[usize]); 6] = [
+        (Some(16_375), false, BODY, &[16_375, 8_201]),
+        (Some(20_480), false, BODY, &[16_384, 4_096, 4_096]),
         (None, true, BODY, &[16_384, 4_096, 4_096]),
         (Some(32_768), true, BODY, &[20_480, 4_096]),
         (Some(0), true, &[3], &[1, 1, 1]),
@@ -442,6 +444,8 @@ async fn one_frame_per_write() {
     // the connection is read-idle past its threshold, goes alone ahead of the
     // DATA frame that arms it, with or without a DATA cap. Without the option,
     // the CONTINUATION frames take writes apart from the HEADERS frame.
+    // Without vectored writes, DATA frames of up to 16,384 bytes are copied
+    // so they take a write each too.
     use futures::StreamExt;
 
     h2_support::trace_init!();
@@ -452,12 +456,19 @@ async fn one_frame_per_write() {
     const WINDOW_UPDATE: u8 = 0x8;
     const CONTINUATION: u8 = 0x9;
 
-    for (enabled, data_cap) in [(false, true), (true, true), (true, false)] {
+    for (enabled, data_cap, vectored) in [
+        (false, true, true),
+        (true, true, true),
+        (true, false, true),
+        (true, true, false),
+        (true, false, false),
+    ] {
         let (io, mut srv) = mock::new();
         let writes = Arc::new(Mutex::new(Vec::new()));
         let io = WriteLog {
             inner: io,
             writes: writes.clone(),
+            vectored,
         };
 
         let srv = async move {
@@ -550,11 +561,12 @@ async fn one_frame_per_write() {
 }
 
 /// An IO wrapper that keeps the bytes of each write. It takes vectored
-/// writes as one plain write of the joined slices, so the mock takes each
-/// write whole.
+/// writes, if it reports them, as one plain write of the joined slices, so
+/// the mock takes each write whole.
 struct WriteLog<T> {
     inner: T,
     writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    vectored: bool,
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for WriteLog<T> {
@@ -590,7 +602,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for WriteLog<T> {
     }
 
     fn is_write_vectored(&self) -> bool {
-        true
+        self.vectored
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
