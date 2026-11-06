@@ -2586,3 +2586,84 @@ async fn read_activity_of_closing_poll() {
 
     join(srv, client).await;
 }
+
+#[tokio::test]
+async fn has_streams_while_requests_are_queued_or_open() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let (handshake_tx, handshake_rx) = futures::channel::oneshot::channel();
+    let (open_tx, open_rx) = futures::channel::oneshot::channel();
+    let (body_tx, body_rx) = futures::channel::oneshot::channel();
+
+    let srv = async move {
+        let settings = srv
+            .assert_client_handshake_with_settings(frames::settings().max_concurrent_streams(0))
+            .await;
+        assert_default_settings!(settings);
+        handshake_tx.send(()).unwrap();
+        open_rx.await.unwrap();
+        srv.send_frame(frames::settings().max_concurrent_streams(1))
+            .await;
+        srv.recv_frame(frames::settings_ack()).await;
+        // The reset request still opens before its RST_STREAM.
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.recv_frame(frames::reset(1).cancel()).await;
+        srv.recv_frame(
+            frames::headers(3)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(3).response(200)).await;
+        body_rx.await.unwrap();
+        srv.send_frame(frames::data(3, "hello").eos()).await;
+        srv.recv_frame(frames::go_away(0)).await;
+        srv.recv_eof().await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .initial_max_send_streams(0)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        let get = || Request::get("https://example.com/").body(()).unwrap();
+        assert!(!conn.has_streams());
+
+        // A queued request counts once sent and while no stream may open.
+        let (_, mut reset) = client.send_request(get(), true).unwrap();
+        assert!(conn.has_streams());
+        conn.drive(handshake_rx).await.unwrap();
+        assert!(conn.has_streams());
+
+        // A reset request stops counting, but a live one queued behind it counts.
+        reset.send_reset(Reason::CANCEL);
+        assert!(!conn.has_streams());
+        let (response, _) = client.clone().send_request(get(), true).unwrap();
+        assert!(conn.has_streams());
+        open_tx.send(()).unwrap();
+
+        // An open response body counts without any SendRequest.
+        let response = conn.drive(response).await.unwrap();
+        drop(client);
+        assert!(conn.has_streams());
+        body_tx.send(()).unwrap();
+
+        // A stream closed both ways stops counting while its body is held.
+        let mut body = response.into_body();
+        let chunk = conn.drive(body.data()).await.unwrap().unwrap();
+        assert_eq!(chunk, &b"hello"[..]);
+        assert!(body.is_end_stream());
+        assert!(!conn.has_streams());
+
+        drop((reset, body));
+        conn.await.expect("client");
+    };
+
+    join(srv, client).await;
+}

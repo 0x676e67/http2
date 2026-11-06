@@ -147,6 +147,14 @@ impl Prioritize {
         self.pending_open.push(stream);
     }
 
+    /// Returns whether a request waiting to open is still live.
+    pub fn has_pending_open(&self, store: &Store) -> bool {
+        // A reset or canceled request can stay queued until the connection
+        // pops it.
+        self.pending_open
+            .any(store, |stream| !stream.state.is_closed())
+    }
+
     /// Send a data frame
     pub fn send_data<B>(
         &mut self,

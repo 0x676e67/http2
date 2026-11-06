@@ -1778,6 +1778,20 @@ where
         self.inner.take_read_activity()
     }
 
+    /// Returns whether any stream is open or waiting to open.
+    ///
+    /// A request counts from [`SendRequest::send_request`] until its stream
+    /// closes, including while `SETTINGS_MAX_CONCURRENT_STREAMS` holds it back.
+    /// A request reset before it opens stops counting, though it may count
+    /// again while its HEADERS and RST_STREAM are written.
+    ///
+    /// Read it once polling the connection returns `Pending`. A request sent
+    /// during that poll may open without waking the task again, while one sent
+    /// later wakes it.
+    pub fn has_streams(&self) -> bool {
+        self.inner.streams().has_streams_or_pending_open()
+    }
+
     /// Returns when the unanswered preface PING times out, unless a GOAWAY from
     /// [`abrupt_shutdown`](Self::abrupt_shutdown) while open waits to be written.
     ///
