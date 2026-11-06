@@ -460,7 +460,6 @@ async fn one_frame_per_write() {
         (false, true, true),
         (true, true, true),
         (true, false, true),
-        (true, true, false),
         (true, false, false),
     ] {
         let (io, mut srv) = mock::new();

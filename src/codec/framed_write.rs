@@ -51,9 +51,9 @@ struct Encoder<B> {
     max_frame_size: FrameSize,
 
     /// Local cap on DATA payloads; `max_frame_size` still applies. Capped
-    /// frames are always chained, copy their small leading chunks, or their
-    /// whole payload without vectored writes, and share no write with other
-    /// frames.
+    /// frames are always chained, share no write with other frames and copy
+    /// their small leading chunks, or without vectored writes their whole
+    /// payload up to `MAX_COPIED_DATA_FRAME_SIZE`.
     max_data_frame_size: Option<FrameSize>,
 
     /// Whether the upstream writer takes vectored writes
@@ -94,8 +94,8 @@ enum Next<B> {
 /// frame that big.
 const DEFAULT_BUFFER_CAPACITY: usize = 16 * 1_024;
 
-/// A write buffer grown past this, as a header block buffered whole can grow
-/// it, is replaced by a default one once written.
+/// A write buffer grown past this, as a header block buffered whole or a DATA
+/// frame copied whole can grow it, is replaced by a default one once written.
 const MAX_IDLE_BUFFER_CAPACITY: usize = 4 * DEFAULT_BUFFER_CAPACITY;
 
 /// Smallest cap on header frame payloads, so a HEADERS frame's priority
@@ -123,7 +123,7 @@ const DATA_WRITE_SLICES: usize = WRITE_SLICES - 1;
 
 /// Without vectored writes, a DATA frame going alone with at most this much
 /// payload, the default max frame size, is copied whole into the buffer so
-/// it takes one write instead of one per chunk.
+/// it takes one write; `max_data_frame_parts` coalesces only up to it.
 const MAX_COPIED_DATA_FRAME_SIZE: usize = frame::DEFAULT_MAX_FRAME_SIZE as usize;
 
 // TODO: Make generic
@@ -501,9 +501,12 @@ where
             && self.has_room_after(len)
     }
 
+    /// Room is counted within the default capacity, so a grown buffer takes
+    /// no more bytes ahead of a frame, and a frame copied whole after them
+    /// grows it at most once.
     fn has_room_after(&self, len: usize) -> bool {
         self.next.is_none()
-            && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
+            && (DEFAULT_BUFFER_CAPACITY.saturating_sub(self.buf.get_ref().len())
                 >= self.min_buffer_capacity.saturating_add(len))
     }
 }
@@ -773,15 +776,32 @@ mod tests {
         assert_eq!(lens[..3], [10, 7, 10]);
         assert_eq!(lens.iter().sum::<usize>(), 17 + 9 + 16_375);
 
-        // Plain writes split the same way, and the frame is copied whole,
-        // growing the buffer, so it still takes one write
+        // Plain writes chain an uncapped frame as before. With a cap they
+        // split the same way, and the frame is copied whole, growing the
+        // buffer, so it still takes one write
         let mut codec = FramedWrite::new(Writes {
             plain: true,
             ..Writes::default()
         });
+        send(&mut codec, [data(&[16_375])]);
         codec.set_max_data_frame_size(16_375);
         send(&mut codec, [ping(), data(&[16_375])]);
-        assert_eq!(codec.get_mut().lens, [17, 16_384]);
+        assert_eq!(codec.get_mut().lens, [1_024, 15_360, 17, 16_384]);
+
+        // The grown buffer takes no more bytes ahead of a frame than a
+        // default one
+        let debug_data = Bytes::from(vec![0; 15_335]);
+        let go_away =
+            frame::GoAway::with_debug_data(StreamId::zero(), Reason::NO_ERROR, debug_data);
+        codec.buffer(go_away.into()).unwrap();
+        assert!(!codec.has_capacity());
+
+        // Chunks are coalesced only while capped frames, within the peer's
+        // max frame size, are at most 16,384 bytes
+        codec.set_max_data_frame_size(16_385);
+        assert_eq!(codec.max_data_frame_parts(), Some(DATA_WRITE_SLICES));
+        codec.set_max_frame_size(20_000);
+        assert_eq!(codec.max_data_frame_parts(), None);
     }
 
     #[test]
