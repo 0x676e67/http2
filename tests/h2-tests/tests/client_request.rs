@@ -149,6 +149,53 @@ async fn request_stream_id_overflows() {
 }
 
 #[tokio::test]
+async fn builder_clamps_out_of_range_values() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let max = u32::MAX >> 1;
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::Builder::new()
+            .max_frame_size(0)
+            .max_frame_size(u32::MAX)
+            .initial_window_size(u32::MAX)
+            .initial_connection_window_size(u32::MAX)
+            .max_send_buffer_size(usize::MAX)
+            // Even, with the reserved bit set.
+            .initial_stream_id(u32::MAX - 1)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        let request = Request::get("https://example.com/").body(()).unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        let _x = h2.drive(response).await.unwrap();
+        h2.await.unwrap();
+    };
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_frame_eq(
+            settings,
+            frames::settings()
+                .max_frame_size(16_777_215)
+                .initial_window_size(max),
+        );
+        srv.recv_frame(frames::window_update(0, max - 65_535)).await;
+        srv.recv_frame(
+            frames::headers(max)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(max).response(200).eos())
+            .await;
+        idle_ms(10).await;
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
 async fn client_builder_max_concurrent_streams() {
     h2_support::trace_init!();
     let (io, mut srv) = mock::new();
@@ -1212,6 +1259,100 @@ async fn send_stream_poll_reset() {
             .await
             .unwrap();
         assert_eq!(reason, Reason::REFUSED_STREAM);
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn pending_open_wakes_poll_ready_and_send_stream() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(frames::headers(1).request("POST", "https://example.com/"))
+            .await;
+        srv.send_frame(frames::reset(1).refused()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .initial_max_send_streams(1)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        let request = Request::post("https://example.com/").body(()).unwrap();
+        let (_response, mut stream) = client.send_request(request, false).unwrap();
+
+        // Stream 1 waits to open until the connection runs. `join` polls each
+        // side only when its own waker fires, so the `SendStream` must not
+        // evict the waker `poll_ready` registered first.
+        let ready = poll_fn(|cx| client.poll_ready(cx));
+        let reset = poll_fn(|cx| stream.poll_reset(cx));
+        let (ready, reason) = conn.drive(join(ready, reset)).await;
+        ready.unwrap();
+        assert_eq!(reason.unwrap(), Reason::REFUSED_STREAM);
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn unlinked_pending_open_wakes_poll_ready_on_eof() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::{Wake, Waker};
+
+    /// Records that it was woken.
+    #[derive(Default)]
+    struct Probe(AtomicBool);
+
+    impl Wake for Probe {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let (eof_tx, eof_rx) = futures::channel::oneshot::channel();
+
+    let srv = async move {
+        srv.assert_client_handshake_with_settings(frames::settings().max_concurrent_streams(1))
+            .await;
+        eof_rx.await.unwrap();
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .initial_max_send_streams(1)
+            .initial_stream_window_size(1 << 20)
+            .max_concurrent_reset_streams(0)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        let get = || Request::get("https://example.com/").body(()).unwrap();
+
+        // Stream 1 takes the only slot, and stream 3 waits at the head of the
+        // queue with stream 5, which `client` holds as its pending request.
+        let (_open, _) = client.send_request(get(), true).unwrap();
+        client = conn.drive(client.ready()).await.unwrap();
+        let (_queued, _) = client.clone().send_request(get(), true).unwrap();
+        let (_reset, mut stream) = client.send_request(get(), false).unwrap();
+
+        // Stream 5 is discarded unsent, and its untracked reset unlinks it.
+        stream.send_reset(Reason::CANCEL);
+
+        let probe = Arc::new(Probe::default());
+        let waker = Waker::from(probe.clone());
+        let poll = client.poll_ready(&mut Context::from_waker(&waker));
+        assert!(poll.is_pending());
+
+        eof_tx.send(()).unwrap();
+        let _ = conn.await;
+        assert!(probe.0.load(Ordering::SeqCst));
     };
 
     join(srv, client).await;
@@ -2445,7 +2586,7 @@ impl MockH2 for mock_io::Builder {
 async fn frame_on_pending_open_stream_is_conn_error() {
     h2_support::trace_init!();
 
-    for scenario in 0..5u8 {
+    for scenario in 0..6u8 {
         let (io, mut srv) = mock::new();
 
         let srv = async move {
@@ -2478,6 +2619,12 @@ async fn frame_on_pending_open_stream_is_conn_error() {
                 2 => srv.send_frame(frames::window_update(3, 1024)).await,
                 3 => srv.send_frame(frames::headers(3).response(200).eos()).await,
                 4 => srv.send_frame(frames::data(3, &b"hello"[..])).await,
+                5 => {
+                    srv.send_frame(
+                        frames::push_promise(3, 2).request("GET", "https://example.com/pushed"),
+                    )
+                    .await
+                }
                 _ => unreachable!(),
             }
 

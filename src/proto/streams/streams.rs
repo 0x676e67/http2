@@ -933,6 +933,11 @@ impl Inner {
                     return Ok(RecvOutcome::Processed);
                 }
 
+                if stream.is_pending_open {
+                    proto_err!(conn: "recv_push_promise: received frame on idle stream {:?}", id);
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+                }
+
                 // The stream must be receive open
                 if !stream.state.ensure_recv_open()? {
                     proto_err!(conn: "recv_push_promise: initiating stream is not opened");
@@ -1184,7 +1189,7 @@ where
             let mut stream = me.store.resolve(pending.key);
             tracing::trace!("poll_pending_open; stream = {:?}", stream.is_pending_open);
             if stream.is_pending_open {
-                stream.wait_send(cx);
+                stream.wait_open(cx);
                 return Poll::Pending;
             }
         }
