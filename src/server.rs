@@ -477,15 +477,17 @@ where
     /// out until the number of "in flight" bytes drops below `size`.
     ///
     /// The default value is 65,535. The automatic small-DATA-frame budget is
-    /// updated to match this target.
+    /// updated to match this target. A `size` above 2<sup>31</sup> - 1, the
+    /// largest window [RFC 9113 §6.9.1] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// See [`FlowControl`] documentation for more details.
     ///
     /// [`FlowControl`]: ../struct.FlowControl.html
     /// [library level]: ../index.html#flow-control
+    /// [RFC 9113 §6.9.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
     pub fn set_target_window_size(&mut self, size: u32) {
-        assert!(size <= proto::MAX_WINDOW_SIZE);
-        self.connection.set_target_window_size(size);
+        self.connection
+            .set_target_window_size(size.min(proto::MAX_WINDOW_SIZE));
     }
 
     /// Set a new `INITIAL_WINDOW_SIZE` setting (in octets) for stream-level
@@ -495,15 +497,18 @@ where
     /// remote acknowledges the change.
     ///
     /// This can be used to increase or decrease the window size for existing
-    /// streams.
+    /// streams. A `size` above 2<sup>31</sup> - 1, the largest window
+    /// [RFC 9113 §6.5.2] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// # Errors
     ///
     /// Returns an error if a previous call is still pending acknowledgement
     /// from the remote endpoint.
+    ///
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     pub fn set_initial_window_size(&mut self, size: u32) -> Result<(), crate::Error> {
-        assert!(size <= proto::MAX_WINDOW_SIZE);
-        self.connection.set_initial_window_size(size)?;
+        self.connection
+            .set_initial_window_size(size.min(proto::MAX_WINDOW_SIZE))?;
         Ok(())
     }
 
@@ -689,9 +694,11 @@ impl Builder {
     /// The initial window of a stream is used as part of flow control. For more
     /// details, see [`FlowControl`].
     ///
-    /// The default value is 65,535.
+    /// The default value is 65,535. A `size` above 2<sup>31</sup> - 1, the
+    /// largest window [RFC 9113 §6.5.2] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// [`FlowControl`]: ../struct.FlowControl.html
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     ///
     /// # Examples
     ///
@@ -713,6 +720,7 @@ impl Builder {
     /// # pub fn main() {}
     /// ```
     pub fn initial_window_size(&mut self, size: u32) -> &mut Self {
+        let size = size.min(proto::MAX_WINDOW_SIZE);
         self.settings.set_initial_window_size(Some(size));
         self
     }
@@ -723,9 +731,11 @@ impl Builder {
     /// The initial window of a connection is used as part of flow control. For more details,
     /// see [`FlowControl`].
     ///
-    /// The default value is 65,535.
+    /// The default value is 65,535. A `size` above 2<sup>31</sup> - 1, the
+    /// largest window [RFC 9113 §6.9.1] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// [`FlowControl`]: ../struct.FlowControl.html
+    /// [RFC 9113 §6.9.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
     ///
     /// # Examples
     ///
@@ -758,7 +768,10 @@ impl Builder {
     /// but any data larger than `max` will be broken up into multiple `DATA`
     /// frames.
     ///
-    /// The value **must** be between 16,384 and 16,777,215. The default value is 16,384.
+    /// `max` is clamped between 16,384 and 16,777,215, the range
+    /// [RFC 9113 §6.5.2] allows. The default value is 16,384.
+    ///
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     ///
     /// # Examples
     ///
@@ -779,12 +792,8 @@ impl Builder {
     /// #
     /// # pub fn main() {}
     /// ```
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `max` is not within the legal range specified
-    /// above.
     pub fn max_frame_size(&mut self, max: u32) -> &mut Self {
+        let max = max.clamp(frame::DEFAULT_MAX_FRAME_SIZE, frame::MAX_MAX_FRAME_SIZE);
         self.settings.set_max_frame_size(Some(max));
         self
     }
@@ -1006,12 +1015,7 @@ impl Builder {
     /// will be freed up again.
     ///
     /// The default is currently ~400KB, but may change.
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `max` is larger than `u32::MAX`.
     pub fn max_send_buffer_size(&mut self, max: usize) -> &mut Self {
-        assert!(max <= u32::MAX as usize);
         self.max_send_buffer_size = max;
         self
     }

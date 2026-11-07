@@ -747,7 +747,11 @@ impl Prioritize {
     }
 
     pub fn clear_pending_open(&mut self, store: &mut Store, counts: &mut Counts) {
-        while let Some(stream) = self.pending_open.pop(store) {
+        while let Some(mut stream) = self.pending_open.pop(store) {
+            // A reset request unlinked while still queued, once its reset expired
+            // or when it was never tracked, misses the connection-wide
+            // notification, so wake `SendRequest::poll_ready` waiting on it here.
+            stream.notify_send();
             let is_pending_reset = stream.is_pending_reset_expiration();
             counts.transition_after(stream, is_pending_reset);
         }

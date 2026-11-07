@@ -1994,3 +1994,38 @@ async fn remote_reset_does_not_panic_connection_driver() {
         .expect("server task timed out")
         .expect("server task panicked");
 }
+
+#[tokio::test]
+async fn builder_clamps_out_of_range_values() {
+    h2_support::trace_init!();
+    let (io, mut client) = mock::new();
+    let max = u32::MAX >> 1;
+
+    let client = async move {
+        let settings = client.assert_server_handshake().await;
+        assert_frame_eq(
+            settings,
+            frames::settings()
+                .max_frame_size(16_777_215)
+                .initial_window_size(max),
+        );
+        client
+            .recv_frame(frames::window_update(0, max - 65_535))
+            .await;
+    };
+
+    let srv = async move {
+        let mut srv = server::Builder::new()
+            .max_frame_size(0)
+            .max_frame_size(u32::MAX)
+            .initial_window_size(u32::MAX)
+            .initial_connection_window_size(u32::MAX)
+            .max_send_buffer_size(usize::MAX)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        assert!(srv.next().await.is_none());
+    };
+
+    join(client, srv).await;
+}

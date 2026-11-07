@@ -72,6 +72,13 @@ impl StreamId {
             Ok(StreamId(next))
         }
     }
+
+    /// Rounds `id` up to an odd, client-initiated ID, saturating at
+    /// [`StreamId::MAX`].
+    pub(crate) fn saturating_client(id: u32) -> StreamId {
+        // `MAX - 1` is even, so setting the low bit stays within `MAX`.
+        StreamId(id.min(Self::MAX.0 - 1) | 1)
+    }
 }
 
 impl From<u32> for StreamId {
@@ -96,5 +103,24 @@ impl PartialEq<u32> for StreamId {
 impl From<crate::StreamId> for StreamId {
     fn from(src: crate::StreamId) -> Self {
         StreamId(src.as_u32())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saturating_client_rounds_up_to_odd_ids() {
+        for (id, expected) in [
+            (0, 1),
+            (4, 5),
+            (5, 5),
+            (u32::MAX >> 1, StreamId::MAX.0),
+            (u32::MAX - 1, StreamId::MAX.0),
+            (u32::MAX, StreamId::MAX.0),
+        ] {
+            assert_eq!(StreamId::saturating_client(id), StreamId(expected));
+        }
     }
 }
