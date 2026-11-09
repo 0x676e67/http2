@@ -313,7 +313,8 @@ impl Counts {
         self.chain_parents.attach(stream)
     }
 
-    // TODO: move this to macro?
+    /// Settles the stream's counts after an action. `is_reset_counted` tells
+    /// whether it held a reset slot, i.e. was queued to expire, beforehand.
     pub fn transition_after(&mut self, mut stream: store::Ptr, is_reset_counted: bool) {
         tracing::trace!(
             "transition_after; stream={:?}; state={:?}; is_closed={:?}; \
@@ -330,12 +331,15 @@ impl Counts {
 
         self.chain_parents.detach(&mut stream);
 
+        // The reset slot belongs to the expiration queue entry, so it is freed
+        // once the stream leaves the queue, even with frames still to send.
+        if is_reset_counted && !stream.is_pending_reset_expiration() {
+            self.dec_num_reset_streams();
+        }
+
         if stream.is_closed() {
             if !stream.is_pending_reset_expiration() {
                 stream.unlink();
-                if is_reset_counted {
-                    self.dec_num_reset_streams();
-                }
             }
 
             if !stream.state.is_scheduled_reset() && stream.is_counted {
@@ -528,5 +532,39 @@ mod tests {
                 .unwrap();
         }
         assert!(counts.record_data_frame(0).is_err());
+    }
+
+    #[test]
+    fn expired_reset_frees_its_slot_before_frames_flush() {
+        let config = Config {
+            local_reset_max: 1,
+            ..counts_config()
+        };
+        let mut counts = Counts::new(peer::Dyn::Client, &config);
+        let mut recv = Recv::new(peer::Dyn::Client, &config);
+        let mut store = Store::new();
+        let mut buffer = Buffer::<Frame<Bytes>>::new();
+        let id = StreamId::from(1);
+
+        // A request canceled while its HEADERS, stood in for by any frame, wait
+        // for a stream slot.
+        let mut stream = store.insert(id, Stream::new(id, 0, 0));
+        stream.state.set_scheduled_reset(frame::Reason::CANCEL);
+        stream
+            .pending_send
+            .push_back(&mut buffer, frame::Data::new(id, Bytes::new()).into());
+        recv.enqueue_reset_expiration(&mut stream, &mut counts);
+        assert!(!counts.can_inc_num_reset_streams());
+
+        // The reset expires before the queued frame is written.
+        std::thread::sleep(Duration::from_millis(1));
+        recv.clear_expired_reset_streams(&mut store, &mut counts);
+        assert!(counts.can_inc_num_reset_streams());
+
+        // Writing it later frees the stream without a second decrement.
+        let mut stream = store.find_mut(&id).unwrap();
+        stream.pending_send.pop_front(&mut buffer);
+        counts.transition_after(stream, false);
+        assert!(store.find_mut(&id).is_none());
     }
 }

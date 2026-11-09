@@ -51,6 +51,11 @@ pub(super) struct Stream {
     /// Task tracking additional send capacity (i.e. window updates).
     send_task: Option<Waker>,
 
+    /// `SendRequest::poll_ready` waiting for this stream to leave
+    /// `pending_open`. Kept apart from `send_task`, which the stream's own
+    /// `SendStream` may hold at the same time.
+    open_task: Option<Waker>,
+
     /// Frames pending for this stream being sent to the socket
     pub pending_send: buffer::Deque,
 
@@ -186,6 +191,7 @@ impl Stream {
             requested_send_capacity: 0,
             buffered_send_data: 0,
             send_task: None,
+            open_task: None,
             pending_send: buffer::Deque::new(),
             is_pending_send_capacity: false,
             next_pending_send_capacity: None,
@@ -379,6 +385,13 @@ impl Stream {
         if let Some(task) = self.send_task.take() {
             task.wake();
         }
+        if let Some(task) = self.open_task.take() {
+            task.wake();
+        }
+    }
+
+    pub fn wait_open(&mut self, cx: &Context) {
+        self.open_task = Some(cx.waker().clone());
     }
 
     pub fn wait_send(&mut self, cx: &Context) {
@@ -420,6 +433,7 @@ impl fmt::Debug for Stream {
             .field("requested_send_capacity", &self.requested_send_capacity)
             .field("buffered_send_data", &self.buffered_send_data)
             .h2_field_some("send_task", &self.send_task.as_ref().map(|_| ()))
+            .h2_field_some("open_task", &self.open_task.as_ref().map(|_| ()))
             .h2_field_if_then(
                 "pending_send",
                 !self.pending_send.is_empty(),

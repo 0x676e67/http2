@@ -725,9 +725,11 @@ impl Builder {
     /// The initial window of a stream is used as part of flow control. For more
     /// details, see [`FlowControl`].
     ///
-    /// The default value is 65,535.
+    /// The default value is 65,535. A `size` above 2<sup>31</sup> - 1, the
+    /// largest window [RFC 9113 §6.5.2] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// [`FlowControl`]: ../struct.FlowControl.html
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     ///
     /// # Examples
     ///
@@ -749,6 +751,7 @@ impl Builder {
     /// # pub fn main() {}
     /// ```
     pub fn initial_window_size(&mut self, size: u32) -> &mut Self {
+        let size = size.min(proto::MAX_WINDOW_SIZE);
         self.settings.set_initial_window_size(Some(size));
         self
     }
@@ -759,9 +762,11 @@ impl Builder {
     /// The initial window of a connection is used as part of flow control. For more details,
     /// see [`FlowControl`].
     ///
-    /// The default value is 65,535.
+    /// The default value is 65,535. A `size` above 2<sup>31</sup> - 1, the
+    /// largest window [RFC 9113 §6.9.1] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// [`FlowControl`]: ../struct.FlowControl.html
+    /// [RFC 9113 §6.9.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
     ///
     /// # Examples
     ///
@@ -794,7 +799,10 @@ impl Builder {
     /// but any data larger than `max` will be broken up into multiple `DATA`
     /// frames.
     ///
-    /// The value **must** be between 16,384 and 16,777,215. The default value is 16,384.
+    /// `max` is clamped between 16,384 and 16,777,215, the range
+    /// [RFC 9113 §6.5.2] allows. The default value is 16,384.
+    ///
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     ///
     /// # Examples
     ///
@@ -815,12 +823,11 @@ impl Builder {
     /// #
     /// # pub fn main() {}
     /// ```
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `max` is not within the legal range specified
-    /// above.
     pub fn max_frame_size(&mut self, max: u32) -> &mut Self {
+        let max = max.clamp(
+            crate::frame::DEFAULT_MAX_FRAME_SIZE,
+            crate::frame::MAX_MAX_FRAME_SIZE,
+        );
         self.settings.set_max_frame_size(Some(max));
         self
     }
@@ -843,11 +850,11 @@ impl Builder {
     ///
     /// Each capped frame starts a write and shares none: the frames buffered
     /// before it are written first, and later ones wait until it is written.
-    /// Small frames, and frames between other frames, thus take more writes
-    /// and TLS records than without a cap. With 16,375 bytes, a full frame,
-    /// its 9-byte header included, fills one TLS record of 2^14 bytes
-    /// ([RFC 8446 §5.1]); a transport that takes the write only in part can
-    /// still seal one more record.
+    /// Small frames, and frames between other frames, thus take more writes,
+    /// and more TLS records with stacks that seal each write separately. With
+    /// 16,375 bytes, a full frame, its 9-byte header included, then fills one
+    /// TLS record of 2^14 bytes ([RFC 8446 §5.1]); a transport that takes the
+    /// write only in part can still seal one more record.
     ///
     /// Without vectored writes, a frame of up to 16,384 bytes is copied into
     /// the write buffer so it takes one write. A larger frame with a
@@ -881,7 +888,8 @@ impl Builder {
     /// PRIORITY frames still share the first write. After it, each frame is
     /// written alone, except that a header block goes out in one write with
     /// its CONTINUATION frames and the stream WINDOW_UPDATE that follows it.
-    /// Over TLS, a write is sealed into its own records ([RFC 8446 §5.1]).
+    /// TLS stacks commonly seal each write into its own records, though
+    /// [RFC 8446 §5.1] lets them split or coalesce application data.
     /// Without vectored writes, a DATA frame of up to 16,384 bytes is copied
     /// so it takes one write; a larger one can take more.
     ///
@@ -1182,12 +1190,7 @@ impl Builder {
     /// will be freed up again.
     ///
     /// The default is currently ~400KB, but may change.
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `max` is larger than `u32::MAX`.
     pub fn max_send_buffer_size(&mut self, max: usize) -> &mut Self {
-        assert!(max <= u32::MAX as usize);
         self.max_send_buffer_size = max;
         self
     }
@@ -1328,19 +1331,14 @@ impl Builder {
     /// Requests never use a lower ID, so [`Builder::priorities`] can declare
     /// lower streams as dependency parents without a later request opening them.
     ///
-    /// # Panics
-    ///
-    /// Panics if `stream_id` is even or has the reserved most significant bit
-    /// set. Clients must open odd stream identifiers, which are unsigned 31-bit
-    /// integers ([RFC 9113 §5.1.1]).
+    /// Clients open odd, 31-bit stream IDs ([RFC 9113 §5.1.1]), so an even
+    /// `stream_id` is rounded up to the next odd one, and one above
+    /// 2<sup>31</sup> - 1 is treated as 2<sup>31</sup> - 1, which leaves room
+    /// for a single request.
     ///
     /// [RFC 9113 §5.1.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1.1
     pub fn initial_stream_id(&mut self, stream_id: u32) -> &mut Self {
-        self.stream_id = stream_id.into();
-        assert!(
-            self.stream_id.is_client_initiated(),
-            "stream id must be odd"
-        );
+        self.stream_id = StreamId::saturating_client(stream_id);
         self
     }
 
@@ -1728,15 +1726,17 @@ where
     /// out until the number of "in flight" bytes drops below `size`.
     ///
     /// The default value is 65,535. The automatic small-DATA-frame budget is
-    /// updated to match this target.
+    /// updated to match this target. A `size` above 2<sup>31</sup> - 1, the
+    /// largest window [RFC 9113 §6.9.1] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// See [`FlowControl`] documentation for more details.
     ///
     /// [`FlowControl`]: ../struct.FlowControl.html
     /// [library level]: ../index.html#flow-control
+    /// [RFC 9113 §6.9.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
     pub fn set_target_window_size(&mut self, size: u32) {
-        assert!(size <= proto::MAX_WINDOW_SIZE);
-        self.inner.set_target_window_size(size);
+        self.inner
+            .set_target_window_size(size.min(proto::MAX_WINDOW_SIZE));
     }
 
     /// Set a new `INITIAL_WINDOW_SIZE` setting (in octets) for stream-level
@@ -1746,7 +1746,8 @@ where
     /// remote acknowledges the change.
     ///
     /// This can be used to increase or decrease the window size for existing
-    /// streams.
+    /// streams. A `size` above 2<sup>31</sup> - 1, the largest window
+    /// [RFC 9113 §6.5.2] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// # Errors
     ///
@@ -1755,9 +1756,11 @@ where
     /// is configured, dynamically increasing the stream baseline is also
     /// rejected because it could overflow an already-open stream's target
     /// window before the acknowledgement arrives.
+    ///
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     pub fn set_initial_window_size(&mut self, size: u32) -> Result<(), crate::Error> {
-        assert!(size <= proto::MAX_WINDOW_SIZE);
-        self.inner.set_client_initial_window_size(size)?;
+        self.inner
+            .set_client_initial_window_size(size.min(proto::MAX_WINDOW_SIZE))?;
         Ok(())
     }
 
