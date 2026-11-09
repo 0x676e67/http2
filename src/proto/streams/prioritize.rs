@@ -1151,7 +1151,16 @@ impl<B: Buf> Prioritized<B> {
             payload.end_of_stream = eos;
 
             if len > 0 {
-                payload.rest.push(queued.into_payload().take(len));
+                let rest = &mut payload.rest;
+
+                // Reserves for the room filled with parts the size of the
+                // first, and at least the four a first push takes, so equal
+                // chunks allocate once rather than once per doubling
+                if rest.capacity() == 0 {
+                    rest.reserve_exact(room.div_ceil(sz).min(max_parts - 1).max(4));
+                }
+
+                rest.push(queued.into_payload().take(len));
                 added += len;
                 room -= len;
             }
