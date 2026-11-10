@@ -406,6 +406,15 @@ impl<N> fmt::Debug for Queue<N> {
     }
 }
 
+// ===== impl Key =====
+
+impl Key {
+    /// The ID of the stream this key was created for.
+    pub(super) fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+}
+
 // ===== impl Ptr =====
 
 impl<'a> Ptr<'a> {
