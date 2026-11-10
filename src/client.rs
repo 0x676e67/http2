@@ -916,8 +916,10 @@ impl Builder {
     /// A multi-threaded runtime tends to poll the connection as soon as one
     /// stream has queued a frame, so each frame takes a write of its own. With
     /// this enabled, the connection yields to the runtime once before a write
-    /// of less than 1,024 bytes that a stream woke it for. Other tasks that
-    /// are ready run first, which delays such a write by as long as they take.
+    /// of less than 1,024 bytes that a stream woke it for: it wakes itself and
+    /// returns `Pending`, to write when polled next. Other tasks that are
+    /// ready run first, which delays every frame of that write, a PING
+    /// acknowledgement included, by as long as they take.
     /// It has no effect with [`one_frame_per_write`](Self::one_frame_per_write).
     /// Disabled by default.
     pub fn yield_before_small_writes(&mut self, enabled: bool) -> &mut Self {

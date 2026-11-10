@@ -979,6 +979,31 @@ mod tests {
     }
 
     #[test]
+    fn small_write_len_is_that_of_a_write_more_frames_could_share() {
+        let mut codec = FramedWrite::new(Writes::default());
+        assert_eq!(codec.small_write_len(), None);
+
+        // Copied frames add up, until the write is no small one
+        codec.buffer(ping()).unwrap();
+        codec.buffer(data(&[SMALL_WRITE_LIMIT - 27])).unwrap();
+        assert_eq!(codec.small_write_len(), Some(SMALL_WRITE_LIMIT - 1));
+        codec.buffer(data(&[0])).unwrap();
+        assert_eq!(codec.small_write_len(), None);
+        send(&mut codec, []);
+
+        // A chained payload goes with what is buffered, however small
+        codec.set_max_data_frame_size(16_375);
+        codec.buffer(data(&[100])).unwrap();
+        assert_eq!(codec.small_write_len(), None);
+
+        // With one frame per write no frame shares one, the first write aside
+        let mut codec = FramedWrite::new(Writes::default());
+        codec.set_one_frame_per_write();
+        codec.buffer(ping()).unwrap();
+        assert_eq!(codec.small_write_len(), None);
+    }
+
+    #[test]
     fn one_frame_per_write_gives_each_frame_a_write() {
         let mut cx = Context::from_waker(Waker::noop());
 

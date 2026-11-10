@@ -61,18 +61,13 @@ pub(crate) struct DynStreams<'a, B> {
     peer: peer::Dyn,
 }
 
-/// Yields to the runtime once before a small write, so that the tasks that
+/// Yields to the runtime once before a small write, so that the streams that
 /// are ready to run queue their frames and these share the write.
 ///
-/// A runtime polls the connection as soon as the first stream wakes it, on a
-/// multi-threaded one often right away. Each frame then takes a write of its
-/// own, where a single-threaded runtime writes those of all ready streams at
-/// once. Yielding to the runtime once before such a write restores that.
-///
-/// Yielding costs a pass through the runtime, which can wake another worker
-/// for it. A write that gained nothing by being held therefore lets twice as
-/// many of the next ones go at once, up to `MAX_SKIPPED`, so that streams
-/// taking turns pay for few holds.
+/// A multi-threaded runtime often polls the connection as soon as the first
+/// stream wakes it, so each frame takes a write of its own. A yield costs a
+/// pass through the runtime, so a write that gained nothing by being held
+/// lets twice as many of the next ones go at once, up to `MAX_SKIPPED`.
 #[derive(Debug, Default)]
 pub(crate) struct SmallWriteYield {
     /// Whether the connection asked to be woken when it was last polled
@@ -253,7 +248,8 @@ where
             .recv
             .clear_expired_reset_streams(&mut me.store, &mut me.counts);
 
-        // Only streams take the task between two polls.
+        // Between two polls the task is taken by whoever needs the connection
+        // to act, which is nearly always a stream that queued a frame.
         if let Some(small_write_yield) = small_write_yield {
             small_write_yield.is_woken |=
                 std::mem::take(&mut small_write_yield.is_registered) && me.actions.task.is_none();

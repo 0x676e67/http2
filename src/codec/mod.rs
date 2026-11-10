@@ -217,8 +217,8 @@ where
 
     /// Returns the size of the next write, if it could share one with
     /// frames queued a moment later.
-    pub(crate) fn small_write_len(&mut self) -> Option<usize> {
-        self.framed_write().small_write_len()
+    pub(crate) fn small_write_len(&self) -> Option<usize> {
+        self.inner.get_ref().small_write_len()
     }
 
     /// Flush buffered data to the wire
