@@ -607,9 +607,23 @@ impl<T, B> FramedWrite<T, B> {
     }
 
     /// Sets the bytes of frames gathered for one write while DATA frames are
-    /// coalesced, at least the default buffer capacity.
+    /// coalesced, from the default buffer capacity to the largest frame size.
     pub(crate) fn set_max_write_buffer_size(&mut self, val: usize) {
-        self.encoder.max_write_buffer_size = val.max(DEFAULT_BUFFER_CAPACITY);
+        self.encoder.max_write_buffer_size =
+            val.clamp(DEFAULT_BUFFER_CAPACITY, frame::MAX_MAX_FRAME_SIZE as usize);
+    }
+
+    /// Replaces a grown write buffer with nothing left to write by a default
+    /// one, if `idle`, which is only asked then.
+    pub(crate) fn release_write_buffer(&mut self, idle: impl FnOnce() -> bool) {
+        let encoder = &mut self.encoder;
+        if encoder.buf.get_ref().capacity() > DEFAULT_BUFFER_CAPACITY
+            && encoder.next.is_none()
+            && !encoder.buf.has_remaining()
+            && idle()
+        {
+            encoder.buf = Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY));
+        }
     }
 
     /// Gives each frame a write of its own once the client's initial
@@ -904,7 +918,8 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
 
         // DATA frames that fit 64 KiB are copied and share a write; the next
-        // one is chained after them and ends it. Sizes under 16 KiB are 16 KiB
+        // one is chained after them and ends it. Sizes are clamped to 16 KiB
+        // through 16 MiB
         let mut codec = FramedWrite::new(Writes::default());
         for size in [None, Some(0), Some(usize::MAX)] {
             if let Some(size) = size {
@@ -919,6 +934,19 @@ mod tests {
         assert_eq!(
             codec.get_mut().lens,
             [72_081, 8_009, 24_027, 24_027, 24_027, 8_009, 80_090]
+        );
+        assert_eq!(
+            codec.encoder.max_write_buffer_size,
+            frame::MAX_MAX_FRAME_SIZE as usize
+        );
+
+        // The grown buffer is released only once idle
+        codec.release_write_buffer(|| false);
+        assert!(codec.encoder.buf.get_ref().capacity() > DEFAULT_BUFFER_CAPACITY);
+        codec.release_write_buffer(|| true);
+        assert_eq!(
+            codec.encoder.buf.get_ref().capacity(),
+            DEFAULT_BUFFER_CAPACITY
         );
 
         // With one frame per write, frames are not coalesced, also before it

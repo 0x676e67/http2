@@ -1035,9 +1035,9 @@ impl Builder {
     /// TLS fewer records. A frame that does not fit is written with them and
     /// ends the write.
     ///
-    /// The buffer grows as needed, and keeps up to about twice this size
-    /// between writes. Values under 16 KiB are treated as 16 KiB. The default
-    /// is 64 KiB, four full TLS records ([RFC 8446 §5.1]).
+    /// The buffer grows as needed while streams are open, and returns to 16 KiB
+    /// once the connection has none. Values are clamped to 16 KiB through
+    /// 16 MiB. The default is 64 KiB, four full TLS records ([RFC 8446 §5.1]).
     ///
     /// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
     pub fn max_write_buffer_size(&mut self, max: usize) -> &mut Self {

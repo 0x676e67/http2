@@ -914,9 +914,9 @@ impl Builder {
     /// ends the write. This does not apply with [`max_send_data_frame_size`] or
     /// [`one_frame_per_write`], whose frames keep writes of their own.
     ///
-    /// The buffer grows as needed, and keeps up to about twice this size
-    /// between writes. Values under 16 KiB are treated as 16 KiB. The default
-    /// is 64 KiB, four full TLS records ([RFC 8446 §5.1]).
+    /// The buffer grows as needed while streams are open, and returns to 16 KiB
+    /// once the connection has none. Values are clamped to 16 KiB through
+    /// 16 MiB. The default is 64 KiB, four full TLS records ([RFC 8446 §5.1]).
     ///
     /// [`max_send_data_frame_size`]: Self::max_send_data_frame_size
     /// [`one_frame_per_write`]: Self::one_frame_per_write

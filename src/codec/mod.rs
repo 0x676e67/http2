@@ -120,6 +120,12 @@ impl<T, B> Codec<T, B> {
         self.framed_write().set_max_write_buffer_size(val)
     }
 
+    /// Replaces a grown write buffer with nothing left to write by a default
+    /// one, if `idle`.
+    pub(crate) fn release_write_buffer(&mut self, idle: impl FnOnce() -> bool) {
+        self.framed_write().release_write_buffer(idle)
+    }
+
     /// Gives each sent frame a write of its own after the initial write.
     pub(crate) fn set_one_frame_per_write(&mut self) {
         self.framed_write().set_one_frame_per_write()
