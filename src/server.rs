@@ -255,6 +255,9 @@ pub struct Builder {
     /// Maximum amount of bytes to "buffer" for writing per stream.
     max_send_buffer_size: usize,
 
+    /// Bytes of frames gathered for one write while DATA frames are coalesced.
+    max_write_buffer_size: Option<usize>,
+
     /// Maximum number of locally reset streams due to protocol error across
     /// the lifetime of the connection.
     ///
@@ -406,6 +409,10 @@ where
 
         if let Some(max) = builder.settings.max_header_list_size() {
             codec.set_max_recv_header_list_size(max as usize);
+        }
+
+        if let Some(max) = builder.max_write_buffer_size {
+            codec.set_max_write_buffer_size(max);
         }
 
         // Send initial settings frame.
@@ -683,6 +690,7 @@ impl Builder {
             settings: Settings::default(),
             initial_target_connection_window_size: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
+            max_write_buffer_size: None,
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             data_frame_budget: proto::DataFrameBudget::Auto,
         }
@@ -1017,6 +1025,23 @@ impl Builder {
     /// The default is currently ~400KB, but may change.
     pub fn max_send_buffer_size(&mut self, max: usize) -> &mut Self {
         self.max_send_buffer_size = max;
+        self
+    }
+
+    /// Sets how many bytes of frames are gathered for one write.
+    ///
+    /// DATA frames that fit are copied into the write buffer after the frames
+    /// queued before them, so frames of many streams share one write, and with
+    /// TLS fewer records. A frame that does not fit is written with them and
+    /// ends the write.
+    ///
+    /// The buffer grows as needed while streams are open, and returns to 16 KiB
+    /// once the connection has none. Values are clamped to 16 KiB through
+    /// 16 MiB. The default is 64 KiB, four full TLS records ([RFC 8446 §5.1]).
+    ///
+    /// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
+    pub fn max_write_buffer_size(&mut self, max: usize) -> &mut Self {
+        self.max_write_buffer_size = Some(max);
         self
     }
 

@@ -551,6 +551,10 @@ where
                                 continue;
                             }
 
+                            // An idle connection keeps no grown write buffer.
+                            self.codec
+                                .release_write_buffer(|| !self.inner.streams.has_streams());
+
                             return Poll::Pending;
                         }
                     };

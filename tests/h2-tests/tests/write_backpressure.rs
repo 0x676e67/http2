@@ -594,9 +594,10 @@ async fn close_while_blocked(close: Close) {
             let (_request, mut respond) = conn.next().await.unwrap().unwrap();
             let mut stream = respond.send_response(Response::new(()), false).unwrap();
             if !matches!(close, Close::AbruptFlush) {
-                // Within the initial window, so stream 1 can end.
+                // The initial window, so stream 1 can end, and the frames
+                // fill the write buffer.
                 stream
-                    .send_data(Bytes::from_static(&[0; 16 * 1024]), true)
+                    .send_data(Bytes::from_static(&[0; 65_535]), true)
                     .unwrap();
             }
 

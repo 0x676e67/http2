@@ -65,6 +65,9 @@ struct Encoder<B> {
     /// Whether each frame takes a write of its own
     one_frame_per_write: OneFramePerWrite,
 
+    /// Bytes of frames gathered for one write while DATA frames are coalesced
+    max_write_buffer_size: usize,
+
     /// Chain payloads bigger than this.
     chain_threshold: usize,
 
@@ -94,9 +97,11 @@ enum Next<B> {
 /// frame that big.
 const DEFAULT_BUFFER_CAPACITY: usize = 16 * 1_024;
 
-/// A write buffer grown past this, as a header block buffered whole can grow
-/// it, is replaced by a default one once written.
-const MAX_IDLE_BUFFER_CAPACITY: usize = 4 * DEFAULT_BUFFER_CAPACITY;
+/// Bytes of frames gathered for one write while DATA frames are coalesced:
+/// four full TLS records of 2^14 bytes ([RFC 8446 §5.1]).
+///
+/// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
+const DEFAULT_MAX_WRITE_BUFFER_SIZE: usize = 64 * 1_024;
 
 /// Returns the bytes the write buffer still takes, counted within its default
 /// capacity, so a grown buffer takes no more than a default one.
@@ -158,6 +163,7 @@ where
                 vectored,
                 max_header_frame_size: None,
                 one_frame_per_write: OneFramePerWrite::Off,
+                max_write_buffer_size: DEFAULT_MAX_WRITE_BUFFER_SIZE,
                 chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
             },
@@ -315,7 +321,7 @@ where
         // Clear internal buffer
         self.buf.set_position(0);
         self.buf.get_mut().clear();
-        if self.buf.get_ref().capacity() > MAX_IDLE_BUFFER_CAPACITY {
+        if self.buf.get_ref().capacity() > self.max_idle_capacity() {
             *self.buf.get_mut() = BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY);
         }
 
@@ -367,7 +373,11 @@ where
                 let capped = self.max_data_frame_size.is_some();
                 let alone = capped || self.one_frame_per_write == OneFramePerWrite::On;
 
-                if len >= self.chain_threshold || alone {
+                // Otherwise a frame that fits is copied, so frames of many
+                // streams share one write
+                let copied = self.coalesces() && frame::HEADER_LEN + len <= self.room();
+
+                if !copied && (len >= self.chain_threshold || alone) {
                     let head = v.head();
                     let at = self.buf.get_ref().len();
 
@@ -507,11 +517,41 @@ where
             && self.has_room_after(len)
     }
 
-    /// A grown buffer takes no more bytes ahead of a frame than a default
-    /// one, so a frame copied whole after them grows it at most once.
+    /// A grown buffer takes no more bytes ahead of a frame than
+    /// `write_buffer_size`, so a frame copied whole after them grows it at
+    /// most once.
     fn has_room_after(&self, len: usize) -> bool {
-        self.next.is_none()
-            && buffer_room(self.buf.get_ref()) >= self.min_buffer_capacity.saturating_add(len)
+        self.next.is_none() && self.room() >= self.min_buffer_capacity.saturating_add(len)
+    }
+
+    /// Whether DATA frames that fit are copied to share a write: neither a cap
+    /// nor one frame per write, set or waiting for the initial write, applies.
+    fn coalesces(&self) -> bool {
+        self.max_data_frame_size.is_none() && self.one_frame_per_write == OneFramePerWrite::Off
+    }
+
+    /// Bytes of frames gathered for one write.
+    fn write_buffer_size(&self) -> usize {
+        if self.coalesces() {
+            self.max_write_buffer_size
+        } else {
+            DEFAULT_BUFFER_CAPACITY
+        }
+    }
+
+    /// Bytes the buffer still takes for this write.
+    fn room(&self) -> usize {
+        self.write_buffer_size()
+            .saturating_sub(self.buf.get_ref().len())
+    }
+
+    /// A buffer grown past this is replaced by a default one once written. A
+    /// header block or a frame copied whole adds up to a default buffer past
+    /// `write_buffer_size`, and growth at most doubles that.
+    fn max_idle_capacity(&self) -> usize {
+        self.write_buffer_size()
+            .saturating_add(DEFAULT_BUFFER_CAPACITY)
+            .saturating_mul(2)
     }
 }
 
@@ -564,6 +604,26 @@ impl<T, B> FramedWrite<T, B> {
     pub(crate) fn set_max_header_frame_size(&mut self, val: usize) {
         self.encoder.max_header_frame_size =
             Some(val.clamp(MIN_HEADER_FRAME_SIZE, frame::MAX_MAX_FRAME_SIZE as usize) as FrameSize);
+    }
+
+    /// Sets the bytes of frames gathered for one write while DATA frames are
+    /// coalesced, from the default buffer capacity to the largest frame size.
+    pub(crate) fn set_max_write_buffer_size(&mut self, val: usize) {
+        self.encoder.max_write_buffer_size =
+            val.clamp(DEFAULT_BUFFER_CAPACITY, frame::MAX_MAX_FRAME_SIZE as usize);
+    }
+
+    /// Replaces a grown write buffer with nothing left to write by a default
+    /// one, if `idle`, which is only asked then.
+    pub(crate) fn release_write_buffer(&mut self, idle: impl FnOnce() -> bool) {
+        let encoder = &mut self.encoder;
+        if encoder.buf.get_ref().capacity() > DEFAULT_BUFFER_CAPACITY
+            && encoder.next.is_none()
+            && !encoder.buf.has_remaining()
+            && idle()
+        {
+            encoder.buf = Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY));
+        }
     }
 
     /// Gives each frame a write of its own once the client's initial
@@ -753,9 +813,8 @@ mod tests {
 
     #[test]
     fn capped_data_frames_take_a_write_of_their_own() {
-        // Without a cap, frames under 256 bytes are copied and share the write
-        // of the frames around them, and a chained frame shares the write of
-        // the frames before it
+        // Without a cap, frames that fit are copied and share the write of the
+        // frames around them
         let mut codec = FramedWrite::new(Writes::default());
         send(&mut codec, [ping(), data(&[100]), ping(), data(&[16_375])]);
         assert_eq!(codec.get_mut().lens, [16_527]);
@@ -780,9 +839,9 @@ mod tests {
         assert_eq!(lens[..3], [10, 7, 10]);
         assert_eq!(lens.iter().sum::<usize>(), 17 + 9 + 16_375);
 
-        // Plain writes chain an uncapped frame as before. With a cap they
-        // split the same way, and the frame is copied whole, growing the
-        // buffer, so it still takes one write
+        // Plain writes copy an uncapped frame that fits. With a cap they split
+        // as before, and the frame is copied whole, growing the buffer, so it
+        // still takes one write
         let mut codec = FramedWrite::new(Writes {
             plain: true,
             ..Writes::default()
@@ -790,7 +849,7 @@ mod tests {
         send(&mut codec, [data(&[16_375])]);
         codec.set_max_data_frame_size(16_375);
         send(&mut codec, [ping(), data(&[16_375])]);
-        assert_eq!(codec.get_mut().lens, [1_024, 15_360, 17, 16_384]);
+        assert_eq!(codec.get_mut().lens, [16_384, 17, 16_384]);
 
         // The grown buffer takes no more bytes ahead of a frame than a
         // default one
@@ -855,6 +914,50 @@ mod tests {
     }
 
     #[test]
+    fn data_frames_share_a_write_up_to_max_write_buffer_size() {
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // DATA frames that fit 64 KiB are copied and share a write; the next
+        // one is chained after them and ends it. Sizes are clamped to 16 KiB
+        // through 16 MiB
+        let mut codec = FramedWrite::new(Writes::default());
+        for size in [None, Some(0), Some(usize::MAX)] {
+            if let Some(size) = size {
+                codec.set_max_write_buffer_size(size);
+            }
+            for _ in 0..10 {
+                assert!(codec.poll_ready(&mut cx).is_ready());
+                codec.buffer(data(&[8_000])).unwrap();
+            }
+            send(&mut codec, []);
+        }
+        assert_eq!(
+            codec.get_mut().lens,
+            [72_081, 8_009, 24_027, 24_027, 24_027, 8_009, 80_090]
+        );
+        assert_eq!(
+            codec.encoder.max_write_buffer_size,
+            frame::MAX_MAX_FRAME_SIZE as usize
+        );
+
+        // The grown buffer is released only once idle
+        codec.release_write_buffer(|| false);
+        assert!(codec.encoder.buf.get_ref().capacity() > DEFAULT_BUFFER_CAPACITY);
+        codec.release_write_buffer(|| true);
+        assert_eq!(
+            codec.encoder.buf.get_ref().capacity(),
+            DEFAULT_BUFFER_CAPACITY
+        );
+
+        // With one frame per write, frames are not coalesced, also before it
+        // starts
+        let mut codec = FramedWrite::new(Writes::default());
+        codec.set_one_frame_per_write();
+        codec.buffer(data(&[8_000])).unwrap();
+        assert!(!codec.has_capacity());
+    }
+
+    #[test]
     fn one_frame_per_write_gives_each_frame_a_write() {
         let mut cx = Context::from_waker(Waker::noop());
 
@@ -877,7 +980,7 @@ mod tests {
             assert!(!codec.has_capacity());
         }
         send(&mut codec, []);
-        assert!(codec.encoder.buf.get_ref().capacity() <= MAX_IDLE_BUFFER_CAPACITY);
+        assert!(codec.encoder.buf.get_ref().capacity() <= codec.encoder.max_idle_capacity());
 
         // A frame can still follow another before the write, as a preface
         // PING precedes DATA; the DATA frame then starts its own write, also
