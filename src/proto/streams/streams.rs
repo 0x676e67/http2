@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     fmt, io,
     sync::{
         Arc,
@@ -108,7 +107,7 @@ struct Shared {
 
     /// What handles left to do under the lock when they found it held, in
     /// the order they left it.
-    deferred: Mutex<VecDeque<Deferred>>,
+    deferred: Mutex<Vec<Deferred>>,
 
     /// Whether `deferred` may hold anything, to check without its lock
     has_deferred: AtomicBool,
@@ -160,6 +159,10 @@ struct Inner {
 
     /// The number of stream refs to this shared state.
     refs: usize,
+
+    /// Buffer of the changes a holder of the lock runs for the handles that
+    /// left them, empty in between.
+    deferred: Vec<Deferred>,
 
     /// Connection-level request `HEADERS` priority rules
     headers_priority_policy: HeadersPriorityPolicy,
@@ -540,7 +543,6 @@ impl<B> DynStreams<'_, B> {
 
     pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), Error> {
         let mut me = self.inner.lock();
-
         me.recv_data(self.peer, self.send_buffer, frame)
     }
 
@@ -617,6 +619,7 @@ impl Inner {
             },
             store: Store::new(),
             refs: 1,
+            deferred: Vec::new(),
             headers_priority_policy: config.headers_priority_policy,
             headers_pseudo_order: config.headers_pseudo_order,
         }
@@ -1133,12 +1136,13 @@ impl Inner {
         // this requires a bit of indirection to make the borrow checker happy.
         let child_key: Option<store::Key> = {
             // Create state for the stream
-            let stream = Stream::new(
-                promised_id,
-                self.actions.send.init_window_sz(),
-                self.actions.recv.init_window_sz(),
-            );
-            let stream = self.store.insert(promised_id, stream);
+            let stream = self.store.insert(promised_id, {
+                Stream::new(
+                    promised_id,
+                    self.actions.send.init_window_sz(),
+                    self.actions.recv.init_window_sz(),
+                )
+            });
 
             let actions = &mut self.actions;
 
@@ -1630,12 +1634,14 @@ impl<B> StreamRef<B> {
         let promised_id = actions.send.reserve_local()?;
 
         let child_key = {
-            let child_stream = Stream::new(
+            let mut child_stream = me.store.insert(
                 promised_id,
-                actions.send.init_window_sz(),
-                actions.recv.init_window_sz(),
+                Stream::new(
+                    promised_id,
+                    actions.send.init_window_sz(),
+                    actions.recv.init_window_sz(),
+                ),
             );
-            let mut child_stream = me.store.insert(promised_id, child_stream);
             child_stream.state.reserve_local()?;
             child_stream.is_pending_push = true;
             child_stream.key()
@@ -1883,19 +1889,10 @@ impl OpaqueStreamRef {
 
 impl fmt::Debug for OpaqueStreamRef {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        match self.handle.inner.inner.try_lock() {
-            Some(me) => {
-                let stream = &me.store[self.handle.key];
-                fmt.debug_struct("OpaqueStreamRef")
-                    .field("stream_id", &stream.id)
-                    .field("ref_count", &stream.ref_count)
-                    .finish()
-            }
-            None => fmt
-                .debug_struct("OpaqueStreamRef")
-                .field("inner", &"<Locked>")
-                .finish(),
-        }
+        fmt.debug_struct("OpaqueStreamRef")
+            .field("stream_id", &self.stream_id())
+            .field("ref_count", &Arc::strong_count(&self.handle))
+            .finish()
     }
 }
 
@@ -1934,7 +1931,7 @@ impl Shared {
     fn new(inner: Inner) -> Self {
         Shared {
             inner: Mutex::new(inner),
-            deferred: Mutex::new(VecDeque::new()),
+            deferred: Mutex::new(Vec::new()),
             has_deferred: AtomicBool::new(false),
             conn_task: AtomicWaker::new(),
             is_contended: AtomicBool::new(false),
@@ -1983,7 +1980,7 @@ impl Shared {
         }
 
         let mut queue = self.deferred.lock();
-        queue.push_back(deferred);
+        queue.push(deferred);
         self.has_deferred.store(true, Ordering::Release);
         drop(queue);
 
@@ -2001,21 +1998,19 @@ impl Shared {
 
     #[cold]
     fn run_deferred_slow(&self, me: &mut Inner) {
-        loop {
-            let deferred = {
-                let mut queue = self.deferred.lock();
-                let deferred = queue.pop_front();
-                if deferred.is_none() {
-                    self.has_deferred.store(false, Ordering::Release);
-                }
-                deferred
-            };
-
-            match deferred {
-                Some(deferred) => me.run(deferred),
-                None => return,
-            }
+        // Only what was left by now, so that handles leaving more do not keep
+        // this holder: each of those wakes the connection for its own.
+        let mut deferred = std::mem::take(&mut me.deferred);
+        {
+            let mut queue = self.deferred.lock();
+            std::mem::swap(&mut *queue, &mut deferred);
+            self.has_deferred.store(false, Ordering::Release);
         }
+
+        for deferred in deferred.drain(..) {
+            me.run(deferred);
+        }
+        me.deferred = deferred;
     }
 
     /// Records, once the connection has failed or run out of stream IDs, that
@@ -2193,7 +2188,15 @@ mod tests {
     use super::*;
     use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
     use crate::proto::{DEFAULT_DATA_FRAME_BUDGET, DataFrameBudget};
-    use std::time::Duration;
+    use std::{task::Wake, time::Duration};
+
+    struct Woken(AtomicBool);
+
+    impl Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
 
     fn config() -> Config {
         Config {
@@ -2216,7 +2219,8 @@ mod tests {
 
     #[test]
     fn changes_left_under_the_lock_run_in_order_for_its_next_holder() {
-        let shared = Shared::new(Inner::new(peer::Dyn::Client, config()));
+        let mut streams = Streams::<Bytes, crate::client::Peer>::new(config());
+        let shared = streams.inner.clone();
         let id = StreamId::from(1);
         let key = shared
             .lock()
@@ -2225,20 +2229,36 @@ mod tests {
             .key();
         let requested = |me: &mut Inner| me.store.resolve(key).requested_send_capacity;
 
+        let conn_task = Arc::new(Woken(AtomicBool::new(false)));
+        let waker = Waker::from(conn_task.clone());
+        let is_woken = || conn_task.0.swap(false, Ordering::Relaxed);
+        streams.leave_poll(&Context::from_waker(&waker));
+
         // With the lock free, a change is made at once.
         shared.defer(Deferred::ReserveCapacity(key, 1));
         assert_eq!(requested(&mut shared.lock()), 1);
+        assert!(!is_woken() && shared.wake_scope().is_none());
 
-        // With the lock held, changes wait without blocking their caller.
+        // With the lock held, changes wait without blocking their caller, and
+        // wake the connection in case no one else takes the lock.
         let mut me = shared.lock();
         shared.defer(Deferred::ReserveCapacity(key, 5));
         shared.defer(Deferred::ReserveCapacity(key, 3));
         assert_eq!(requested(&mut me), 1);
+        assert!(is_woken() && shared.wake_scope().is_some());
         drop(me);
 
         // The next holder finds both made, the later one last.
-        let mut me = shared.lock();
-        assert_eq!(requested(&mut me), 3);
+        assert_eq!(requested(&mut shared.lock()), 3);
+
+        // A change left while the connection is polled is made as its poll
+        // ends, here seen under the bare lock, which runs nothing.
+        let me = shared.inner.lock();
+        shared.defer(Deferred::ReserveCapacity(key, 7));
+        drop(me);
+        streams.leave_poll(&Context::from_waker(&waker));
+        let mut me = shared.inner.lock();
+        assert_eq!(requested(&mut me), 7);
 
         let mut stream = me.store.resolve(key);
         stream.unlink();

@@ -5,7 +5,7 @@
 //! - Without the feature, [`std::sync::Mutex`] is used, with poisoning ignored.
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     fmt,
     marker::PhantomData,
     ops::{Deref, DerefMut},
@@ -28,8 +28,9 @@ thread_local! {
     /// without a destructor is read at no more than the cost of a static.
     static PENDING: Cell<usize> = const { Cell::new(0) };
 
-    /// Wakers held back until the thread leaves its scopes.
-    static DEFERRED: RefCell<Vec<Waker>> = const { RefCell::new(Vec::new()) };
+    /// Wakers held back until the thread leaves its scopes. Taken out to be
+    /// changed, so that nothing is borrowed while a waker runs.
+    static DEFERRED: Cell<Vec<Waker>> = const { Cell::new(Vec::new()) };
 }
 
 /// A `Mutex` that never poisons.
@@ -60,9 +61,9 @@ pub(super) fn defer_wake(waker: Waker) {
     let mut waker = Some(waker);
     // Fails only for a thread that is running its destructors.
     let _ = DEFERRED.try_with(|deferred| {
-        if let Ok(mut deferred) = deferred.try_borrow_mut() {
-            deferred.extend(waker.take());
-        }
+        let mut wakers = deferred.take();
+        wakers.extend(waker.take());
+        deferred.set(wakers);
     });
 
     match waker {
@@ -180,22 +181,18 @@ impl Drop for WakeScope {
 fn wake_deferred() {
     PENDING.set(0);
 
-    let Ok(mut wakers) = DEFERRED.try_with(|deferred| std::mem::take(&mut *deferred.borrow_mut()))
-    else {
+    let Ok(mut wakers) = DEFERRED.try_with(Cell::take) else {
         return;
     };
 
-    // A waker may enter a scope of its own, so the thread's buffer is not
-    // borrowed while it runs.
     for waker in wakers.drain(..) {
         waker.wake();
     }
 
+    // A waker may have deferred others in a scope of its own, which stay.
     let _ = DEFERRED.try_with(|deferred| {
-        let mut deferred = deferred.borrow_mut();
-        if deferred.capacity() == 0 {
-            *deferred = wakers;
-        }
+        let newer = deferred.take();
+        deferred.set(if newer.capacity() == 0 { wakers } else { newer });
     });
 }
 
