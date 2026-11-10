@@ -256,7 +256,7 @@ pub struct Builder {
     max_send_buffer_size: usize,
 
     /// Whether a small write waits for the streams that are ready to send.
-    coalesce_writes: bool,
+    yield_before_small_writes: bool,
 
     /// Bytes of frames gathered for one write while DATA frames are coalesced.
     max_write_buffer_size: Option<usize>,
@@ -693,7 +693,7 @@ impl Builder {
             settings: Settings::default(),
             initial_target_connection_window_size: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
-            coalesce_writes: false,
+            yield_before_small_writes: false,
             max_write_buffer_size: None,
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             data_frame_budget: proto::DataFrameBudget::Auto,
@@ -1041,8 +1041,8 @@ impl Builder {
     /// of less than 1,024 bytes that a stream woke it for. Other tasks that
     /// are ready run first, which delays such a write by as long as they take.
     /// Disabled by default.
-    pub fn coalesce_writes(&mut self, enabled: bool) -> &mut Self {
-        self.coalesce_writes = enabled;
+    pub fn yield_before_small_writes(&mut self, enabled: bool) -> &mut Self {
+        self.yield_before_small_writes = enabled;
         self
     }
 
@@ -1616,7 +1616,7 @@ where
                             priorities: None,
                             preface_ping: None,
                             preface_ping_timeout: None,
-                            coalesce_writes: self.builder.coalesce_writes,
+                            yield_before_small_writes: self.builder.yield_before_small_writes,
                         },
                     );
 

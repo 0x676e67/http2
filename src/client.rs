@@ -346,7 +346,7 @@ pub struct Builder {
     one_frame_per_write: bool,
 
     /// Whether a small write waits for the streams that are ready to send.
-    coalesce_writes: bool,
+    yield_before_small_writes: bool,
 
     /// Bytes of frames gathered for one write while DATA frames are coalesced.
     max_write_buffer_size: Option<usize>,
@@ -707,7 +707,7 @@ impl Builder {
             max_send_data_frame_size: None,
             max_send_header_frame_size: None,
             one_frame_per_write: false,
-            coalesce_writes: false,
+            yield_before_small_writes: false,
             max_write_buffer_size: None,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
@@ -920,8 +920,8 @@ impl Builder {
     /// are ready run first, which delays such a write by as long as they take.
     /// It has no effect with [`one_frame_per_write`](Self::one_frame_per_write).
     /// Disabled by default.
-    pub fn coalesce_writes(&mut self, enabled: bool) -> &mut Self {
-        self.coalesce_writes = enabled;
+    pub fn yield_before_small_writes(&mut self, enabled: bool) -> &mut Self {
+        self.yield_before_small_writes = enabled;
         self
     }
 
@@ -1743,7 +1743,7 @@ where
                 priorities: builder.priorities,
                 preface_ping: builder.preface_ping,
                 preface_ping_timeout: builder.preface_ping_timeout,
-                coalesce_writes: builder.coalesce_writes,
+                yield_before_small_writes: builder.yield_before_small_writes,
             },
         );
         let send_request = SendRequest {

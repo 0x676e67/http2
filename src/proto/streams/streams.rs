@@ -67,8 +67,8 @@ pub(crate) struct DynStreams<'a, B> {
     peer: peer::Dyn,
 }
 
-/// Holds a small write back until the tasks that are ready to run have
-/// queued their frames, so that these share the write.
+/// Yields to the runtime once before a small write, so that the tasks that
+/// are ready to run queue their frames and these share the write.
 ///
 /// A runtime polls the connection as soon as the first stream wakes it, on a
 /// multi-threaded one often right away. Each frame then takes a write of its
@@ -80,7 +80,7 @@ pub(crate) struct DynStreams<'a, B> {
 /// many of the next ones go at once, up to `MAX_SKIPPED`, so that streams
 /// taking turns pay for few holds.
 #[derive(Debug, Default)]
-pub(crate) struct Coalesce {
+pub(crate) struct SmallWriteYield {
     /// Whether the connection asked to be woken when it was last polled
     is_registered: bool,
     /// Whether a stream has woken the connection since
@@ -330,7 +330,7 @@ where
     }
 
     /// Does what is due when a poll starts receiving, under one lock.
-    pub fn start_poll(&mut self, coalesce: Option<&mut Coalesce>) {
+    pub fn start_poll(&mut self, small_write_yield: Option<&mut SmallWriteYield>) {
         let mut me = self.inner.lock();
         let me = &mut *me;
         me.actions
@@ -338,9 +338,9 @@ where
             .clear_expired_reset_streams(&mut me.store, &mut me.counts);
 
         // Only streams take the task between two polls.
-        if let Some(coalesce) = coalesce {
-            coalesce.is_woken |=
-                std::mem::take(&mut coalesce.is_registered) && me.actions.task.is_none();
+        if let Some(small_write_yield) = small_write_yield {
+            small_write_yield.is_woken |=
+                std::mem::take(&mut small_write_yield.is_registered) && me.actions.task.is_none();
         }
     }
 
@@ -349,7 +349,7 @@ where
         cx: &mut Context,
         dst: &mut Codec<T, Prioritized<B>>,
         mut preface_ping: Option<&mut PrefacePing>,
-        mut coalesce: Option<&mut Coalesce>,
+        mut small_write_yield: Option<&mut SmallWriteYield>,
     ) -> Poll<io::Result<()>>
     where
         T: AsyncWrite + Unpin,
@@ -369,8 +369,8 @@ where
                 // flushed will then take and wake this task.
                 if status == BufferStatus::Complete {
                     me.actions.task = Some(cx.waker().clone());
-                    if let Some(coalesce) = coalesce.as_deref_mut() {
-                        coalesce.is_registered = true;
+                    if let Some(small_write_yield) = small_write_yield.as_deref_mut() {
+                        small_write_yield.is_registered = true;
                     }
                 }
 
@@ -388,8 +388,8 @@ where
             }
 
             // Let the streams that are ready to run add to a small write.
-            if let Some(coalesce) = coalesce.as_deref_mut()
-                && coalesce.holds(dst.small_write_len())
+            if let Some(small_write_yield) = small_write_yield.as_deref_mut()
+                && small_write_yield.holds(dst.small_write_len())
             {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
@@ -1550,9 +1550,9 @@ where
     }
 }
 
-// ===== impl Coalesce =====
+// ===== impl SmallWriteYield =====
 
-impl Coalesce {
+impl SmallWriteYield {
     /// Most writes let go at once after one that gained nothing by being held.
     const MAX_SKIPPED: u8 = 63;
 
@@ -2366,37 +2366,37 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_holds_small_stream_writes_once_and_backs_off() {
-        let mut coalesce = Coalesce::default();
-        let write = |coalesce: &mut Coalesce, is_woken, len| {
-            coalesce.is_woken = is_woken;
-            coalesce.holds(len)
+    fn small_stream_writes_are_held_once_and_back_off() {
+        let mut small_write_yield = SmallWriteYield::default();
+        let write = |small_write_yield: &mut SmallWriteYield, is_woken, len| {
+            small_write_yield.is_woken = is_woken;
+            small_write_yield.holds(len)
         };
 
         // Only a small write that a stream woke the connection for is held.
-        assert!(!write(&mut coalesce, false, Some(10)));
-        assert!(!write(&mut coalesce, true, None));
-        assert!(write(&mut coalesce, true, Some(10)));
+        assert!(!write(&mut small_write_yield, false, Some(10)));
+        assert!(!write(&mut small_write_yield, true, None));
+        assert!(write(&mut small_write_yield, true, Some(10)));
         // It goes out when polled again, having gained a frame here.
-        assert!(!write(&mut coalesce, true, Some(20)));
-        assert!(write(&mut coalesce, true, Some(10)));
+        assert!(!write(&mut small_write_yield, true, Some(20)));
+        assert!(write(&mut small_write_yield, true, Some(10)));
 
         // A write that gained nothing lets the next one go at once, then
         // three, and so on: `holds` are the writes held out of twelve.
-        assert!(!write(&mut coalesce, false, Some(10)));
+        assert!(!write(&mut small_write_yield, false, Some(10)));
         let mut holds = Vec::new();
         for n in 0..12 {
-            if write(&mut coalesce, true, Some(10)) {
+            if write(&mut small_write_yield, true, Some(10)) {
                 holds.push(n);
-                assert!(!write(&mut coalesce, false, Some(10)));
+                assert!(!write(&mut small_write_yield, false, Some(10)));
             }
         }
         assert_eq!(holds, [1, 5]);
 
         // One that gains again ends the backoff.
-        coalesce.skip = 0;
-        assert!(write(&mut coalesce, true, Some(10)));
-        assert!(!write(&mut coalesce, true, None));
-        assert!(write(&mut coalesce, true, Some(10)));
+        small_write_yield.skip = 0;
+        assert!(write(&mut small_write_yield, true, Some(10)));
+        assert!(!write(&mut small_write_yield, true, None));
+        assert!(write(&mut small_write_yield, true, Some(10)));
     }
 }

@@ -60,10 +60,10 @@ fn frame_count(mut write: &[u8]) -> usize {
 
 /// Sends two requests on a connection that waits to be woken, polling it
 /// after each as a runtime would, and returns the frames in each write.
-fn request_writes(coalesce: bool) -> (Vec<usize>, usize) {
+fn request_writes(yields: bool) -> (Vec<usize>, usize) {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let (mut send_request, mut connection) = client::Builder::new()
-        .coalesce_writes(coalesce)
+        .yield_before_small_writes(yields)
         .handshake::<_, Bytes>(Writes(writes.clone()))
         .now_or_never()
         .expect("handshake attempted transport I/O")

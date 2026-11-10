@@ -234,7 +234,7 @@ fn concurrent_streams_on_worker_threads_all_finish() {
         .build()
         .unwrap();
 
-    for coalesce in [false, true] {
+    for yields in [false, true] {
         rt.block_on(async {
             let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
                 .await
@@ -246,7 +246,7 @@ fn concurrent_streams_on_worker_threads_all_finish() {
                 socket.set_nodelay(true).unwrap();
                 // The limits on resets are not what this is after.
                 let mut conn = server::Builder::new()
-                    .coalesce_writes(coalesce)
+                    .yield_before_small_writes(yields)
                     .max_pending_accept_reset_streams(usize::MAX)
                     .max_local_error_reset_streams(None)
                     .handshake::<_, Bytes>(socket)
@@ -263,7 +263,7 @@ fn concurrent_streams_on_worker_threads_all_finish() {
             let tcp = TcpStream::connect(addr).await.unwrap();
             tcp.set_nodelay(true).unwrap();
             let (client, conn) = client::Builder::new()
-                .coalesce_writes(coalesce)
+                .yield_before_small_writes(yields)
                 .max_local_error_reset_streams(None)
                 .handshake::<_, Bytes>(tcp)
                 .await

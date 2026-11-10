@@ -125,9 +125,9 @@ const CHAIN_THRESHOLD: usize = 256;
 /// fragmented data being sent, and hereby improve the throughput.
 const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
 
-/// Buffered bytes from which a write is not held back for more frames, when
-/// writes are coalesced.
-const MIN_COALESCED_WRITE: usize = 1024;
+/// Buffered bytes below which a write is small: the connection can yield
+/// before it, so that more frames share it.
+const SMALL_WRITE_LIMIT: usize = 1024;
 
 /// Max slices `poll_write_buf` passes to one vectored write (tokio-util's
 /// private `MAX_BUFS`).
@@ -516,7 +516,7 @@ where
 
         (self.next.is_none()
             && self.one_frame_per_write == OneFramePerWrite::Off
-            && (1..MIN_COALESCED_WRITE).contains(&len))
+            && (1..SMALL_WRITE_LIMIT).contains(&len))
         .then_some(len)
     }
 
