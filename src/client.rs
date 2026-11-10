@@ -348,6 +348,9 @@ pub struct Builder {
     /// Whether a small write waits for the streams that are ready to send.
     coalesce_writes: bool,
 
+    /// Bytes of frames gathered for one write while DATA frames are coalesced.
+    max_write_buffer_size: Option<usize>,
+
     /// Maximum number of locally reset streams to keep at a time.
     reset_stream_max: usize,
 
@@ -705,6 +708,7 @@ impl Builder {
             max_send_header_frame_size: None,
             one_frame_per_write: false,
             coalesce_writes: false,
+            max_write_buffer_size: None,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
             pending_accept_reset_stream_max: proto::DEFAULT_REMOTE_RESET_STREAM_MAX,
@@ -918,6 +922,26 @@ impl Builder {
     /// Disabled by default.
     pub fn coalesce_writes(&mut self, enabled: bool) -> &mut Self {
         self.coalesce_writes = enabled;
+        self
+    }
+
+    /// Sets how many bytes of frames are gathered for one write.
+    ///
+    /// DATA frames that fit are copied into the write buffer after the frames
+    /// queued before them, so frames of many streams share one write, and with
+    /// TLS fewer records. A frame that does not fit is written with them and
+    /// ends the write. This does not apply with [`max_send_data_frame_size`] or
+    /// [`one_frame_per_write`], whose frames keep writes of their own.
+    ///
+    /// The buffer grows as needed while streams are open, and returns to 16 KiB
+    /// once the connection has none. Values are clamped to 16 KiB through
+    /// 16 MiB. The default is 64 KiB, four full TLS records ([RFC 8446 §5.1]).
+    ///
+    /// [`max_send_data_frame_size`]: Self::max_send_data_frame_size
+    /// [`one_frame_per_write`]: Self::one_frame_per_write
+    /// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
+    pub fn max_write_buffer_size(&mut self, max: usize) -> &mut Self {
+        self.max_write_buffer_size = Some(max);
         self
     }
 
@@ -1685,6 +1709,10 @@ where
 
         if builder.one_frame_per_write {
             codec.set_one_frame_per_write();
+        }
+
+        if let Some(max) = builder.max_write_buffer_size {
+            codec.set_max_write_buffer_size(max);
         }
 
         if let Some(max) = builder.settings.max_header_list_size() {

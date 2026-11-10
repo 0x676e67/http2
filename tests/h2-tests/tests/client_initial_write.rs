@@ -614,10 +614,13 @@ async fn large_initial_priority_block_resumes_before_read_without_flush() {
 
     let (io, calls, write_blocked, blocked_waker) =
         recording_io(WriteMode::PartialThenPending, Bytes::new());
+    // The block exceeds a 16 KiB write buffer, so the resumed write takes
+    // more than one write.
     let mut builder = client::Builder::new();
     builder
         .initial_stream_id(PRIORITY_COUNT * 2 + 1)
-        .priorities(priorities);
+        .priorities(priorities)
+        .max_write_buffer_size(16 * 1024);
 
     let (send_request, mut connection) = builder
         .handshake::<_, Bytes>(io)
