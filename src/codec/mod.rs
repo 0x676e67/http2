@@ -114,6 +114,12 @@ impl<T, B> Codec<T, B> {
         self.framed_write().set_max_header_frame_size(val)
     }
 
+    /// Sets the bytes of frames gathered for one write while DATA frames are
+    /// coalesced.
+    pub(crate) fn set_max_write_buffer_size(&mut self, val: usize) {
+        self.framed_write().set_max_write_buffer_size(val)
+    }
+
     /// Gives each sent frame a write of its own after the initial write.
     pub(crate) fn set_one_frame_per_write(&mut self) {
         self.framed_write().set_one_frame_per_write()

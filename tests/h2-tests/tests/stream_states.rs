@@ -1589,7 +1589,11 @@ async fn send_err_with_buffered_data() {
         srv.send_frame(frames::headers(1).response(204).eos()).await;
         rx.await.unwrap();
         srv.unbounded_bytes().await;
-        srv.recv_frame(frames::data(1, vec![0; 16_384])).await;
+        // The frames within the window fit the write buffer, so they are
+        // written before the reset.
+        for len in [16_384, 16_384, 16_384, 16_383] {
+            srv.recv_frame(frames::data(1, vec![0; len])).await;
+        }
         srv.recv_frame(frames::reset(1).cancel()).await;
         srv.recv_frame(frames::go_away(0).no_error()).await;
     };
