@@ -138,7 +138,7 @@ impl FrameDecoder {
         // The newest block weighs 1/4. Rounding up keeps a steady count from
         // decaying, and the cap bounds what one huge block makes later ones reserve.
         let len = len.min(MAX_FIELDS_HINT);
-        self.fields_hint = (self.fields_hint * 3 + len + 3) / 4;
+        self.fields_hint = (self.fields_hint * 3 + len).div_ceil(4);
     }
 
     fn set_max_frame_size(&mut self, val: usize) {
