@@ -66,6 +66,33 @@ pub(crate) struct DynStreams<'a, B> {
     peer: peer::Dyn,
 }
 
+/// Yields to the runtime once before a small write, so that the tasks that
+/// are ready to run queue their frames and these share the write.
+///
+/// A runtime polls the connection as soon as the first stream wakes it, on a
+/// multi-threaded one often right away. Each frame then takes a write of its
+/// own, where a single-threaded runtime writes those of all ready streams at
+/// once. Yielding to the runtime once before such a write restores that.
+///
+/// Yielding costs a pass through the runtime, which can wake another worker
+/// for it. A write that gained nothing by being held therefore lets twice as
+/// many of the next ones go at once, up to `MAX_SKIPPED`, so that streams
+/// taking turns pay for few holds.
+#[derive(Debug, Default)]
+pub(crate) struct SmallWriteYield {
+    /// Whether the connection asked to be woken when it was last polled
+    is_registered: bool,
+    /// Whether a stream has woken the connection since
+    is_woken: bool,
+
+    /// Size of the write being held back
+    held: Option<usize>,
+    /// Writes still to let go at once
+    skip: u8,
+    /// Writes let go at once after the last one that gained nothing
+    skipped: u8,
+}
+
 /// Outcome of receiving a frame that can open a stream.
 #[derive(Debug)]
 #[must_use = "a refused stream must be reset by the connection"]
@@ -293,12 +320,19 @@ where
         }
     }
 
-    pub fn clear_expired_reset_streams(&mut self) {
+    /// Does what is due when a poll starts receiving, under one lock.
+    pub fn start_poll(&mut self, small_write_yield: Option<&mut SmallWriteYield>) {
         let mut me = self.inner.lock();
         let me = &mut *me;
         me.actions
             .recv
             .clear_expired_reset_streams(&mut me.store, &mut me.counts);
+
+        // Only streams take the task between two polls.
+        if let Some(small_write_yield) = small_write_yield {
+            small_write_yield.is_woken |=
+                std::mem::take(&mut small_write_yield.is_registered) && me.actions.task.is_none();
+        }
     }
 
     pub fn poll_complete<T>(
@@ -306,6 +340,7 @@ where
         cx: &mut Context,
         dst: &mut Codec<T, Prioritized<B>>,
         mut preface_ping: Option<&mut PrefacePing>,
+        mut small_write_yield: Option<&mut SmallWriteYield>,
     ) -> Poll<io::Result<()>>
     where
         T: AsyncWrite + Unpin,
@@ -325,6 +360,9 @@ where
                 // flushed will then take and wake this task.
                 if status == BufferStatus::Complete {
                     me.actions.task = Some(cx.waker().clone());
+                    if let Some(small_write_yield) = small_write_yield.as_deref_mut() {
+                        small_write_yield.is_registered = true;
+                    }
                 }
 
                 status
@@ -338,6 +376,14 @@ where
                     ready!(dst.flush(cx))?;
                     continue;
                 }
+            }
+
+            // Let the streams that are ready to run add to a small write.
+            if let Some(small_write_yield) = small_write_yield.as_deref_mut()
+                && small_write_yield.holds(dst.small_write_len())
+            {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
 
             // Flush any frames staged by `buffer_pending` without holding the
@@ -1482,6 +1528,41 @@ where
     }
 }
 
+// ===== impl SmallWriteYield =====
+
+impl SmallWriteYield {
+    /// Most writes let go at once after one that gained nothing by being held.
+    const MAX_SKIPPED: u8 = 63;
+
+    /// Returns whether to hold the next write back, given its size if it is
+    /// small. A write a stream woke the connection for is held once.
+    fn holds(&mut self, small_write_len: Option<usize>) -> bool {
+        let is_woken = std::mem::take(&mut self.is_woken);
+
+        if let Some(held) = self.held.take() {
+            // A write that grew while held, or beyond a small one, gained.
+            self.skipped = match small_write_len {
+                Some(len) if len <= held => (self.skipped * 2 + 1).min(Self::MAX_SKIPPED),
+                _ => 0,
+            };
+            self.skip = self.skipped;
+            return false;
+        }
+
+        if !is_woken || small_write_len.is_none() {
+            return false;
+        }
+
+        if self.skip > 0 {
+            self.skip -= 1;
+            return false;
+        }
+
+        self.held = small_write_len;
+        true
+    }
+}
+
 // ===== impl StreamRef =====
 
 impl<B> StreamRef<B> {
@@ -2243,5 +2324,40 @@ mod tests {
         let mut stream = me.store.resolve(key);
         stream.unlink();
         stream.remove();
+    }
+
+    #[test]
+    fn small_stream_writes_are_held_once_and_back_off() {
+        let mut small_write_yield = SmallWriteYield::default();
+        let write = |small_write_yield: &mut SmallWriteYield, is_woken, len| {
+            small_write_yield.is_woken = is_woken;
+            small_write_yield.holds(len)
+        };
+
+        // Only a small write that a stream woke the connection for is held.
+        assert!(!write(&mut small_write_yield, false, Some(10)));
+        assert!(!write(&mut small_write_yield, true, None));
+        assert!(write(&mut small_write_yield, true, Some(10)));
+        // It goes out when polled again, having gained a frame here.
+        assert!(!write(&mut small_write_yield, true, Some(20)));
+        assert!(write(&mut small_write_yield, true, Some(10)));
+
+        // A write that gained nothing lets the next one go at once, then
+        // three, and so on: `holds` are the writes held out of twelve.
+        assert!(!write(&mut small_write_yield, false, Some(10)));
+        let mut holds = Vec::new();
+        for n in 0..12 {
+            if write(&mut small_write_yield, true, Some(10)) {
+                holds.push(n);
+                assert!(!write(&mut small_write_yield, false, Some(10)));
+            }
+        }
+        assert_eq!(holds, [1, 5]);
+
+        // One that gains again ends the backoff.
+        small_write_yield.skip = 0;
+        assert!(write(&mut small_write_yield, true, Some(10)));
+        assert!(!write(&mut small_write_yield, true, None));
+        assert!(write(&mut small_write_yield, true, Some(10)));
     }
 }

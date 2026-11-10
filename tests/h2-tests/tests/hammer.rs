@@ -234,62 +234,66 @@ fn concurrent_streams_on_worker_threads_all_finish() {
         .build()
         .unwrap();
 
-    rt.block_on(async {
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            socket.set_nodelay(true).unwrap();
-            // The limits on resets are not what this is after.
-            let mut conn = server::Builder::new()
-                .max_pending_accept_reset_streams(usize::MAX)
-                .max_local_error_reset_streams(None)
-                .handshake::<_, Bytes>(socket)
+    for yields in [false, true] {
+        rt.block_on(async {
+            let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
                 .await
                 .unwrap();
-            // Ends with the client's connection, which can leave streams
-            // that it dropped open here. An earlier error fails the client.
-            while let Some(Ok((request, respond))) = conn.next().await {
-                // A stream the client dropped fails here, as it should.
-                tokio::spawn(echo_size(request, respond));
-            }
-        });
+            let addr = listener.local_addr().unwrap();
 
-        let tcp = TcpStream::connect(addr).await.unwrap();
-        tcp.set_nodelay(true).unwrap();
-        let (client, conn) = client::Builder::new()
-            .max_local_error_reset_streams(None)
-            .handshake::<_, Bytes>(tcp)
-            .await
-            .unwrap();
-        let conn = tokio::spawn(conn);
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                socket.set_nodelay(true).unwrap();
+                // The limits on resets are not what this is after.
+                let mut conn = server::Builder::new()
+                    .yield_before_small_writes(yields)
+                    .max_pending_accept_reset_streams(usize::MAX)
+                    .max_local_error_reset_streams(None)
+                    .handshake::<_, Bytes>(socket)
+                    .await
+                    .unwrap();
+                // Ends with the client's connection, which can leave streams
+                // that it dropped open here. An earlier error fails the client.
+                while let Some(Ok((request, respond))) = conn.next().await {
+                    // A stream the client dropped fails here, as it should.
+                    tokio::spawn(echo_size(request, respond));
+                }
+            });
 
-        let tasks: Vec<_> = (0..TASKS)
-            .map(|task| {
-                let mut client = client.clone();
-                tokio::spawn(async move {
-                    for n in 0..REQUESTS {
-                        let size = SIZES[(task + n) % SIZES.len()];
-                        client = request(client, size, (task / SIZES.len() + n) % 4).await;
-                    }
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            tcp.set_nodelay(true).unwrap();
+            let (client, conn) = client::Builder::new()
+                .yield_before_small_writes(yields)
+                .max_local_error_reset_streams(None)
+                .handshake::<_, Bytes>(tcp)
+                .await
+                .unwrap();
+            let conn = tokio::spawn(conn);
+
+            let tasks: Vec<_> = (0..TASKS)
+                .map(|task| {
+                    let mut client = client.clone();
+                    tokio::spawn(async move {
+                        for n in 0..REQUESTS {
+                            let size = SIZES[(task + n) % SIZES.len()];
+                            client = request(client, size, (task / SIZES.len() + n) % 4).await;
+                        }
+                    })
                 })
-            })
-            .collect();
-        drop(client);
+                .collect();
+            drop(client);
 
-        let finished = async {
-            for task in tasks {
-                task.await.unwrap();
-            }
-            // With its streams and handles gone, the connection closes.
-            conn.await.unwrap().unwrap();
-            server.await.unwrap();
-        };
-        tokio::time::timeout(Duration::from_secs(60), finished)
-            .await
-            .expect("streams or their connection did not finish");
-    });
+            let finished = async {
+                for task in tasks {
+                    task.await.unwrap();
+                }
+                // With its streams and handles gone, the connection closes.
+                conn.await.unwrap().unwrap();
+                server.await.unwrap();
+            };
+            tokio::time::timeout(Duration::from_secs(60), finished)
+                .await
+                .expect("streams or their connection did not finish");
+        });
+    }
 }

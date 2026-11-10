@@ -20,6 +20,8 @@
 //! - `WINDOW` / `CONN_WINDOW`: receive windows. Default 1 MiB / 4 MiB.
 //! - `ECHO_MSGS`: messages per `echo` stream. Default `64`.
 //! - `WORK_US`: CPU time the server spends on each `rpc` request. Default `0`.
+//! - `YIELD_BEFORE_SMALL_WRITES`: `1` to yield before small writes, with
+//!   `LIB=http2` only. Default `0`.
 
 use std::{
     error::Error,
@@ -62,6 +64,7 @@ struct Config {
     conn_window: u32,
     echo_msgs: usize,
     work: Duration,
+    yield_before_small_writes: bool,
 }
 
 #[derive(Default)]
@@ -99,6 +102,7 @@ impl Config {
             conn_window: env_usize("CONN_WINDOW", 4 * 1024 * 1024) as u32,
             echo_msgs: env_usize("ECHO_MSGS", 64),
             work: Duration::from_micros(env_usize("WORK_US", 0) as u64),
+            yield_before_small_writes: env_usize("YIELD_BEFORE_SMALL_WRITES", 0) != 0,
         }
     }
 }
@@ -157,7 +161,9 @@ fn voluntary_switches() -> u64 {
 }
 
 macro_rules! bench_impl {
-    ($name:ident, $lib:ident) => {
+    // `$yield_before_small_writes` names the builder method of that option,
+    // if the library has it.
+    ($name:ident, $lib:ident $(, $yield_before_small_writes:ident)?) => {
         mod $name {
             use super::*;
             use $lib::{RecvStream, SendStream, client, server};
@@ -246,6 +252,7 @@ macro_rules! bench_impl {
                     .initial_window_size(config.window)
                     .initial_connection_window_size(config.conn_window)
                     .max_concurrent_streams(config.streams as u32 * 2);
+                $(builder.$yield_before_small_writes(config.yield_before_small_writes);)?
                 let mut connection = builder.handshake(socket).await?;
 
                 while let Some(result) = connection.accept().await {
@@ -392,6 +399,7 @@ macro_rules! bench_impl {
                     builder
                         .initial_window_size(config.window)
                         .initial_connection_window_size(config.conn_window);
+                    $(builder.$yield_before_small_writes(config.yield_before_small_writes);)?
                     let (send_request, connection) = builder.handshake::<_, Bytes>(socket).await?;
                     tokio::spawn(async move {
                         if let Err(err) = connection.await {
@@ -429,7 +437,7 @@ macro_rules! bench_impl {
     };
 }
 
-bench_impl!(fork, http2);
+bench_impl!(fork, http2, yield_before_small_writes);
 bench_impl!(upstream, h2);
 
 fn percentile(sorted: &[u32], pct: f64) -> u32 {

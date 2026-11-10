@@ -49,6 +49,9 @@ where
     /// A refused stream to reset before receiving another frame.
     pending_refusal: Option<StreamId>,
 
+    /// Set to yield before small writes, for the frames of other streams.
+    small_write_yield: Option<SmallWriteYield>,
+
     /// Ping/pong handler
     ping_pong: PingPong,
 
@@ -97,6 +100,7 @@ pub(crate) struct Config {
     pub priorities: Option<Priorities>,
     pub preface_ping: Option<Duration>,
     pub preface_ping_timeout: Option<Duration>,
+    pub yield_before_small_writes: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -210,6 +214,9 @@ where
                 error: None,
                 go_away: GoAway::new(),
                 pending_refusal: None,
+                small_write_yield: config
+                    .yield_before_small_writes
+                    .then(SmallWriteYield::default),
                 ping_pong: PingPong::new(config.preface_ping, config.preface_ping_timeout),
                 read_activity: false,
                 settings: Settings::new(config.settings),
@@ -548,7 +555,8 @@ where
                             ready!(self.inner.streams.poll_complete(
                                 cx,
                                 &mut self.codec,
-                                self.inner.ping_pong.preface_ping_mut()
+                                self.inner.ping_pong.preface_ping_mut(),
+                                self.inner.small_write_yield.as_mut(),
                             ))?;
 
                             if (self.inner.error.is_some()
@@ -592,7 +600,9 @@ where
         // This happens outside of the loop to prevent needing to do a clock
         // check and then comparison of the queue possibly multiple times a
         // second (and thus, the clock wouldn't have changed enough to matter).
-        self.clear_expired_reset_streams();
+        self.inner
+            .streams
+            .start_poll(self.inner.small_write_yield.as_mut());
 
         let wakes = self.inner.streams.wake_scope();
 
@@ -652,10 +662,6 @@ where
                 }
             }
         }
-    }
-
-    fn clear_expired_reset_streams(&mut self) {
-        self.inner.streams.clear_expired_reset_streams();
     }
 
     /// Returns whether bytes were read since the last call.
