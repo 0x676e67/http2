@@ -255,6 +255,9 @@ pub struct Builder {
     /// Maximum amount of bytes to "buffer" for writing per stream.
     max_send_buffer_size: usize,
 
+    /// Whether a small write waits for the streams that are ready to send.
+    coalesce_writes: bool,
+
     /// Maximum number of locally reset streams due to protocol error across
     /// the lifetime of the connection.
     ///
@@ -683,6 +686,7 @@ impl Builder {
             settings: Settings::default(),
             initial_target_connection_window_size: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
+            coalesce_writes: false,
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             data_frame_budget: proto::DataFrameBudget::Auto,
         }
@@ -1017,6 +1021,20 @@ impl Builder {
     /// The default is currently ~400KB, but may change.
     pub fn max_send_buffer_size(&mut self, max: usize) -> &mut Self {
         self.max_send_buffer_size = max;
+        self
+    }
+
+    /// Sets whether a small write waits for the streams that are ready to
+    /// send, so that their frames share it.
+    ///
+    /// A multi-threaded runtime tends to poll the connection as soon as one
+    /// stream has queued a frame, so each frame takes a write of its own. With
+    /// this enabled, the connection yields to the runtime once before a write
+    /// of less than 1,024 bytes that a stream woke it for. Other tasks that
+    /// are ready run first, which delays such a write by as long as they take.
+    /// Disabled by default.
+    pub fn coalesce_writes(&mut self, enabled: bool) -> &mut Self {
+        self.coalesce_writes = enabled;
         self
     }
 
@@ -1573,6 +1591,7 @@ where
                             priorities: None,
                             preface_ping: None,
                             preface_ping_timeout: None,
+                            coalesce_writes: self.builder.coalesce_writes,
                         },
                     );
 

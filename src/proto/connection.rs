@@ -49,6 +49,9 @@ where
     /// A refused stream to reset before receiving another frame.
     pending_refusal: Option<StreamId>,
 
+    /// Set to hold small writes back for the frames of other streams.
+    coalesce: Option<Coalesce>,
+
     /// Ping/pong handler
     ping_pong: PingPong,
 
@@ -97,6 +100,7 @@ pub(crate) struct Config {
     pub priorities: Option<Priorities>,
     pub preface_ping: Option<Duration>,
     pub preface_ping_timeout: Option<Duration>,
+    pub coalesce_writes: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -210,6 +214,7 @@ where
                 error: None,
                 go_away: GoAway::new(),
                 pending_refusal: None,
+                coalesce: config.coalesce_writes.then(Coalesce::default),
                 ping_pong: PingPong::new(config.preface_ping, config.preface_ping_timeout),
                 read_activity: false,
                 settings: Settings::new(config.settings),
@@ -478,6 +483,14 @@ where
 
     /// Advances the internal state of the connection.
     pub fn poll(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        let polled = self.poll_streams(cx);
+        if polled.is_pending() {
+            self.inner.streams.leave_poll(cx);
+        }
+        polled
+    }
+
+    fn poll_streams(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         // XXX(eliza): cloning the span is unfortunately necessary here in
         // order to placate the borrow checker — `self` is mutably borrowed by
         // `poll2`, which means that we can't borrow `self.span` to enter it.
@@ -540,7 +553,8 @@ where
                             ready!(self.inner.streams.poll_complete(
                                 cx,
                                 &mut self.codec,
-                                self.inner.ping_pong.preface_ping_mut()
+                                self.inner.ping_pong.preface_ping_mut(),
+                                self.inner.coalesce.as_mut(),
                             ))?;
 
                             if (self.inner.error.is_some()
@@ -580,9 +594,15 @@ where
         // This happens outside of the loop to prevent needing to do a clock
         // check and then comparison of the queue possibly multiple times a
         // second (and thus, the clock wouldn't have changed enough to matter).
-        self.clear_expired_reset_streams();
+        self.inner.streams.start_poll(self.inner.coalesce.as_mut());
+
+        let wakes = self.inner.streams.wake_scope();
 
         loop {
+            if let Some(wakes) = &wakes {
+                wakes.wake_full_batch();
+            }
+
             // First, ensure that the `Connection` is able to receive a frame
             //
             // The order here matters:
@@ -634,10 +654,6 @@ where
                 }
             }
         }
-    }
-
-    fn clear_expired_reset_streams(&mut self) {
-        self.inner.streams.clear_expired_reset_streams();
     }
 
     /// Returns whether bytes were read since the last call.

@@ -6,6 +6,7 @@ use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops;
+use std::sync::Arc;
 
 use crate::tracing;
 
@@ -14,6 +15,10 @@ use crate::tracing;
 pub(super) struct Store {
     slab: slab::Slab<Stream>,
     ids: IndexMap<StreamId, SlabIndex>,
+
+    /// Receive queues of removed streams, kept for new ones. As a slab does
+    /// its slots, this spares the allocator a round trip per stream.
+    recycled: Vec<Arc<stream::Shared>>,
 }
 
 /// "Pointer" to an entry in the store
@@ -72,6 +77,7 @@ pub(super) struct OccupiedEntry<'a> {
 pub(super) struct VacantEntry<'a> {
     ids: indexmap::map::VacantEntry<'a, StreamId, SlabIndex>,
     slab: &'a mut slab::Slab<Stream>,
+    recycled: &'a mut Vec<Arc<stream::Shared>>,
 }
 
 pub(super) trait Resolve {
@@ -90,7 +96,13 @@ impl Store {
         Store {
             slab: slab::Slab::new(),
             ids: IndexMap::new(),
+            recycled: Vec::new(),
         }
+    }
+
+    /// Returns a receive queue for a new stream.
+    pub fn shared(&mut self) -> Arc<stream::Shared> {
+        recycle(&mut self.recycled)
     }
 
     pub fn find_mut(&mut self, id: &StreamId) -> Option<Ptr<'_>> {
@@ -129,6 +141,7 @@ impl Store {
             Vacant(e) => Entry::Vacant(VacantEntry {
                 ids: e,
                 slab: &mut self.slab,
+                recycled: &mut self.recycled,
             }),
         }
     }
@@ -238,6 +251,23 @@ impl Drop for Store {
             debug_assert!(self.slab.is_empty());
         }
     }
+}
+
+/// Receive queues kept at most, which bounds what a burst of streams leaves
+/// behind.
+const MAX_RECYCLED: usize = 256;
+
+/// Takes a receive queue that no handle refers to anymore, or a new one.
+fn recycle(recycled: &mut Vec<Arc<stream::Shared>>) -> Arc<stream::Shared> {
+    while let Some(mut shared) = recycled.pop() {
+        // The last handle to a removed stream may still be going away.
+        if let Some(unused) = Arc::get_mut(&mut shared) {
+            unused.reset();
+            return shared;
+        }
+    }
+
+    Arc::new(stream::Shared::new())
 }
 
 // ===== impl Queue =====
@@ -406,6 +436,15 @@ impl<N> fmt::Debug for Queue<N> {
     }
 }
 
+// ===== impl Key =====
+
+impl Key {
+    /// The ID of the stream this key was created for.
+    pub(super) fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+}
+
 // ===== impl Ptr =====
 
 impl<'a> Ptr<'a> {
@@ -426,6 +465,9 @@ impl<'a> Ptr<'a> {
         // Remove the stream state
         let stream = self.store.slab.remove(self.key.index.0 as usize);
         assert_eq!(stream.id, self.key.stream_id);
+        if self.store.recycled.len() < MAX_RECYCLED {
+            self.store.recycled.push(stream.shared);
+        }
         stream.id
     }
 
@@ -491,6 +533,11 @@ impl<'a> OccupiedEntry<'a> {
 // ===== impl VacantEntry =====
 
 impl<'a> VacantEntry<'a> {
+    /// Returns a receive queue for the stream to insert.
+    pub fn shared(&mut self) -> Arc<stream::Shared> {
+        recycle(self.recycled)
+    }
+
     pub fn insert(self, value: Stream) -> Key {
         // Insert the value in the slab
         let stream_id = value.id;

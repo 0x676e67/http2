@@ -345,6 +345,9 @@ pub struct Builder {
     /// Whether each frame after the initial write takes a write of its own.
     one_frame_per_write: bool,
 
+    /// Whether a small write waits for the streams that are ready to send.
+    coalesce_writes: bool,
+
     /// Maximum number of locally reset streams to keep at a time.
     reset_stream_max: usize,
 
@@ -561,8 +564,8 @@ where
         self.inner
             .send_request(request, end_of_stream, self.pending.as_ref())
             .map_err(Into::into)
-            .map(|(stream, is_full)| {
-                if stream.is_pending_open() && is_full {
+            .map(|(stream, is_pending)| {
+                if is_pending {
                     // Only prevent sending another request when the request queue
                     // is not full.
                     self.pending = Some(stream.clone_to_opaque());
@@ -701,6 +704,7 @@ impl Builder {
             max_send_data_frame_size: None,
             max_send_header_frame_size: None,
             one_frame_per_write: false,
+            coalesce_writes: false,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
             pending_accept_reset_stream_max: proto::DEFAULT_REMOTE_RESET_STREAM_MAX,
@@ -899,6 +903,21 @@ impl Builder {
     /// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
     pub fn one_frame_per_write(&mut self, enabled: bool) -> &mut Self {
         self.one_frame_per_write = enabled;
+        self
+    }
+
+    /// Sets whether a small write waits for the streams that are ready to
+    /// send, so that their frames share it.
+    ///
+    /// A multi-threaded runtime tends to poll the connection as soon as one
+    /// stream has queued a frame, so each frame takes a write of its own. With
+    /// this enabled, the connection yields to the runtime once before a write
+    /// of less than 1,024 bytes that a stream woke it for. Other tasks that
+    /// are ready run first, which delays such a write by as long as they take.
+    /// It has no effect with [`one_frame_per_write`](Self::one_frame_per_write).
+    /// Disabled by default.
+    pub fn coalesce_writes(&mut self, enabled: bool) -> &mut Self {
+        self.coalesce_writes = enabled;
         self
     }
 
@@ -1696,6 +1715,7 @@ where
                 priorities: builder.priorities,
                 preface_ping: builder.preface_ping,
                 preface_ping_timeout: builder.preface_ping_timeout,
+                coalesce_writes: builder.coalesce_writes,
             },
         );
         let send_request = SendRequest {
