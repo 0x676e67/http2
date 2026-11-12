@@ -286,7 +286,7 @@ impl Headers {
     /// Loads the header frame but doesn't actually do HPACK decoding.
     ///
     /// HPACK decoding is done in the `load_hpack` step.
-    pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
+    pub fn load(head: Head, mut src: BytesMut, capacity: usize) -> Result<(Self, BytesMut), Error> {
         let flags = HeadersFlag(head.flag());
         let mut pad = 0;
         let mut is_malformed = false;
@@ -344,7 +344,7 @@ impl Headers {
             stream_id: head.stream_id(),
             stream_dep,
             header_block: HeaderBlock {
-                fields: HeaderMap::new(),
+                fields: HeaderMap::with_capacity(capacity),
                 is_over_size: false,
                 pseudo: Pseudo::default(),
                 decoded_size: 0,
@@ -613,7 +613,7 @@ impl PushPromise {
     /// Loads the push promise frame but doesn't actually do HPACK decoding.
     ///
     /// HPACK decoding is done in the `load_hpack` step.
-    pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
+    pub fn load(head: Head, mut src: BytesMut, capacity: usize) -> Result<(Self, BytesMut), Error> {
         let flags = PushPromiseFlag(head.flag());
         let mut pad = 0;
 
@@ -654,7 +654,7 @@ impl PushPromise {
         let frame = PushPromise {
             flags,
             header_block: HeaderBlock {
-                fields: HeaderMap::new(),
+                fields: HeaderMap::with_capacity(capacity),
                 is_over_size: false,
                 pseudo: Pseudo::default(),
                 decoded_size: 0,
@@ -1563,7 +1563,7 @@ mod test {
         // Parse the HEADERS frame
         let head = Head::parse(&frame[..9]);
         let payload = BytesMut::from(&frame[9..]);
-        let (mut headers, mut hpack_data) = Headers::load(head, payload).unwrap();
+        let (mut headers, mut hpack_data) = Headers::load(head, payload, 0).unwrap();
         // hpack_data contains the HPACK payload (no padding/priority in our frame)
 
         // Decode the HPACK block — this should NOT panic
