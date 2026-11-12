@@ -215,6 +215,12 @@ where
         self.framed_write().poll_write_buffered(cx)
     }
 
+    /// Returns the size of the next write, if it could share one with
+    /// frames queued a moment later.
+    pub(crate) fn small_write_len(&mut self) -> Option<usize> {
+        self.framed_write().small_write_len()
+    }
+
     /// Flush buffered data to the wire
     pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         self.framed_write().flush(cx)
