@@ -1,9 +1,14 @@
 use std::{
+    collections::VecDeque,
     fmt, io,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     task::{Context, Poll, Waker},
 };
 
+use atomic_waker::AtomicWaker;
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Request, Response};
 use tokio::io::AsyncWrite;
@@ -15,7 +20,8 @@ use super::{
     headers_priority,
     recv::RecvHeaderBlockError,
     store::{self, Entry, Resolve, Store},
-    sync::Mutex,
+    stream,
+    sync::{Mutex, MutexGuard, WakeScope},
 };
 use crate::ext::HeadersPriority;
 use crate::{
@@ -35,7 +41,7 @@ where
 {
     /// Holds most of the connection and stream related state for processing
     /// HTTP/2 frames associated with streams.
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<Shared>,
 
     /// This is the queue of frames to be written to the wire. This is split out
     /// to avoid requiring a `B` generic on all public API types even if `B` is
@@ -54,11 +60,38 @@ where
 // Ensures that the methods only get one instantiation, instead of two (client and server)
 #[derive(Debug)]
 pub(crate) struct DynStreams<'a, B> {
-    inner: &'a Mutex<Inner>,
+    inner: &'a Shared,
 
     send_buffer: &'a SendBuffer<B>,
 
     peer: peer::Dyn,
+}
+
+/// Yields to the runtime once before a small write, so that the tasks that
+/// are ready to run queue their frames and these share the write.
+///
+/// A runtime polls the connection as soon as the first stream wakes it, on a
+/// multi-threaded one often right away. Each frame then takes a write of its
+/// own, where a single-threaded runtime writes those of all ready streams at
+/// once. Yielding to the runtime once before such a write restores that.
+///
+/// Yielding costs a pass through the runtime, which can wake another worker
+/// for it. A write that gained nothing by being held therefore lets twice as
+/// many of the next ones go at once, up to `MAX_SKIPPED`, so that streams
+/// taking turns pay for few holds.
+#[derive(Debug, Default)]
+pub(crate) struct SmallWriteYield {
+    /// Whether the connection asked to be woken when it was last polled
+    is_registered: bool,
+    /// Whether a stream has woken the connection since
+    is_woken: bool,
+
+    /// Size of the write being held back
+    held: Option<usize>,
+    /// Writes still to let go at once
+    skip: u8,
+    /// Writes let go at once after the last one that gained nothing
+    skipped: u8,
 }
 
 /// Outcome of receiving a frame that can open a stream.
@@ -79,9 +112,71 @@ pub(crate) struct StreamRef<B> {
 }
 
 /// Reference to the stream state that hides the send data chunk generic
+#[derive(Clone)]
 pub(crate) struct OpaqueStreamRef {
-    inner: Arc<Mutex<Inner>>,
+    /// Shared by every clone, so that cloning or dropping one of several
+    /// handles to a stream does not take the lock on all streams.
+    handle: Arc<Handle>,
+}
+
+/// What the handles to one stream share.
+///
+/// The store counts them as a single reference to the stream, taken when the
+/// first handle is created and released when the last one is dropped.
+struct Handle {
+    inner: Arc<Shared>,
     key: store::Key,
+    /// The stream's receive queue, read without the lock on all streams
+    stream: Arc<stream::Shared>,
+}
+
+/// State shared by a connection and the handles to its streams.
+#[derive(Debug)]
+struct Shared {
+    /// The lock on all streams
+    inner: Mutex<Inner>,
+
+    /// What handles left to do under the lock when they found it held, in
+    /// the order they left it.
+    deferred: Mutex<VecDeque<Deferred>>,
+
+    /// Whether `deferred` may hold anything, to check without its lock
+    has_deferred: AtomicBool,
+
+    /// The connection task, woken to run `deferred` if no one else does
+    conn_task: AtomicWaker,
+
+    /// Set once a handle has found the lock on all streams held. Only from
+    /// then on does the connection wake the readers of its frames in batches:
+    /// until tasks run into each other, as they never do on a runtime of one
+    /// thread, that gains nothing.
+    is_contended: AtomicBool,
+
+    /// Set once no stream can be opened whatever the request, so that
+    /// `poll_pending_open` tells a ready connection without the lock.
+    is_open_blocked: AtomicBool,
+
+    /// DATA frame budget that handles have released by reading frames: a
+    /// running sum that wraps, which the connection counts in by its growth.
+    released_data_frames: AtomicUsize,
+}
+
+/// A change to a stream that returns nothing to the handle making it.
+///
+/// A handle that finds the lock on all streams held leaves the change to
+/// whoever takes the lock next, instead of waiting for it. Every holder runs
+/// what was left before anything of its own, so changes take effect in the
+/// order they were made.
+#[derive(Debug)]
+enum Deferred {
+    /// See `Recv::release_claimed_capacity`.
+    ReleaseCapacity(store::Key, WindowSize),
+    /// See `Send::reserve_capacity`.
+    ReserveCapacity(store::Key, WindowSize),
+    /// See `OpaqueStreamRef::clear_recv_buffer`.
+    ClearRecvBuffer(store::Key),
+    /// The last handle to a stream was dropped.
+    DropRef(store::Key),
 }
 
 /// Fields needed to manage state related to managing the set of streams. This
@@ -141,7 +236,7 @@ where
         let peer = P::r#dyn();
 
         Streams {
-            inner: Inner::new(peer, config),
+            inner: Arc::new(Shared::new(Inner::new(peer, config))),
             send_buffer: Arc::new(SendBuffer::new()),
 
             _p: ::std::marker::PhantomData,
@@ -218,12 +313,35 @@ where
         Ok(())
     }
 
-    pub fn clear_expired_reset_streams(&mut self) {
+    /// Holds back the wakes of a poll's read phase, so that the tasks reading
+    /// its frames are woken in batches, not once for each frame.
+    pub fn wake_scope(&self) -> Option<WakeScope> {
+        self.inner.wake_scope()
+    }
+
+    /// Has handles wake the connection for what they leave under the lock,
+    /// and runs what was left while it was being polled.
+    pub fn leave_poll(&mut self, cx: &Context) {
+        self.inner.conn_task.register(cx.waker());
+
+        if self.inner.has_deferred.load(Ordering::Acquire) {
+            drop(self.inner.lock());
+        }
+    }
+
+    /// Does what is due when a poll starts receiving, under one lock.
+    pub fn start_poll(&mut self, small_write_yield: Option<&mut SmallWriteYield>) {
         let mut me = self.inner.lock();
         let me = &mut *me;
         me.actions
             .recv
             .clear_expired_reset_streams(&mut me.store, &mut me.counts);
+
+        // Only streams take the task between two polls.
+        if let Some(small_write_yield) = small_write_yield {
+            small_write_yield.is_woken |=
+                std::mem::take(&mut small_write_yield.is_registered) && me.actions.task.is_none();
+        }
     }
 
     pub fn poll_complete<T>(
@@ -231,6 +349,7 @@ where
         cx: &mut Context,
         dst: &mut Codec<T, Prioritized<B>>,
         mut preface_ping: Option<&mut PrefacePing>,
+        mut small_write_yield: Option<&mut SmallWriteYield>,
     ) -> Poll<io::Result<()>>
     where
         T: AsyncWrite + Unpin,
@@ -250,6 +369,9 @@ where
                 // flushed will then take and wake this task.
                 if status == BufferStatus::Complete {
                     me.actions.task = Some(cx.waker().clone());
+                    if let Some(small_write_yield) = small_write_yield.as_deref_mut() {
+                        small_write_yield.is_registered = true;
+                    }
                 }
 
                 status
@@ -263,6 +385,14 @@ where
                     ready!(dst.flush(cx))?;
                     continue;
                 }
+            }
+
+            // Let the streams that are ready to run add to a small write.
+            if let Some(small_write_yield) = small_write_yield.as_deref_mut()
+                && small_write_yield.holds(dst.small_write_len())
+            {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
 
             // Flush any frames staged by `buffer_pending` without holding the
@@ -346,7 +476,7 @@ where
         // If that stream is still pending, the Client isn't allowed to
         // queue up another pending stream. They should use `poll_ready`.
         if let Some(stream) = pending
-            && me.store.resolve(stream.key).is_pending_open
+            && me.store.resolve(stream.handle.key).is_pending_open
         {
             return Err(UserError::Rejected.into());
         }
@@ -360,11 +490,14 @@ where
             .headers_priority_policy
             .resolve(request_priority, next_stream_id)?;
         let stream_id = me.actions.send.open()?;
+        // This may have been the last stream ID.
+        self.inner.publish_open_blocked(me);
 
-        let mut stream = Stream::new(
+        let mut stream = Stream::with_shared(
             stream_id,
             me.actions.send.init_window_sz(),
             me.actions.recv.init_window_sz(),
+            me.store.shared(),
         );
         // A `Chain` parent depends on which streams are still open when the
         // initial HEADERS is written, which can be later for queued requests.
@@ -414,13 +547,15 @@ where
         // the lock, so it can't.
         me.refs += 1;
 
-        let is_full = me.counts.next_send_stream_will_reach_capacity();
+        // The caller holds its next request back while this one waits for a
+        // stream slot that it takes the last of.
+        let is_pending = stream.is_pending_open && me.counts.next_send_stream_will_reach_capacity();
         Ok((
             StreamRef {
                 opaque: OpaqueStreamRef::new(self.inner.clone(), &mut stream),
                 send_buffer: self.send_buffer.clone(),
             },
-            is_full,
+            is_pending,
         ))
     }
 
@@ -461,6 +596,9 @@ impl<B> DynStreams<'_, B> {
 
     pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), Error> {
         let mut me = self.inner.lock();
+        // Count in what the handles have read before charging this frame.
+        let released = self.inner.released_data_frames.load(Ordering::Relaxed);
+        me.counts.sync_released_data_frames(released);
         me.recv_data(self.peer, self.send_buffer, frame)
     }
 
@@ -473,12 +611,16 @@ impl<B> DynStreams<'_, B> {
     /// Notify all streams that a connection-level error happened.
     pub fn handle_error(&mut self, err: proto::Error) -> StreamId {
         let mut me = self.inner.lock();
-        me.handle_error(self.send_buffer, err)
+        let last_processed_id = me.handle_error(self.send_buffer, err);
+        self.inner.publish_open_blocked(&me);
+        last_processed_id
     }
 
     pub fn recv_go_away(&mut self, frame: &frame::GoAway) -> Result<(), Error> {
         let mut me = self.inner.lock();
-        me.recv_go_away(self.send_buffer, frame)
+        let res = me.recv_go_away(self.send_buffer, frame);
+        self.inner.publish_open_blocked(&me);
+        res
     }
 
     pub fn last_processed_id(&self) -> StreamId {
@@ -498,7 +640,9 @@ impl<B> DynStreams<'_, B> {
 
     pub fn recv_eof(&mut self, clear_pending_accept: bool) -> Result<(), ()> {
         let mut me = self.inner.lock();
-        me.recv_eof(self.send_buffer, clear_pending_accept)
+        let res = me.recv_eof(self.send_buffer, clear_pending_accept);
+        self.inner.publish_open_blocked(&me);
+        res
     }
 
     pub fn send_reset(
@@ -507,7 +651,10 @@ impl<B> DynStreams<'_, B> {
         reason: Reason,
     ) -> Result<(), crate::proto::error::GoAway> {
         let mut me = self.inner.lock();
-        me.send_reset(self.send_buffer, id, reason)
+        let res = me.send_reset(self.send_buffer, id, reason);
+        // Resetting an unknown stream can use up the last stream ID.
+        self.inner.publish_open_blocked(&me);
+        res
     }
 
     pub fn send_go_away(&mut self, last_processed_id: StreamId) {
@@ -517,8 +664,8 @@ impl<B> DynStreams<'_, B> {
 }
 
 impl Inner {
-    fn new(peer: peer::Dyn, config: Config) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Inner {
+    fn new(peer: peer::Dyn, config: Config) -> Self {
+        Inner {
             counts: Counts::new(peer, &config),
             actions: Actions {
                 recv: Recv::new(peer, &config),
@@ -530,7 +677,87 @@ impl Inner {
             refs: 1,
             headers_priority_policy: config.headers_priority_policy,
             headers_pseudo_order: config.headers_pseudo_order,
-        }))
+        }
+    }
+
+    /// Makes a change that a handle left for the holder of the lock.
+    #[inline]
+    fn run(&mut self, deferred: Deferred) {
+        match deferred {
+            Deferred::ReleaseCapacity(key, capacity) => {
+                let mut stream = self.store.resolve(key);
+                self.actions.recv.release_claimed_capacity(
+                    capacity,
+                    &mut stream,
+                    &mut self.actions.task,
+                );
+            }
+            Deferred::ReserveCapacity(key, capacity) => {
+                let mut stream = self.store.resolve(key);
+                self.actions
+                    .send
+                    .reserve_capacity(capacity, &mut stream, &mut self.counts);
+            }
+            Deferred::ClearRecvBuffer(key) => {
+                let mut stream = self.store.resolve(key);
+                stream.is_recv = false;
+                self.actions.recv.clear_recv_buffer(
+                    &mut stream,
+                    &mut self.actions.task,
+                    &mut self.counts,
+                );
+            }
+            Deferred::DropRef(key) => self.drop_stream_ref(key),
+        }
+    }
+
+    /// Releases the reference the handles to a stream held on it.
+    fn drop_stream_ref(&mut self, key: store::Key) {
+        self.refs -= 1;
+        let mut stream = self.store.resolve(key);
+
+        tracing::trace!("drop_stream_ref; stream={:?}", stream);
+
+        // decrement the stream's ref count by 1.
+        stream.ref_dec();
+
+        let actions = &mut self.actions;
+
+        // If the stream is not referenced and it is already
+        // closed (does not have to go through logic below
+        // of canceling the stream), we should notify the task
+        // (connection) so that it can close properly
+        if stream.ref_count == 0
+            && stream.is_closed()
+            && let Some(task) = actions.task.take()
+        {
+            task.wake();
+        }
+
+        self.counts.transition(stream, |counts, stream| {
+            maybe_cancel(stream, actions, counts);
+
+            if stream.ref_count == 0 {
+                // Release any recv window back to connection, no one can access
+                // it anymore.
+                actions
+                    .recv
+                    .release_closed_capacity(stream, &mut actions.task, counts);
+
+                // We won't be able to reach our push promises anymore
+                let mut ppp = stream.pending_push_promises.take();
+                while let Some(promise) = ppp.pop(stream.store_mut()) {
+                    counts.transition(promise, |counts, stream| {
+                        maybe_cancel(stream, actions, counts);
+                        // Discard unreachable push data and return connection credit.
+                        // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
+                        actions
+                            .recv
+                            .release_closed_capacity(stream, &mut actions.task, counts);
+                    });
+                }
+            }
+        });
     }
 
     fn recv_headers<B>(
@@ -554,7 +781,7 @@ impl Inner {
 
         let key = match self.store.find_entry(id) {
             Entry::Occupied(e) => e.key(),
-            Entry::Vacant(e) => {
+            Entry::Vacant(mut e) => {
                 // Client: it's possible to send a request, and then send
                 // a RST_STREAM while the response HEADERS were in transit.
                 //
@@ -578,10 +805,11 @@ impl Inner {
                     .open(id, Open::Headers, &mut self.counts)?
                 {
                     Some(stream_id) => {
-                        let stream = Stream::new(
+                        let stream = Stream::with_shared(
                             stream_id,
                             self.actions.send.init_window_sz(),
                             self.actions.recv.init_window_sz(),
+                            e.shared(),
                         );
 
                         e.insert(stream)
@@ -972,13 +1200,13 @@ impl Inner {
         // this requires a bit of indirection to make the borrow checker happy.
         let child_key: Option<store::Key> = {
             // Create state for the stream
-            let stream = self.store.insert(promised_id, {
-                Stream::new(
-                    promised_id,
-                    self.actions.send.init_window_sz(),
-                    self.actions.recv.init_window_sz(),
-                )
-            });
+            let stream = Stream::with_shared(
+                promised_id,
+                self.actions.send.init_window_sz(),
+                self.actions.recv.init_window_sz(),
+                self.store.shared(),
+            );
+            let stream = self.store.insert(promised_id, stream);
 
             let actions = &mut self.actions;
 
@@ -1130,7 +1358,7 @@ impl Inner {
     ) -> Result<(), crate::proto::error::GoAway> {
         let key = match self.store.find_entry(id) {
             Entry::Occupied(e) => e.key(),
-            Entry::Vacant(e) => {
+            Entry::Vacant(mut e) => {
                 // Resetting a stream we don't know about? That could be OK...
                 //
                 // 1. As a server, we just received a request, but that request was bad, so we're
@@ -1151,7 +1379,7 @@ impl Inner {
                     self.actions.recv.maybe_reset_next_stream_id(id);
                 }
 
-                let stream = Stream::new(id, 0, 0);
+                let stream = Stream::with_shared(id, 0, 0, e.shared());
 
                 e.insert(stream)
             }
@@ -1179,6 +1407,12 @@ where
         cx: &Context,
         pending: Option<&OpaqueStreamRef>,
     ) -> Poll<Result<(), crate::Error>> {
+        // With no request pending, only a failed connection or exhausted
+        // stream IDs keep the next one from being sent.
+        if pending.is_none() && !self.inner.is_open_blocked.load(Ordering::Relaxed) {
+            return Poll::Ready(Ok(()));
+        }
+
         let mut me = self.inner.lock();
         let me = &mut *me;
 
@@ -1186,7 +1420,7 @@ where
         me.actions.send.ensure_next_stream_id()?;
 
         if let Some(pending) = pending {
-            let mut stream = me.store.resolve(pending.key);
+            let mut stream = me.store.resolve(pending.handle.key);
             tracing::trace!("poll_pending_open; stream = {:?}", stream.is_pending_open);
             if stream.is_pending_open {
                 stream.wait_open(cx);
@@ -1316,6 +1550,41 @@ where
     }
 }
 
+// ===== impl SmallWriteYield =====
+
+impl SmallWriteYield {
+    /// Most writes let go at once after one that gained nothing by being held.
+    const MAX_SKIPPED: u8 = 63;
+
+    /// Returns whether to hold the next write back, given its size if it is
+    /// small. A write a stream woke the connection for is held once.
+    fn holds(&mut self, small_write_len: Option<usize>) -> bool {
+        let is_woken = std::mem::take(&mut self.is_woken);
+
+        if let Some(held) = self.held.take() {
+            // A write that grew while held, or beyond a small one, gained.
+            self.skipped = match small_write_len {
+                Some(len) if len <= held => (self.skipped * 2 + 1).min(Self::MAX_SKIPPED),
+                _ => 0,
+            };
+            self.skip = self.skipped;
+            return false;
+        }
+
+        if !is_woken || small_write_len.is_none() {
+            return false;
+        }
+
+        if self.skip > 0 {
+            self.skip -= 1;
+            return false;
+        }
+
+        self.held = small_write_len;
+        true
+    }
+}
+
 // ===== impl StreamRef =====
 
 impl<B> StreamRef<B> {
@@ -1323,10 +1592,10 @@ impl<B> StreamRef<B> {
     where
         B: Buf,
     {
-        let mut me = self.opaque.inner.lock();
+        let mut me = self.opaque.handle.inner.lock();
         let me = &mut *me;
 
-        let stream = me.store.resolve(self.opaque.key);
+        let stream = me.store.resolve(self.opaque.handle.key);
         let actions = &mut me.actions;
         let mut send_buffer = self.send_buffer.inner.lock();
         let send_buffer = &mut *send_buffer;
@@ -1344,10 +1613,10 @@ impl<B> StreamRef<B> {
     }
 
     pub fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), UserError> {
-        let mut me = self.opaque.inner.lock();
+        let mut me = self.opaque.handle.inner.lock();
         let me = &mut *me;
 
-        let stream = me.store.resolve(self.opaque.key);
+        let stream = me.store.resolve(self.opaque.handle.key);
         let actions = &mut me.actions;
         let mut send_buffer = self.send_buffer.inner.lock();
         let send_buffer = &mut *send_buffer;
@@ -1364,10 +1633,10 @@ impl<B> StreamRef<B> {
     }
 
     pub fn send_reset(&mut self, reason: Reason) {
-        let mut me = self.opaque.inner.lock();
+        let mut me = self.opaque.handle.inner.lock();
         let me = &mut *me;
 
-        let stream = me.store.resolve(self.opaque.key);
+        let stream = me.store.resolve(self.opaque.handle.key);
         let mut send_buffer = self.send_buffer.inner.lock();
         let send_buffer = &mut *send_buffer;
 
@@ -1388,10 +1657,10 @@ impl<B> StreamRef<B> {
     }
 
     pub fn send_informational_headers(&mut self, frame: frame::Headers) -> Result<(), UserError> {
-        let mut me = self.opaque.inner.lock();
+        let mut me = self.opaque.handle.inner.lock();
         let me = &mut *me;
 
-        let stream = me.store.resolve(self.opaque.key);
+        let stream = me.store.resolve(self.opaque.handle.key);
         let actions = &mut me.actions;
         let mut send_buffer = self.send_buffer.inner.lock();
         let send_buffer = &mut *send_buffer;
@@ -1431,10 +1700,10 @@ impl<B> StreamRef<B> {
     ) -> Result<(), UserError> {
         // Clear before taking lock, incase extensions contain a StreamRef.
         response.extensions_mut().clear();
-        let mut me = self.opaque.inner.lock();
+        let mut me = self.opaque.handle.inner.lock();
         let me = &mut *me;
 
-        let stream = me.store.resolve(self.opaque.key);
+        let stream = me.store.resolve(self.opaque.handle.key);
         let actions = &mut me.actions;
         let mut send_buffer = self.send_buffer.inner.lock();
         let send_buffer = &mut *send_buffer;
@@ -1454,7 +1723,7 @@ impl<B> StreamRef<B> {
     ) -> Result<StreamRef<B>, UserError> {
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
-        let mut me = self.opaque.inner.lock();
+        let mut me = self.opaque.handle.inner.lock();
         let me = &mut *me;
 
         let mut send_buffer = self.send_buffer.inner.lock();
@@ -1464,21 +1733,20 @@ impl<B> StreamRef<B> {
         let promised_id = actions.send.reserve_local()?;
 
         let child_key = {
-            let mut child_stream = me.store.insert(
+            let child_stream = Stream::with_shared(
                 promised_id,
-                Stream::new(
-                    promised_id,
-                    actions.send.init_window_sz(),
-                    actions.recv.init_window_sz(),
-                ),
+                actions.send.init_window_sz(),
+                actions.recv.init_window_sz(),
+                me.store.shared(),
             );
+            let mut child_stream = me.store.insert(promised_id, child_stream);
             child_stream.state.reserve_local()?;
             child_stream.is_pending_push = true;
             child_stream.key()
         };
 
         let pushed = {
-            let mut stream = me.store.resolve(self.opaque.key);
+            let mut stream = me.store.resolve(self.opaque.handle.key);
 
             let frame = crate::server::Peer::convert_push_message(stream.id, promised_id, request)?;
 
@@ -1495,8 +1763,10 @@ impl<B> StreamRef<B> {
         }
 
         me.refs += 1;
-        let opaque =
-            OpaqueStreamRef::new(self.opaque.inner.clone(), &mut me.store.resolve(child_key));
+        let opaque = OpaqueStreamRef::new(
+            self.opaque.handle.inner.clone(),
+            &mut me.store.resolve(child_key),
+        );
 
         Ok(StreamRef {
             opaque,
@@ -1512,47 +1782,33 @@ impl<B> StreamRef<B> {
     ///
     /// This function panics if the request isn't present.
     pub fn take_request(&self) -> Request<()> {
-        let mut me = self.opaque.inner.lock();
-        let me = &mut *me;
-
-        let mut stream = me.store.resolve(self.opaque.key);
-        me.actions.recv.take_request(&mut stream)
-    }
-
-    /// Called by a client to see if the current stream is pending open
-    pub fn is_pending_open(&self) -> bool {
-        let mut me = self.opaque.inner.lock();
-        me.store.resolve(self.opaque.key).is_pending_open
+        self.opaque.handle.stream.recv().take_request()
     }
 
     /// Request capacity to send data
     pub fn reserve_capacity(&mut self, capacity: WindowSize) {
-        let mut me = self.opaque.inner.lock();
-        let me = &mut *me;
-
-        let mut stream = me.store.resolve(self.opaque.key);
-
-        me.actions
-            .send
-            .reserve_capacity(capacity, &mut stream, &mut me.counts)
+        let handle = &self.opaque.handle;
+        handle
+            .inner
+            .defer(Deferred::ReserveCapacity(handle.key, capacity));
     }
 
     /// Returns the stream's current send capacity.
     pub fn capacity(&self) -> WindowSize {
-        let mut me = self.opaque.inner.lock();
+        let mut me = self.opaque.handle.inner.lock();
         let me = &mut *me;
 
-        let mut stream = me.store.resolve(self.opaque.key);
+        let mut stream = me.store.resolve(self.opaque.handle.key);
 
         me.actions.send.capacity(&mut stream)
     }
 
     /// Request to be notified when the stream's capacity increases
     pub fn poll_capacity(&mut self, cx: &Context) -> Poll<Option<Result<WindowSize, UserError>>> {
-        let mut me = self.opaque.inner.lock();
+        let mut me = self.opaque.handle.inner.lock();
         let me = &mut *me;
 
-        let mut stream = me.store.resolve(self.opaque.key);
+        let mut stream = me.store.resolve(self.opaque.handle.key);
 
         me.actions.send.poll_capacity(cx, &mut stream)
     }
@@ -1563,10 +1819,10 @@ impl<B> StreamRef<B> {
         cx: &Context,
         mode: proto::PollReset,
     ) -> Poll<Result<Reason, crate::Error>> {
-        let mut me = self.opaque.inner.lock();
+        let mut me = self.opaque.handle.inner.lock();
         let me = &mut *me;
 
-        let mut stream = me.store.resolve(self.opaque.key);
+        let mut stream = me.store.resolve(self.opaque.handle.key);
 
         me.actions.send.poll_reset(cx, &mut stream, mode)
     }
@@ -1592,19 +1848,32 @@ impl<B> Clone for StreamRef<B> {
 // ===== impl OpaqueStreamRef =====
 
 impl OpaqueStreamRef {
-    fn new(inner: Arc<Mutex<Inner>>, stream: &mut store::Ptr) -> OpaqueStreamRef {
+    fn new(inner: Arc<Shared>, stream: &mut store::Ptr) -> OpaqueStreamRef {
         stream.ref_inc();
+        // The handles read the receive status without the lock from here on.
+        stream.publish_recv_status();
+
         OpaqueStreamRef {
-            inner,
-            key: stream.key(),
+            handle: Arc::new(Handle {
+                inner,
+                key: stream.key(),
+                stream: stream.shared.clone(),
+            }),
         }
     }
+
     /// Called by a client to check for a received response.
     pub fn poll_response(&mut self, cx: &Context) -> Poll<Result<Response<()>, proto::Error>> {
-        let mut me = self.inner.lock();
+        // The queue settles most polls without the lock on all streams.
+        let polled = self.handle.stream.recv().poll_response(cx);
+        if let Some(polled) = polled {
+            return polled.map(Ok);
+        }
+
+        let mut me = self.handle.inner.lock();
         let me = &mut *me;
 
-        let mut stream = me.store.resolve(self.key);
+        let mut stream = me.store.resolve(self.handle.key);
 
         me.actions.recv.poll_response(cx, &mut stream)
     }
@@ -1614,10 +1883,10 @@ impl OpaqueStreamRef {
         &mut self,
         cx: &Context,
     ) -> Poll<Option<Result<Response<()>, proto::Error>>> {
-        let mut me = self.inner.lock();
+        let mut me = self.handle.inner.lock();
         let me = &mut *me;
 
-        let mut stream = me.store.resolve(self.key);
+        let mut stream = me.store.resolve(self.handle.key);
 
         me.actions.recv.poll_informational(cx, &mut stream)
     }
@@ -1626,116 +1895,106 @@ impl OpaqueStreamRef {
         &mut self,
         cx: &Context,
     ) -> Poll<Option<Result<(Request<()>, OpaqueStreamRef), proto::Error>>> {
-        let mut me = self.inner.lock();
+        let mut me = self.handle.inner.lock();
         let me = &mut *me;
 
-        let mut stream = me.store.resolve(self.key);
+        let mut stream = me.store.resolve(self.handle.key);
         me.actions
             .recv
             .poll_pushed(cx, &mut stream)
             .map_ok(|(h, key)| {
                 me.refs += 1;
                 let opaque_ref =
-                    OpaqueStreamRef::new(self.inner.clone(), &mut me.store.resolve(key));
+                    OpaqueStreamRef::new(self.handle.inner.clone(), &mut me.store.resolve(key));
                 (h, opaque_ref)
             })
     }
 
     pub fn is_end_stream(&self) -> bool {
-        let mut me = self.inner.lock();
-        let me = &mut *me;
-
-        let stream = me.store.resolve(self.key);
-
-        me.actions.recv.is_end_stream(&stream)
+        self.handle.stream.recv().is_end_stream()
     }
 
     pub fn poll_data(&mut self, cx: &Context) -> Poll<Option<Result<Bytes, proto::Error>>> {
-        let mut me = self.inner.lock();
-        let me = &mut *me;
+        // The queue settles most polls without the lock on all streams.
+        let polled = self.handle.stream.recv().poll_data(cx);
+        let polled = match polled {
+            Some(polled) => polled.map(|data| data.map(Ok)),
+            None => {
+                let mut me = self.handle.inner.lock();
+                let me = &mut *me;
 
-        let mut stream = me.store.resolve(self.key);
+                let mut stream = me.store.resolve(self.handle.key);
 
-        me.actions
-            .recv
-            .poll_data(cx, &mut stream)
-            .map(|result| match result {
-                Some(Ok(data)) => {
-                    if data.is_budgeted {
-                        me.counts.release_data_frame(data.payload.len());
-                    }
-                    Some(Ok(data.payload))
-                }
-                Some(Err(err)) => Some(Err(err)),
-                None => None,
-            })
+                me.actions.recv.poll_data(cx, &mut stream)
+            }
+        };
+
+        polled.map_ok(|data| {
+            if data.is_budgeted {
+                self.handle.inner.release_data_frame(data.payload.len());
+            }
+            data.payload
+        })
     }
 
     pub fn poll_trailers(&mut self, cx: &Context) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
-        let mut me = self.inner.lock();
+        // The queue settles most polls without the lock on all streams.
+        let polled = self.handle.stream.recv().poll_trailers(cx);
+        if let Some(polled) = polled {
+            return polled.map(|trailers| trailers.map(Ok));
+        }
+
+        let mut me = self.handle.inner.lock();
         let me = &mut *me;
 
-        let mut stream = me.store.resolve(self.key);
+        let mut stream = me.store.resolve(self.handle.key);
 
         me.actions.recv.poll_trailers(cx, &mut stream)
     }
 
     pub(crate) fn available_recv_capacity(&self) -> isize {
-        let me = self.inner.lock();
+        let me = self.handle.inner.lock();
         let me = &*me;
 
-        let stream = &me.store[self.key];
+        let stream = &me.store[self.handle.key];
         stream.recv_flow.available().into()
     }
 
     pub(crate) fn used_recv_capacity(&self) -> WindowSize {
-        let me = self.inner.lock();
-        let me = &*me;
-
-        let stream = &me.store[self.key];
-        stream.in_flight_recv_data
+        self.handle.stream.recv().in_flight
     }
 
     /// Releases recv capacity back to the peer. This may result in sending
     /// WINDOW_UPDATE frames on both the stream and connection.
     pub fn release_capacity(&mut self, capacity: WindowSize) -> Result<(), UserError> {
-        let mut me = self.inner.lock();
-        let me = &mut *me;
+        // The stream alone tells whether this much can be released. Passing
+        // it on to the windows needs the lock on all streams, but no result.
+        self.handle.stream.recv().release_in_flight(capacity)?;
 
-        let mut stream = me.store.resolve(self.key);
+        self.handle
+            .inner
+            .defer(Deferred::ReleaseCapacity(self.handle.key, capacity));
 
-        me.actions
-            .recv
-            .release_capacity(capacity, &mut stream, &mut me.actions.task)
+        Ok(())
     }
 
     /// Clear the receive queue and set the status to no longer receive data frames.
     pub(crate) fn clear_recv_buffer(&mut self) {
-        let mut me = self.inner.lock();
-        let me = &mut *me;
-
-        let mut stream = me.store.resolve(self.key);
-        stream.is_recv = false;
-        me.actions
-            .recv
-            .clear_recv_buffer(&mut stream, &mut me.actions.task, &mut me.counts);
+        self.handle
+            .inner
+            .defer(Deferred::ClearRecvBuffer(self.handle.key));
     }
 
     pub fn stream_id(&self) -> StreamId {
-        self.inner.lock().store[self.key].id
+        self.handle.key.stream_id()
     }
 }
 
 impl fmt::Debug for OpaqueStreamRef {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        #[cfg(feature = "parking_lot")]
-        let lock_result = self.inner.try_lock();
-        #[cfg(not(feature = "parking_lot"))]
-        let lock_result = self.inner.try_lock().ok();
-
-        match lock_result {
+        match self.handle.inner.inner.try_lock() {
             Some(me) => {
-                let stream = &me.store[self.key];
+                let stream = &me.store[self.handle.key];
                 fmt.debug_struct("OpaqueStreamRef")
                     .field("stream_id", &stream.id)
                     .field("ref_count", &stream.ref_count)
@@ -1749,76 +2008,12 @@ impl fmt::Debug for OpaqueStreamRef {
     }
 }
 
-impl Clone for OpaqueStreamRef {
-    fn clone(&self) -> Self {
-        // Increment the ref count
-        let mut inner = self.inner.lock();
-        inner.store.resolve(self.key).ref_inc();
-        inner.refs += 1;
+// ===== impl Handle =====
 
-        OpaqueStreamRef {
-            inner: self.inner.clone(),
-            key: self.key,
-        }
-    }
-}
-
-impl Drop for OpaqueStreamRef {
+impl Drop for Handle {
     fn drop(&mut self) {
-        drop_stream_ref(&self.inner, self.key);
+        self.inner.defer(Deferred::DropRef(self.key));
     }
-}
-
-// TODO: Move back in fn above
-fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
-    let mut me = inner.lock();
-
-    let me = &mut *me;
-    me.refs -= 1;
-    let mut stream = me.store.resolve(key);
-
-    tracing::trace!("drop_stream_ref; stream={:?}", stream);
-
-    // decrement the stream's ref count by 1.
-    stream.ref_dec();
-
-    let actions = &mut me.actions;
-
-    // If the stream is not referenced and it is already
-    // closed (does not have to go through logic below
-    // of canceling the stream), we should notify the task
-    // (connection) so that it can close properly
-    if stream.ref_count == 0
-        && stream.is_closed()
-        && let Some(task) = actions.task.take()
-    {
-        task.wake();
-    }
-
-    me.counts.transition(stream, |counts, stream| {
-        maybe_cancel(stream, actions, counts);
-
-        if stream.ref_count == 0 {
-            // Release any recv window back to connection, no one can access
-            // it anymore.
-            actions
-                .recv
-                .release_closed_capacity(stream, &mut actions.task, counts);
-
-            // We won't be able to reach our push promises anymore
-            let mut ppp = stream.pending_push_promises.take();
-            while let Some(promise) = ppp.pop(stream.store_mut()) {
-                counts.transition(promise, |counts, stream| {
-                    maybe_cancel(stream, actions, counts);
-                    // Discard unreachable push data and return connection credit.
-                    // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
-                    actions
-                        .recv
-                        .release_closed_capacity(stream, &mut actions.task, counts);
-                });
-            }
-        }
-    });
 }
 
 fn maybe_cancel(stream: &mut store::Ptr, actions: &mut Actions, counts: &mut Counts) {
@@ -1839,6 +2034,128 @@ fn maybe_cancel(stream: &mut store::Ptr, actions: &mut Actions, counts: &mut Cou
             .send
             .schedule_implicit_reset(stream, reason, counts, &mut actions.task);
         actions.recv.enqueue_reset_expiration(stream, counts);
+    }
+}
+
+// ===== impl Shared =====
+
+impl Shared {
+    fn new(inner: Inner) -> Self {
+        Shared {
+            inner: Mutex::new(inner),
+            deferred: Mutex::new(VecDeque::new()),
+            has_deferred: AtomicBool::new(false),
+            conn_task: AtomicWaker::new(),
+            is_contended: AtomicBool::new(false),
+            is_open_blocked: AtomicBool::new(false),
+            released_data_frames: AtomicUsize::new(0),
+        }
+    }
+
+    /// Takes the lock on all streams, having run what handles left for it.
+    #[inline]
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        let mut me = self.inner.lock();
+        self.run_deferred(&mut me);
+        me
+    }
+
+    /// Like `lock`, unless the lock is held.
+    #[inline]
+    fn try_lock(&self) -> Option<MutexGuard<'_, Inner>> {
+        let mut me = self.inner.try_lock()?;
+        self.run_deferred(&mut me);
+        Some(me)
+    }
+
+    /// Holds wakes back while the returned scope lives, if that is worth it.
+    fn wake_scope(&self) -> Option<WakeScope> {
+        self.is_contended
+            .load(Ordering::Relaxed)
+            .then(WakeScope::enter)
+    }
+
+    /// Makes a change that returns nothing: at once if the lock on all
+    /// streams is free, and else by leaving it to the next holder.
+    #[inline]
+    fn defer(&self, deferred: Deferred) {
+        match self.try_lock() {
+            Some(mut me) => me.run(deferred),
+            None => self.defer_slow(deferred),
+        }
+    }
+
+    #[cold]
+    fn defer_slow(&self, deferred: Deferred) {
+        // Read first: the flag shares its cache line with the locks.
+        if !self.is_contended.load(Ordering::Relaxed) {
+            self.is_contended.store(true, Ordering::Relaxed);
+        }
+
+        let mut queue = self.deferred.lock();
+        queue.push_back(deferred);
+        self.has_deferred.store(true, Ordering::Release);
+        drop(queue);
+
+        // Whoever takes the lock next runs the change. The connection takes
+        // it when polled, so waking it bounds the wait if no one else does.
+        self.conn_task.wake();
+    }
+
+    #[inline]
+    fn run_deferred(&self, me: &mut Inner) {
+        if self.has_deferred.load(Ordering::Acquire) {
+            self.run_deferred_slow(me);
+        }
+    }
+
+    #[cold]
+    fn run_deferred_slow(&self, me: &mut Inner) {
+        loop {
+            let deferred = {
+                let mut queue = self.deferred.lock();
+                let deferred = queue.pop_front();
+                if deferred.is_none() {
+                    self.has_deferred.store(false, Ordering::Release);
+                }
+                deferred
+            };
+
+            match deferred {
+                Some(deferred) => me.run(deferred),
+                None => return,
+            }
+        }
+    }
+
+    /// Records, once the connection has failed or run out of stream IDs, that
+    /// no stream can be opened anymore. Neither is ever undone.
+    fn publish_open_blocked(&self, me: &Inner) {
+        if me.actions.conn_error.is_some() || me.actions.send.ensure_next_stream_id().is_err() {
+            self.is_open_blocked.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Releases the budget of a DATA frame a handle has read, as
+    /// `Counts::release_data_frame` does under the lock.
+    fn release_data_frame(&self, payload_len: usize) {
+        let released = Counts::data_frame_overhead(payload_len);
+        if released != 0 {
+            self.released_data_frames
+                .fetch_add(released, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // Nothing takes the lock again, so the handles dropped last would
+        // leave their streams unreleased.
+        let deferred = std::mem::take(self.deferred.get_mut());
+        let me = self.inner.get_mut();
+        for deferred in deferred {
+            me.run(deferred);
+        }
     }
 }
 
@@ -1988,5 +2305,98 @@ impl Actions {
     fn clear_queues(&mut self, clear_pending_accept: bool, store: &mut Store, counts: &mut Counts) {
         self.recv.clear_queues(clear_pending_accept, store, counts);
         self.send.clear_queues(store, counts);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
+    use crate::proto::{DEFAULT_DATA_FRAME_BUDGET, DataFrameBudget};
+    use std::time::Duration;
+
+    fn config() -> Config {
+        Config {
+            initial_max_send_streams: 0,
+            local_max_buffer_size: 0,
+            local_next_stream_id: 1.into(),
+            local_push_enabled: false,
+            extended_connect_protocol_enabled: false,
+            local_reset_duration: Duration::ZERO,
+            local_reset_max: 0,
+            remote_reset_max: 0,
+            remote_init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
+            remote_max_initiated: None,
+            local_max_error_reset_streams: None,
+            data_frame_budget: DataFrameBudget::Configured(DEFAULT_DATA_FRAME_BUDGET),
+            headers_priority_policy: HeadersPriorityPolicy::default(),
+            headers_pseudo_order: None,
+        }
+    }
+
+    #[test]
+    fn changes_left_under_the_lock_run_in_order_for_its_next_holder() {
+        let shared = Shared::new(Inner::new(peer::Dyn::Client, config()));
+        let id = StreamId::from(1);
+        let key = shared
+            .lock()
+            .store
+            .insert(id, Stream::new(id, DEFAULT_INITIAL_WINDOW_SIZE, 0))
+            .key();
+        let requested = |me: &mut Inner| me.store.resolve(key).requested_send_capacity;
+
+        // With the lock free, a change is made at once.
+        shared.defer(Deferred::ReserveCapacity(key, 1));
+        assert_eq!(requested(&mut shared.lock()), 1);
+
+        // With the lock held, changes wait without blocking their caller.
+        let mut me = shared.lock();
+        shared.defer(Deferred::ReserveCapacity(key, 5));
+        shared.defer(Deferred::ReserveCapacity(key, 3));
+        assert_eq!(requested(&mut me), 1);
+        drop(me);
+
+        // The next holder finds both made, the later one last.
+        let mut me = shared.lock();
+        assert_eq!(requested(&mut me), 3);
+
+        let mut stream = me.store.resolve(key);
+        stream.unlink();
+        stream.remove();
+    }
+
+    #[test]
+    fn small_stream_writes_are_held_once_and_back_off() {
+        let mut small_write_yield = SmallWriteYield::default();
+        let write = |small_write_yield: &mut SmallWriteYield, is_woken, len| {
+            small_write_yield.is_woken = is_woken;
+            small_write_yield.holds(len)
+        };
+
+        // Only a small write that a stream woke the connection for is held.
+        assert!(!write(&mut small_write_yield, false, Some(10)));
+        assert!(!write(&mut small_write_yield, true, None));
+        assert!(write(&mut small_write_yield, true, Some(10)));
+        // It goes out when polled again, having gained a frame here.
+        assert!(!write(&mut small_write_yield, true, Some(20)));
+        assert!(write(&mut small_write_yield, true, Some(10)));
+
+        // A write that gained nothing lets the next one go at once, then
+        // three, and so on: `holds` are the writes held out of twelve.
+        assert!(!write(&mut small_write_yield, false, Some(10)));
+        let mut holds = Vec::new();
+        for n in 0..12 {
+            if write(&mut small_write_yield, true, Some(10)) {
+                holds.push(n);
+                assert!(!write(&mut small_write_yield, false, Some(10)));
+            }
+        }
+        assert_eq!(holds, [1, 5]);
+
+        // One that gains again ends the backoff.
+        small_write_yield.skip = 0;
+        assert!(write(&mut small_write_yield, true, Some(10)));
+        assert!(!write(&mut small_write_yield, true, None));
+        assert!(write(&mut small_write_yield, true, Some(10)));
     }
 }

@@ -51,9 +51,6 @@ pub(super) struct Recv {
     /// How long locally reset streams should ignore received frames
     reset_duration: Duration,
 
-    /// Holds frames that are waiting to be read
-    buffer: Buffer<Event>,
-
     /// If push promises are allowed to be received.
     is_push_enabled: bool,
 
@@ -116,7 +113,6 @@ impl Recv {
             pending_accept: store::Queue::new(),
             pending_reset_expired: store::Queue::new(),
             reset_duration: config.local_reset_duration,
-            buffer: Buffer::new(),
             is_push_enabled: config.local_push_enabled,
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
             initial_target_stream_window_sz: None,
@@ -271,10 +267,7 @@ impl Recv {
                 .convert_poll_message(pseudo, fields, stream_id)?;
 
             // Push the frame onto the stream's recv buffer
-            stream
-                .pending_recv
-                .push_back(&mut self.buffer, Event::Headers(message));
-            stream.notify_recv();
+            stream.push_recv(Event::Headers(message));
 
             // Only servers can receive a headers frame that initiates the stream.
             // This is verified in `Streams` before calling this function.
@@ -294,28 +287,10 @@ impl Recv {
 
             // Push the informational response onto the stream's recv buffer
             // with a special event type so it can be polled separately
-            stream
-                .pending_recv
-                .push_back(&mut self.buffer, Event::InformationalHeaders(message));
-            stream.notify_recv();
+            stream.push_recv(Event::InformationalHeaders(message));
         }
 
         Ok(())
-    }
-
-    /// Called by the server to get the request
-    ///
-    /// # Panics
-    ///
-    /// Panics if `stream.pending_recv` has no `Event::Headers` queued.
-    ///
-    pub fn take_request(&mut self, stream: &mut store::Ptr) -> Request<()> {
-        use super::peer::PollMessage::*;
-
-        match stream.pending_recv.pop_front(&mut self.buffer) {
-            Some(Event::Headers(Server(request))) => request,
-            _ => unreachable!("server stream queue must start with Headers"),
-        }
     }
 
     /// Called by the client to get pushed response
@@ -327,8 +302,9 @@ impl Recv {
         use super::peer::PollMessage::*;
 
         let mut ppp = stream.pending_push_promises.take();
-        let pushed = ppp.pop(stream.store_mut()).map(|mut pushed| {
-            match pushed.pending_recv.pop_front(&mut self.buffer) {
+        let pushed = ppp.pop(stream.store_mut()).map(|pushed| {
+            let event = pushed.recv().pending.pop_front();
+            match event {
                 Some(Event::Headers(Server(headers))) => (headers, pushed.key()),
                 // When frames are pushed into the queue, it is verified that
                 // the first frame is a HEADERS frame.
@@ -358,9 +334,11 @@ impl Recv {
     ) -> Poll<Result<Response<()>, proto::Error>> {
         use super::peer::PollMessage::*;
 
+        let mut recv = stream.recv();
+
         // Skip over any interim informational headers to find the main response
         loop {
-            match stream.pending_recv.pop_front(&mut self.buffer) {
+            match recv.pending.pop_front() {
                 Some(Event::Headers(Client(response))) => return Poll::Ready(Ok(response)),
                 Some(Event::InformationalHeaders(_)) => {
                     tracing::trace!(
@@ -379,7 +357,7 @@ impl Recv {
                         )));
                     }
 
-                    stream.recv_task = Some(cx.waker().clone());
+                    recv.wait(cx);
                     return Poll::Pending;
                 }
             }
@@ -394,15 +372,15 @@ impl Recv {
     ) -> Poll<Option<Result<Response<()>, proto::Error>>> {
         use super::peer::PollMessage::*;
 
+        let mut recv = stream.recv();
+
         // Try to pop the front event and check if it's an informational response
         // If it's not, we put it back
-        if let Some(event) = stream.pending_recv.pop_front(&mut self.buffer) {
+        if let Some(event) = recv.pending.pop_front() {
             match event {
                 Event::Headers(Client(response)) => {
                     // Final response
-                    stream
-                        .pending_recv
-                        .push_front(&mut self.buffer, Event::Headers(Client(response)));
+                    recv.pending.push_front(Event::Headers(Client(response)));
                     return Poll::Ready(None);
                 }
                 Event::InformationalHeaders(Client(response)) => {
@@ -411,7 +389,7 @@ impl Recv {
                 }
                 other => {
                     // Not an informational response, put it back at the front
-                    stream.pending_recv.push_front(&mut self.buffer, other);
+                    recv.pending.push_front(other);
                 }
             }
         }
@@ -419,7 +397,7 @@ impl Recv {
         // No informational response available at the front
         if stream.state.ensure_recv_open()? {
             // Request to get notified once more frames arrive
-            stream.recv_task = Some(cx.waker().clone());
+            recv.wait(cx);
             Poll::Pending
         } else {
             // No more frames will be received
@@ -444,10 +422,7 @@ impl Recv {
         let trailers = frame.into_fields();
 
         // Push the frame onto the stream's recv buffer
-        stream
-            .pending_recv
-            .push_back(&mut self.buffer, Event::Trailers(trailers));
-        stream.notify_recv();
+        stream.push_recv(Event::Trailers(trailers));
 
         Ok(())
     }
@@ -475,23 +450,17 @@ impl Recv {
         }
     }
 
-    /// Releases capacity back to the connection & stream
-    pub fn release_capacity(
+    /// Releases capacity back to the connection & stream, once it is taken
+    /// off the stream's in-flight data or never was part of it.
+    pub fn release_claimed_capacity(
         &mut self,
         capacity: WindowSize,
         stream: &mut store::Ptr,
         task: &mut Option<Waker>,
-    ) -> Result<(), UserError> {
+    ) {
         tracing::trace!("release_capacity; size={}", capacity);
 
-        if capacity > stream.in_flight_recv_data {
-            return Err(UserError::ReleaseCapacityTooBig);
-        }
-
         self.release_connection_capacity(capacity, task);
-
-        // Decrement in-flight data
-        stream.in_flight_recv_data -= capacity;
 
         // Assign capacity to stream
         // TODO: proper error handling
@@ -506,8 +475,6 @@ impl Recv {
                 task.wake();
             }
         }
-
-        Ok(())
     }
 
     /// Release any unclaimed capacity for a closed stream.
@@ -519,15 +486,15 @@ impl Recv {
     ) {
         debug_assert_eq!(stream.ref_count, 0);
 
-        if stream.in_flight_recv_data != 0 {
+        let in_flight = std::mem::take(&mut stream.recv().in_flight);
+        if in_flight != 0 {
             tracing::trace!(
                 "auto-release closed stream ({:?}) capacity: {:?}",
                 stream.id,
-                stream.in_flight_recv_data,
+                in_flight,
             );
 
-            self.release_connection_capacity(stream.in_flight_recv_data, task);
-            stream.in_flight_recv_data = 0;
+            self.release_connection_capacity(in_flight, task);
         }
 
         self.clear_recv_buffer(stream, task, counts);
@@ -665,14 +632,6 @@ impl Recv {
         Ok(())
     }
 
-    pub fn is_end_stream(&self, stream: &store::Ptr) -> bool {
-        if !stream.state.is_recv_end_stream() {
-            return false;
-        }
-
-        stream.pending_recv.is_empty()
-    }
-
     pub fn recv_data(&mut self, frame: frame::Data, stream: &mut store::Ptr) -> Result<(), Error> {
         // could include padding
         let sz = frame.flow_controlled_len();
@@ -768,11 +727,9 @@ impl Recv {
             .send_data(sz)
             .map_err(proto::Error::library_go_away)?;
 
-        // Track the data as in-flight
-        stream.in_flight_recv_data += sz;
-
         // Auto-release padding overhead (pad_len field + padding bytes),
-        // since the user only sees the data payload via `payload()`.
+        // since the user only sees the data payload via `payload()`. It
+        // never becomes in-flight data.
         let padding = (frame.flow_controlled_len() - frame.payload().len()) as WindowSize;
         if padding > 0 {
             tracing::trace!(
@@ -780,9 +737,7 @@ impl Recv {
                 padding,
                 stream.id,
             );
-            let _res = self.release_capacity(padding, stream, &mut None);
-            // cannot fail, we JUST added more in_flight data above.
-            debug_assert!(_res.is_ok());
+            self.release_claimed_capacity(padding, stream, &mut None);
         }
 
         // An empty DATA frame without END_STREAM has no effect on the HTTP
@@ -793,14 +748,13 @@ impl Recv {
         }
 
         let is_budgeted = !frame.is_end_stream();
-        let event = Event::Data(DataEvent {
+        let data = DataEvent {
             payload: frame.into_payload(),
             is_budgeted,
-        });
+        };
 
-        // Push the frame onto the recv buffer
-        stream.pending_recv.push_back(&mut self.buffer, event);
-        stream.notify_recv();
+        // Push the frame onto the recv buffer, tracking its data as in-flight
+        stream.push_recv_data(data);
 
         Ok(())
     }
@@ -892,10 +846,7 @@ impl Recv {
         }
 
         use super::peer::PollMessage::*;
-        stream
-            .pending_recv
-            .push_back(&mut self.buffer, Event::Headers(Server(req)));
-        stream.notify_recv();
+        stream.push_recv(Event::Headers(Server(req)));
         stream.notify_push();
         Ok(())
     }
@@ -986,22 +937,24 @@ impl Recv {
         counts: &mut Counts,
     ) {
         let mut to_release: WindowSize = 0;
-        while let Some(event) = stream.pending_recv.pop_front(&mut self.buffer) {
+        let mut recv = stream.recv();
+        while let Some(event) = recv.pending.pop_front() {
             if let Event::Data(data) = &event {
                 if data.is_budgeted {
                     counts.release_data_frame(data.payload.len());
                 }
                 to_release = to_release
                     .saturating_add(data.payload.len() as WindowSize)
-                    .min(stream.in_flight_recv_data);
+                    .min(recv.in_flight);
             }
         }
+        recv.in_flight -= to_release;
+        drop(recv);
         // Release flow control capacity. Cases:
         // * User read data but hasn't released: buf=0, in_flight>0 -> release 0
         // * User released without reading: buf>0, in_flight=0 -> release 0
         // * Normal drop without reading: buf=in_flight -> full release
         if to_release > 0 {
-            stream.in_flight_recv_data -= to_release;
             self.release_connection_capacity(to_release, task);
         }
     }
@@ -1238,11 +1191,12 @@ impl Recv {
         cx: &Context,
         stream: &mut Stream,
     ) -> Poll<Option<Result<DataEvent, proto::Error>>> {
-        match stream.pending_recv.pop_front(&mut self.buffer) {
+        let mut recv = stream.recv();
+        match recv.pending.pop_front() {
             Some(Event::Data(data)) => Poll::Ready(Some(Ok(data))),
             Some(event) => {
                 // Frame is trailer
-                stream.pending_recv.push_front(&mut self.buffer, event);
+                recv.pending.push_front(event);
 
                 // Notify the recv task. This is done just in case
                 // `poll_trailers` was called.
@@ -1252,12 +1206,12 @@ impl Recv {
                 // performance concern. It also means we don't have to track
                 // state to see if `poll_trailers` was called before `poll_data`
                 // returned `None`.
-                stream.notify_recv();
+                recv.notify();
 
                 // No more data frames
                 Poll::Ready(None)
             }
-            None => self.schedule_recv(cx, stream),
+            None => Self::schedule_recv(cx, &stream.state, &mut recv),
         }
     }
 
@@ -1266,26 +1220,27 @@ impl Recv {
         cx: &Context,
         stream: &mut Stream,
     ) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
-        match stream.pending_recv.pop_front(&mut self.buffer) {
+        let mut recv = stream.recv();
+        match recv.pending.pop_front() {
             Some(Event::Trailers(trailers)) => Poll::Ready(Some(Ok(trailers))),
             Some(event) => {
                 // Frame is not trailers.. not ready to poll trailers yet.
-                stream.pending_recv.push_front(&mut self.buffer, event);
-                stream.recv_task = Some(cx.waker().clone());
+                recv.pending.push_front(event);
+                recv.wait(cx);
                 Poll::Pending
             }
-            None => self.schedule_recv(cx, stream),
+            None => Self::schedule_recv(cx, &stream.state, &mut recv),
         }
     }
 
     fn schedule_recv<T>(
-        &mut self,
         cx: &Context,
-        stream: &mut Stream,
+        state: &State,
+        recv: &mut stream::RecvQueue,
     ) -> Poll<Option<Result<T, proto::Error>>> {
-        if stream.state.ensure_recv_open()? {
+        if state.ensure_recv_open()? {
             // Request to get notified once more frames arrive
-            stream.recv_task = Some(cx.waker().clone());
+            recv.wait(cx);
             Poll::Pending
         } else {
             // No more frames will be received
@@ -1440,22 +1395,19 @@ mod tests {
         let data = Bytes::from(vec![0; FRAME_LEN]);
 
         for _ in 0..FRAME_COUNT {
-            stream.pending_recv.push_back(
-                &mut recv.buffer,
-                Event::Data(DataEvent {
-                    payload: data.clone(),
-                    is_budgeted: true,
-                }),
-            );
+            stream.push_recv(Event::Data(DataEvent {
+                payload: data.clone(),
+                is_budgeted: true,
+            }));
         }
-        stream.in_flight_recv_data = DEFAULT_INITIAL_WINDOW_SIZE;
+        stream.recv().in_flight = DEFAULT_INITIAL_WINDOW_SIZE;
         recv.in_flight_data = DEFAULT_INITIAL_WINDOW_SIZE;
 
         let mut counts = Counts::new(peer::Dyn::Server, &config);
         recv.clear_recv_buffer(&mut stream, &mut None, &mut counts);
 
-        assert!(stream.pending_recv.is_empty());
-        assert_eq!(stream.in_flight_recv_data, 0);
+        assert!(stream.recv().pending.is_empty());
+        assert_eq!(stream.recv().in_flight, 0);
         assert_eq!(recv.in_flight_data, 0);
 
         stream.unlink();
