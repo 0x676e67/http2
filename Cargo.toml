@@ -97,3 +97,7 @@ features = ["stream"]
 [[bench]]
 name = "main"
 harness = false
+
+[[bench]]
+name = "scaling"
+harness = false
