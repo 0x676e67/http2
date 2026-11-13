@@ -472,10 +472,11 @@ impl Recv {
         let _res = self.flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
 
-        if self
-            .window_updates
-            .connection_release_due(&self.flow, self.in_flight_data, capacity)
-            && let Some(task) = task.take()
+        if self.window_updates.on_connection_capacity_released(
+            &self.flow,
+            self.in_flight_data,
+            capacity,
+        ) && let Some(task) = task.take()
         {
             task.wake();
         }
@@ -582,7 +583,7 @@ impl Recv {
 
         if self
             .window_updates
-            .connection_target_changed(&self.flow, grew)
+            .on_connection_target_changed(&self.flow, grew)
             && let Some(task) = task.take()
         {
             task.wake();
@@ -637,7 +638,7 @@ impl Recv {
                         // Capacity released before the ACK can cross the
                         // WINDOW_UPDATE threshold once the window shrinks.
                         // Nothing else queues it, so the peer would stall.
-                        if self.window_updates.stream_window_changed(&stream) {
+                        if self.window_updates.stream_update_due_after_shrink(&stream) {
                             self.pending_window_updates.push(&mut stream);
                         }
                         Ok::<_, proto::Error>(())
@@ -777,7 +778,7 @@ impl Recv {
         // Track the data as in-flight
         stream.in_flight_recv_data += sz;
 
-        if self.window_updates.stream_receive_due(stream) {
+        if self.window_updates.stream_update_due_on_data(stream) {
             self.pending_window_updates.push(stream);
         }
 
@@ -846,7 +847,7 @@ impl Recv {
 
         // Track the data as in-flight
         self.in_flight_data += sz;
-        self.window_updates.connection_received(&self.flow);
+        self.window_updates.on_connection_data_received(&self.flow);
         Ok(())
     }
 
@@ -1163,7 +1164,7 @@ impl Recv {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        if let Some(incr) = self.window_updates.connection_increment(&self.flow) {
+        if let Some(incr) = self.window_updates.prepare_connection_update(&self.flow) {
             let frame = frame::WindowUpdate::new(StreamId::zero(), incr);
 
             // Ensure the codec has capacity
