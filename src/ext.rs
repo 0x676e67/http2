@@ -6,6 +6,58 @@ use crate::hpack::BytesStr;
 use bytes::Bytes;
 use std::fmt;
 
+/// Controls when released receive capacity is advertised with WINDOW_UPDATE.
+/// Only released receive capacity is advertised.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum WindowUpdateRule {
+    /// Updates after releasing strictly more than half the receive target.
+    /// An optional delay also permits an update on the next nonzero release;
+    /// elapsed time alone does not send a frame.
+    TargetWindowHalf {
+        /// Time since opening the stream/connection or its last update.
+        max_delay: Option<std::time::Duration>,
+    },
+    /// Updates when released capacity reaches `increment`, or the peer's
+    /// remaining window falls to `low_window` or below.
+    Threshold {
+        /// Minimum accumulated release, in bytes. Zero updates on every release.
+        increment: u32,
+        /// Remaining receive window at which any released capacity is returned.
+        low_window: u32,
+    },
+}
+
+/// Receive window update rules for streams and the connection.
+/// The default preserves the original remaining-window thresholds.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WindowUpdatePolicy {
+    pub(crate) stream: Option<WindowUpdateRule>,
+    pub(crate) connection: Option<WindowUpdateRule>,
+}
+
+impl WindowUpdatePolicy {
+    /// Uses the same rule for streams and the connection.
+    pub fn both(rule: WindowUpdateRule) -> Self {
+        Self {
+            stream: Some(rule),
+            connection: Some(rule),
+        }
+    }
+
+    /// Sets the stream receive window update rule.
+    pub fn stream(mut self, rule: WindowUpdateRule) -> Self {
+        self.stream = Some(rule);
+        self
+    }
+
+    /// Sets the connection receive window update rule.
+    pub fn connection(mut self, rule: WindowUpdateRule) -> Self {
+        self.connection = Some(rule);
+        self
+    }
+}
+
 /// Represents the `:protocol` pseudo-header used by
 /// the [Extended CONNECT Protocol].
 ///

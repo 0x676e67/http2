@@ -187,6 +187,18 @@ impl FlowControl {
         }
         Ok(())
     }
+
+    pub(super) fn released_capacity(&self) -> Option<WindowSize> {
+        // A SETTINGS reduction can leave a negative window. Each increment
+        // still fits 31 bits (RFC 9113 §6.9).
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9
+        let released = i64::from(self.available.0) - i64::from(self.window_size.0);
+        (released > 0).then_some(released.min(i64::from(MAX_WINDOW_SIZE)) as WindowSize)
+    }
+
+    pub(super) fn receive_target(&self, in_flight: WindowSize) -> i64 {
+        i64::from(self.available.0) + i64::from(in_flight)
+    }
 }
 
 /// The current capacity of a flow-controlled Window.

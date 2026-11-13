@@ -418,6 +418,7 @@ mod tests {
             data_frame_budget: DataFrameBudget::Configured(DEFAULT_DATA_FRAME_BUDGET),
             headers_priority_policy: HeadersPriorityPolicy::default(),
             headers_pseudo_order: None,
+            window_update_policy: crate::ext::WindowUpdatePolicy::default(),
         }
     }
 

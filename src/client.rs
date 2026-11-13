@@ -390,6 +390,7 @@ pub struct Builder {
 
     /// Initial target receive window size for locally initiated streams.
     initial_target_stream_window_size: Option<u32>,
+    window_update_policy: crate::ext::WindowUpdatePolicy,
 }
 
 #[derive(Debug)]
@@ -720,6 +721,7 @@ impl Builder {
             preface_ping: None,
             preface_ping_timeout: None,
             initial_target_stream_window_size: None,
+            window_update_policy: crate::ext::WindowUpdatePolicy::default(),
         }
     }
 
@@ -1576,6 +1578,33 @@ impl Builder {
         self.preface_ping_timeout = Some(timeout);
         self
     }
+
+    /// Sets the policy for returning released stream receive capacity.
+    /// `None` preserves the default remaining-window threshold.
+    pub fn stream_window_update_policy(
+        &mut self,
+        rule: Option<crate::ext::WindowUpdateRule>,
+    ) -> &mut Self {
+        self.window_update_policy.stream = rule;
+        self
+    }
+
+    /// Sets the policy for returning released connection receive capacity.
+    /// `None` preserves the default remaining-window threshold.
+    pub fn connection_window_update_policy(
+        &mut self,
+        rule: Option<crate::ext::WindowUpdateRule>,
+    ) -> &mut Self {
+        self.window_update_policy.connection = rule;
+        self
+    }
+
+    /// Sets the receive window update rules for streams and the connection.
+    /// The default policy preserves the original remaining-window thresholds.
+    pub fn window_update_policy(&mut self, policy: crate::ext::WindowUpdatePolicy) -> &mut Self {
+        self.window_update_policy = policy;
+        self
+    }
 }
 
 impl Default for Builder {
@@ -1724,6 +1753,7 @@ where
                 priorities: builder.priorities,
                 preface_ping: builder.preface_ping,
                 preface_ping_timeout: builder.preface_ping_timeout,
+                window_update_policy: builder.window_update_policy,
             },
         );
         let send_request = SendRequest {

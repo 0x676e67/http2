@@ -1598,6 +1598,7 @@ where
                             priorities: None,
                             preface_ping: None,
                             preface_ping_timeout: None,
+                            window_update_policy: crate::ext::WindowUpdatePolicy::default(),
                         },
                     );
 

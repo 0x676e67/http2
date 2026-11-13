@@ -97,6 +97,7 @@ pub(crate) struct Config {
     pub priorities: Option<Priorities>,
     pub preface_ping: Option<Duration>,
     pub preface_ping_timeout: Option<Duration>,
+    pub window_update_policy: crate::ext::WindowUpdatePolicy,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -185,6 +186,7 @@ where
                 data_frame_budget: config.data_frame_budget,
                 headers_priority_policy: std::mem::take(&mut config.headers_priority_policy),
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
+                window_update_policy: config.window_update_policy,
             }
         }
         let state = if P::r#dyn().is_server() {
@@ -462,6 +464,7 @@ where
                     "client initial connection write complete; entering normal polling"
                 );
                 self.inner.state = State::Open;
+                self.inner.streams.start_connection_window_updates();
                 self.codec.start_one_frame_per_write();
                 self.maybe_close_connection_if_no_streams();
                 Poll::Ready(Ok(()))
