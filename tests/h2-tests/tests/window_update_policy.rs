@@ -208,6 +208,88 @@ async fn elapsed_delay_needs_nonzero_release() {
 }
 
 #[tokio::test]
+async fn only_connection_target_growth_bypasses_the_update_threshold() {
+    let (io, mut peer) = mock::new();
+    let policy = WindowUpdatePolicy::default()
+        .connection(WindowUpdateRule::TargetWindowHalf { max_delay: None });
+    let (mut client, mut conn) = client::Builder::new()
+        .window_update_policy(policy)
+        .handshake::<_, Bytes>(io)
+        .await
+        .unwrap();
+
+    conn.drive(peer.assert_client_handshake()).await;
+    let response = client.get("https://example.com/");
+    conn.drive(
+        peer.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        ),
+    )
+    .await;
+    peer.send_frame(frames::headers(1).response(200)).await;
+    peer.send_frame(frames::data(1, vec![0; 4_096])).await;
+    let mut body = conn.drive(response).await.unwrap().into_body();
+    let data = conn.drive(body.data()).await.unwrap().unwrap();
+    body.flow_control().release_capacity(data.len()).unwrap();
+
+    conn.set_target_window_size(64_535);
+    conn.drive(util::yield_once()).await;
+    conn.drive(peer.ping_pong([1; 8])).await;
+
+    conn.set_target_window_size(64_535);
+    conn.drive(util::yield_once()).await;
+    conn.drive(peer.ping_pong([2; 8])).await;
+
+    conn.set_target_window_size(65_535);
+    conn.drive(peer.recv_frame(frames::window_update(0, 4_096)))
+        .await;
+}
+
+#[tokio::test]
+async fn connection_update_delay_starts_after_the_initial_write() {
+    let (io, mut peer) = mock::new_with_write_capacity(0);
+    let delay = Duration::from_secs(1);
+    let policy = WindowUpdatePolicy::default().connection(WindowUpdateRule::TargetWindowHalf {
+        max_delay: Some(delay),
+    });
+    let (mut client, mut conn) = client::Builder::new()
+        .window_update_policy(policy)
+        .handshake::<_, Bytes>(io)
+        .await
+        .unwrap();
+
+    // Poll the connection while the initial write stays blocked past the delay.
+    conn.drive(tokio::time::sleep(delay)).await;
+    peer.unbounded_bytes().await;
+    conn.drive(peer.assert_client_handshake()).await;
+
+    let response = client.get("https://example.com/");
+    conn.drive(
+        peer.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        ),
+    )
+    .await;
+    peer.send_frame(frames::headers(1).response(200)).await;
+    peer.send_frame(frames::data(1, "ab")).await;
+    let mut body = conn.drive(response).await.unwrap().into_body();
+    let data = conn.drive(body.data()).await.unwrap().unwrap();
+    assert_eq!(&data[..], b"ab");
+    body.flow_control().release_capacity(1).unwrap();
+    conn.drive(util::yield_once()).await;
+    conn.drive(peer.ping_pong([1; 8])).await;
+
+    tokio::time::sleep(delay).await;
+    body.flow_control().release_capacity(1).unwrap();
+    conn.drive(peer.recv_frame(frames::window_update(0, 2)))
+        .await;
+}
+
+#[tokio::test]
 async fn padding_is_released_and_closed_stream_only_updates_connection() {
     let (io, mut peer) = mock::new();
     let (read_tx, read_rx) = tokio::sync::oneshot::channel();

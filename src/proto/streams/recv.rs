@@ -573,13 +573,16 @@ impl Recv {
             .available()
             .add(self.in_flight_data)?
             .checked_size();
-        if target > current {
+        let grew = target > current;
+        if grew {
             self.flow.assign_capacity(target - current)?;
         } else {
             self.flow.claim_capacity(current - target)?;
         }
 
-        if self.window_updates.connection_target_changed(&self.flow)
+        if self
+            .window_updates
+            .connection_target_changed(&self.flow, grew)
             && let Some(task) = task.take()
         {
             task.wake();
@@ -1414,6 +1417,10 @@ impl Recv {
             }
         }
         Ok(true)
+    }
+
+    pub(super) fn start_connection_window_updates(&mut self) {
+        self.window_updates.start_connection();
     }
 }
 

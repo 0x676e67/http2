@@ -14,7 +14,7 @@ impl RecvWindowUpdates {
     pub(super) fn new(policy: WindowUpdatePolicy) -> Self {
         Self {
             policy,
-            connection_last_update_at: initial_update_at(policy.connection),
+            connection_last_update_at: None,
             connection_pending: false,
         }
     }
@@ -69,9 +69,10 @@ impl RecvWindowUpdates {
         )
     }
 
-    pub(super) fn connection_target_changed(&mut self, flow: &FlowControl) -> bool {
+    pub(super) fn connection_target_changed(&mut self, flow: &FlowControl, grew: bool) -> bool {
         // Explicit target growth bypasses the optional release threshold.
-        let due = increment(self.policy.connection, flow).is_some();
+        let due = (grew || self.policy.connection.is_none())
+            && increment(self.policy.connection, flow).is_some();
         self.connection_pending |= due;
         due
     }
@@ -99,6 +100,10 @@ impl RecvWindowUpdates {
 
     pub(super) fn stream_buffered(&self, stream: &mut Stream) {
         record_update(&mut stream.last_window_update_at);
+    }
+
+    pub(super) fn start_connection(&mut self) {
+        self.connection_last_update_at = initial_update_at(self.policy.connection);
     }
 }
 

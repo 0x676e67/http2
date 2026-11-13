@@ -464,6 +464,7 @@ where
                     "client initial connection write complete; entering normal polling"
                 );
                 self.inner.state = State::Open;
+                self.inner.streams.start_connection_window_updates();
                 self.codec.start_one_frame_per_write();
                 self.maybe_close_connection_if_no_streams();
                 Poll::Ready(Ok(()))
