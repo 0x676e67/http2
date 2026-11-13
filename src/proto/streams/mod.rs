@@ -91,6 +91,8 @@ pub struct Config {
 
     /// Pseudo order of the headers stream
     pub headers_pseudo_order: Option<PseudoOrder>,
+    pub stream_window_update_policy: Option<crate::ext::WindowUpdatePolicy>,
+    pub connection_window_update_policy: Option<crate::ext::WindowUpdatePolicy>,
 }
 
 trait DebugStructExt<'a, 'b> {

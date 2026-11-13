@@ -97,6 +97,8 @@ pub(crate) struct Config {
     pub priorities: Option<Priorities>,
     pub preface_ping: Option<Duration>,
     pub preface_ping_timeout: Option<Duration>,
+    pub stream_window_update_policy: Option<crate::ext::WindowUpdatePolicy>,
+    pub connection_window_update_policy: Option<crate::ext::WindowUpdatePolicy>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -185,6 +187,8 @@ where
                 data_frame_budget: config.data_frame_budget,
                 headers_priority_policy: std::mem::take(&mut config.headers_priority_policy),
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
+                stream_window_update_policy: config.stream_window_update_policy,
+                connection_window_update_policy: config.connection_window_update_policy,
             }
         }
         let state = if P::r#dyn().is_server() {

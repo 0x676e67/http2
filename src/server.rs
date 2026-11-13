@@ -1598,6 +1598,8 @@ where
                             priorities: None,
                             preface_ping: None,
                             preface_ping_timeout: None,
+                            stream_window_update_policy: None,
+                            connection_window_update_policy: None,
                         },
                     );
 

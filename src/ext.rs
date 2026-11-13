@@ -6,6 +6,28 @@ use crate::hpack::BytesStr;
 use bytes::Bytes;
 use std::fmt;
 
+/// Controls when released receive capacity is advertised with WINDOW_UPDATE.
+/// Only released receive capacity is advertised.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum WindowUpdatePolicy {
+    /// Updates after releasing strictly more than half the receive target.
+    /// An optional delay also permits an update on the next nonzero release;
+    /// elapsed time alone does not send a frame.
+    TargetWindowHalf {
+        /// Time since opening the stream/connection or its last update.
+        max_delay: Option<std::time::Duration>,
+    },
+    /// Updates when released capacity reaches `increment`, or the peer's
+    /// remaining window falls to `low_window` or below.
+    Threshold {
+        /// Minimum accumulated release, in bytes. Zero updates on every release.
+        increment: u32,
+        /// Remaining receive window at which any released capacity is returned.
+        low_window: u32,
+    },
+}
+
 /// Represents the `:protocol` pseudo-header used by
 /// the [Extended CONNECT Protocol].
 ///

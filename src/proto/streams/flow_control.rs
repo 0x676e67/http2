@@ -187,6 +187,43 @@ impl FlowControl {
         }
         Ok(())
     }
+
+    pub(super) fn released_capacity(&self) -> Option<WindowSize> {
+        // A SETTINGS reduction can leave a negative window. Each increment
+        // still fits 31 bits (RFC 9113 §6.9).
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9
+        let released = i64::from(self.available.0) - i64::from(self.window_size.0);
+        (released > 0).then_some(released.min(i64::from(MAX_WINDOW_SIZE)) as WindowSize)
+    }
+
+    pub(super) fn update_due(
+        &self,
+        policy: Option<crate::ext::WindowUpdatePolicy>,
+        in_flight: WindowSize,
+        last_update: Option<std::time::Instant>,
+    ) -> bool {
+        use crate::ext::WindowUpdatePolicy;
+
+        let Some(policy) = policy else {
+            return self.unclaimed_capacity().is_some();
+        };
+        let Some(released) = self.released_capacity() else {
+            return false;
+        };
+        match policy {
+            WindowUpdatePolicy::TargetWindowHalf { max_delay } => {
+                let target = i64::from(self.available.0) + i64::from(in_flight);
+                i64::from(released) > target / 2
+                    || max_delay
+                        .zip(last_update)
+                        .is_some_and(|(delay, last)| last.elapsed() >= delay)
+            }
+            WindowUpdatePolicy::Threshold {
+                increment,
+                low_window,
+            } => released >= increment || self.window_size() <= low_window,
+        }
+    }
 }
 
 /// The current capacity of a flow-controlled Window.
