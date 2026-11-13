@@ -14,7 +14,8 @@ use std::time::Instant;
 pub(super) struct RecvWindowUpdates {
     policy: WindowUpdatePolicy,
     connection_last_update_at: Option<Instant>,
-    connection_pending: bool,
+    connection_rule_pending: bool,
+    connection_growth_from: Option<WindowSize>,
 }
 
 // ===== impl RecvWindowUpdates =====
@@ -24,7 +25,8 @@ impl RecvWindowUpdates {
         Self {
             policy,
             connection_last_update_at: None,
-            connection_pending: false,
+            connection_rule_pending: false,
+            connection_growth_from: None,
         }
     }
 
@@ -65,7 +67,7 @@ impl RecvWindowUpdates {
                 in_flight,
                 self.connection_last_update_at,
             );
-        self.connection_pending |= due;
+        self.connection_rule_pending |= due;
         due
     }
 
@@ -78,7 +80,7 @@ impl RecvWindowUpdates {
     /// Checks the threshold rule after DATA reduces the connection window and
     /// marks an update pending if due.
     pub(super) fn on_connection_data_received(&mut self, flow: &FlowControl) {
-        self.connection_pending |= update_due_on_data(self.policy.connection, flow);
+        self.connection_rule_pending |= update_due_on_data(self.policy.connection, flow);
     }
 
     /// Rechecks the stream rule after applying an acknowledged window reduction.
@@ -92,27 +94,45 @@ impl RecvWindowUpdates {
         )
     }
 
-    /// Marks an update pending if due after the connection target changes.
-    /// Only an increase bypasses the configured threshold. `Recv` wakes a
-    /// parked connection when this returns `true`.
-    pub(super) fn on_connection_target_changed(&mut self, flow: &FlowControl, grew: bool) -> bool {
-        let due = (grew || self.policy.connection.is_none())
-            && increment(self.policy.connection, flow).is_some();
-        self.connection_pending |= due;
+    /// Lets a target increase bypass the configured rule until the update is
+    /// buffered or the target returns to its pre-growth size or below.
+    /// `Recv` wakes a parked connection when this returns `true`.
+    pub(super) fn on_connection_target_changed(
+        &mut self,
+        flow: &FlowControl,
+        previous_target: WindowSize,
+        target: WindowSize,
+    ) -> bool {
+        if self.policy.connection.is_none() {
+            return flow.unclaimed_capacity().is_some();
+        }
+
+        let growth_from = self.connection_growth_from.unwrap_or(previous_target);
+        if target <= growth_from {
+            self.connection_growth_from = None;
+        }
+
+        let due = target > previous_target && flow.released_capacity().is_some();
+        if due {
+            self.connection_growth_from = Some(growth_from);
+        }
         due
     }
 
-    /// Recomputes the increment and clears the pending flag if no credit is
-    /// available. A returned increment leaves the flag as is, so the update
-    /// can be retried if the codec is full.
+    /// Recomputes the increment and clears both pending reasons if no credit
+    /// is available. Otherwise both survive a full codec and can be retried.
     pub(super) fn prepare_connection_update(&mut self, flow: &FlowControl) -> Option<WindowSize> {
-        let increment = if self.policy.connection.is_none() || self.connection_pending {
+        let increment = if self.policy.connection.is_none()
+            || self.connection_rule_pending
+            || self.connection_growth_from.is_some()
+        {
             increment(self.policy.connection, flow)
         } else {
             None
         };
         if increment.is_none() {
-            self.connection_pending = false;
+            self.connection_rule_pending = false;
+            self.connection_growth_from = None;
         }
         increment
     }
@@ -122,11 +142,12 @@ impl RecvWindowUpdates {
         increment(self.policy.stream, &stream.recv_flow)
     }
 
-    /// Clears the pending flag and restarts the configured delay after the codec
+    /// Clears both pending reasons and restarts the configured delay after the codec
     /// accepts the frame and `Recv` advances the connection window.
     pub(super) fn connection_buffered(&mut self) {
         record_update(&mut self.connection_last_update_at);
-        self.connection_pending = false;
+        self.connection_rule_pending = false;
+        self.connection_growth_from = None;
     }
 
     /// Restarts the stream's configured delay after the codec accepts its update

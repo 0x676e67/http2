@@ -234,6 +234,12 @@ async fn only_connection_target_growth_bypasses_the_update_threshold() {
     let data = conn.drive(body.data()).await.unwrap().unwrap();
     body.flow_control().release_capacity(data.len()).unwrap();
 
+    // Both target changes happen before the connection can buffer an update.
+    conn.set_target_window_size(66_535);
+    conn.set_target_window_size(65_535);
+    conn.drive(util::yield_once()).await;
+    conn.drive(peer.ping_pong([0; 8])).await;
+
     conn.set_target_window_size(64_535);
     conn.drive(util::yield_once()).await;
     conn.drive(peer.ping_pong([1; 8])).await;
@@ -242,8 +248,45 @@ async fn only_connection_target_growth_bypasses_the_update_threshold() {
     conn.drive(util::yield_once()).await;
     conn.drive(peer.ping_pong([2; 8])).await;
 
+    conn.set_target_window_size(66_535);
     conn.set_target_window_size(65_535);
     conn.drive(peer.recv_frame(frames::window_update(0, 4_096)))
+        .await;
+}
+
+#[tokio::test]
+async fn withdrawing_connection_target_growth_keeps_a_due_update() {
+    let (io, mut peer) = mock::new();
+    let policy = WindowUpdatePolicy::default().connection(WindowUpdateRule::Threshold {
+        increment: 4_096,
+        low_window: 0,
+    });
+    let (mut client, mut conn) = client::Builder::new()
+        .window_update_policy(policy)
+        .handshake::<_, Bytes>(io)
+        .await
+        .unwrap();
+
+    conn.drive(peer.assert_client_handshake()).await;
+    let response = client.get("https://example.com/");
+    conn.drive(
+        peer.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        ),
+    )
+    .await;
+    peer.send_frame(frames::headers(1).response(200)).await;
+    peer.send_frame(frames::data(1, vec![0; 4_096])).await;
+    let mut body = conn.drive(response).await.unwrap().into_body();
+    let data = conn.drive(body.data()).await.unwrap().unwrap();
+    body.flow_control().release_capacity(data.len()).unwrap();
+
+    conn.set_target_window_size(66_535);
+    conn.set_target_window_size(65_534);
+    // The release reached the threshold before the shrink reduced the credit.
+    conn.drive(peer.recv_frame(frames::window_update(0, 4_095)))
         .await;
 }
 

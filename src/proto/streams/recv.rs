@@ -574,8 +574,7 @@ impl Recv {
             .available()
             .add(self.in_flight_data)?
             .checked_size();
-        let grew = target > current;
-        if grew {
+        if target > current {
             self.flow.assign_capacity(target - current)?;
         } else {
             self.flow.claim_capacity(current - target)?;
@@ -583,7 +582,7 @@ impl Recv {
 
         if self
             .window_updates
-            .on_connection_target_changed(&self.flow, grew)
+            .on_connection_target_changed(&self.flow, current, target)
             && let Some(task) = task.take()
         {
             task.wake();
