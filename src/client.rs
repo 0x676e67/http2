@@ -390,8 +390,7 @@ pub struct Builder {
 
     /// Initial target receive window size for locally initiated streams.
     initial_target_stream_window_size: Option<u32>,
-    stream_window_update_policy: Option<crate::ext::WindowUpdatePolicy>,
-    connection_window_update_policy: Option<crate::ext::WindowUpdatePolicy>,
+    window_update_policy: crate::ext::WindowUpdatePolicy,
 }
 
 #[derive(Debug)]
@@ -722,8 +721,7 @@ impl Builder {
             preface_ping: None,
             preface_ping_timeout: None,
             initial_target_stream_window_size: None,
-            stream_window_update_policy: None,
-            connection_window_update_policy: None,
+            window_update_policy: crate::ext::WindowUpdatePolicy::default(),
         }
     }
 
@@ -1585,9 +1583,9 @@ impl Builder {
     /// `None` preserves the default remaining-window threshold.
     pub fn stream_window_update_policy(
         &mut self,
-        policy: Option<crate::ext::WindowUpdatePolicy>,
+        rule: Option<crate::ext::WindowUpdateRule>,
     ) -> &mut Self {
-        self.stream_window_update_policy = policy;
+        self.window_update_policy.stream = rule;
         self
     }
 
@@ -1595,9 +1593,16 @@ impl Builder {
     /// `None` preserves the default remaining-window threshold.
     pub fn connection_window_update_policy(
         &mut self,
-        policy: Option<crate::ext::WindowUpdatePolicy>,
+        rule: Option<crate::ext::WindowUpdateRule>,
     ) -> &mut Self {
-        self.connection_window_update_policy = policy;
+        self.window_update_policy.connection = rule;
+        self
+    }
+
+    /// Sets the receive window update rules for streams and the connection.
+    /// The default policy preserves the original remaining-window thresholds.
+    pub fn window_update_policy(&mut self, policy: crate::ext::WindowUpdatePolicy) -> &mut Self {
+        self.window_update_policy = policy;
         self
     }
 }
@@ -1748,8 +1753,7 @@ where
                 priorities: builder.priorities,
                 preface_ping: builder.preface_ping,
                 preface_ping_timeout: builder.preface_ping_timeout,
-                stream_window_update_policy: builder.stream_window_update_policy,
-                connection_window_update_policy: builder.connection_window_update_policy,
+                window_update_policy: builder.window_update_policy,
             },
         );
         let send_request = SendRequest {

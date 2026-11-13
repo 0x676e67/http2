@@ -1,4 +1,4 @@
-use h2::ext::WindowUpdatePolicy;
+use h2::ext::{WindowUpdatePolicy, WindowUpdateRule};
 use h2_support::prelude::*;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -6,8 +6,8 @@ use tokio::sync::mpsc;
 // Each step consumes DATA before choosing how much capacity to release.
 // PING barriers make unexpected WINDOW_UPDATE frames visible to the peer.
 async fn check_updates(
-    stream_policy: Option<WindowUpdatePolicy>,
-    connection_policy: Option<WindowUpdatePolicy>,
+    stream_policy: Option<WindowUpdateRule>,
+    connection_policy: Option<WindowUpdateRule>,
     steps: &[(usize, usize, u32, u32)],
 ) {
     let (io, mut peer) = mock::new();
@@ -45,12 +45,18 @@ async fn check_updates(
         peer.recv_eof().await;
     };
     let local = async {
+        let mut policy = WindowUpdatePolicy::default();
+        if let Some(rule) = stream_policy {
+            policy = policy.stream(rule);
+        }
+        if let Some(rule) = connection_policy {
+            policy = policy.connection(rule);
+        }
         let (mut client, mut conn) = client::Builder::new()
             .initial_window_size(65_536)
             .initial_connection_window_size(65_536)
             .one_frame_per_write(true)
-            .stream_window_update_policy(stream_policy)
-            .connection_window_update_policy(connection_policy)
+            .window_update_policy(policy)
             .handshake::<_, Bytes>(io)
             .await
             .unwrap();
@@ -84,7 +90,7 @@ async fn check_updates(
 
 #[tokio::test]
 async fn target_half_is_strict_and_counts_outstanding_data() {
-    let policy = Some(WindowUpdatePolicy::TargetWindowHalf { max_delay: None });
+    let policy = Some(WindowUpdateRule::TargetWindowHalf { max_delay: None });
     check_updates(
         policy,
         policy,
@@ -101,7 +107,7 @@ async fn target_half_is_strict_and_counts_outstanding_data() {
 
 #[tokio::test]
 async fn threshold_low_window_reclaims_only_released_capacity() {
-    let policy = Some(WindowUpdatePolicy::Threshold {
+    let policy = Some(WindowUpdateRule::Threshold {
         increment: 40_000,
         low_window: 16_384,
     });
@@ -120,7 +126,7 @@ async fn threshold_low_window_reclaims_only_released_capacity() {
 
 #[tokio::test]
 async fn policies_are_independent_and_none_keeps_default() {
-    let half = Some(WindowUpdatePolicy::TargetWindowHalf { max_delay: None });
+    let half = Some(WindowUpdateRule::TargetWindowHalf { max_delay: None });
     check_updates(
         None,
         half,
@@ -143,9 +149,9 @@ async fn elapsed_delay_needs_nonzero_release() {
     let (elapsed_tx, elapsed_rx) = tokio::sync::oneshot::channel();
     let (zero_tx, zero_rx) = tokio::sync::oneshot::channel();
     let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
-    let policy = Some(WindowUpdatePolicy::TargetWindowHalf {
+    let rule = WindowUpdateRule::TargetWindowHalf {
         max_delay: Some(Duration::from_secs(1)),
-    });
+    };
     let remote = async {
         peer.assert_client_handshake().await;
         peer.recv_frame(
@@ -170,8 +176,7 @@ async fn elapsed_delay_needs_nonzero_release() {
     };
     let local = async {
         let (mut client, mut conn) = client::Builder::new()
-            .stream_window_update_policy(policy)
-            .connection_window_update_policy(policy)
+            .window_update_policy(WindowUpdatePolicy::both(rule))
             .handshake::<_, Bytes>(io)
             .await
             .unwrap();
@@ -207,10 +212,10 @@ async fn padding_is_released_and_closed_stream_only_updates_connection() {
     let (io, mut peer) = mock::new();
     let (read_tx, read_rx) = tokio::sync::oneshot::channel();
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    let policy = Some(WindowUpdatePolicy::Threshold {
+    let rule = WindowUpdateRule::Threshold {
         increment: 4,
         low_window: 0,
-    });
+    };
     let remote = async {
         peer.assert_client_handshake().await;
         peer.recv_frame(
@@ -234,8 +239,7 @@ async fn padding_is_released_and_closed_stream_only_updates_connection() {
     };
     let local = async {
         let (mut client, mut conn) = client::Builder::new()
-            .stream_window_update_policy(policy)
-            .connection_window_update_policy(policy)
+            .window_update_policy(WindowUpdatePolicy::both(rule))
             .one_frame_per_write(true)
             .handshake::<_, Bytes>(io)
             .await

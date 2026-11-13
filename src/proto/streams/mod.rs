@@ -11,6 +11,7 @@ mod stream;
 #[allow(clippy::module_inception)]
 mod streams;
 mod sync;
+mod window_update;
 
 pub(crate) use self::headers_priority::HeadersPriorityPolicy;
 pub(crate) use self::prioritize::Prioritized;
@@ -91,8 +92,7 @@ pub struct Config {
 
     /// Pseudo order of the headers stream
     pub headers_pseudo_order: Option<PseudoOrder>,
-    pub stream_window_update_policy: Option<crate::ext::WindowUpdatePolicy>,
-    pub connection_window_update_policy: Option<crate::ext::WindowUpdatePolicy>,
+    pub window_update_policy: crate::ext::WindowUpdatePolicy,
 }
 
 trait DebugStructExt<'a, 'b> {

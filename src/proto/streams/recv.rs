@@ -1,4 +1,5 @@
 use super::stream::ContentLength;
+use super::window_update::RecvWindowUpdates;
 use super::*;
 use crate::codec::UserError;
 use crate::frame::{DEFAULT_INITIAL_WINDOW_SIZE, PushPromiseHeaderError, Reason};
@@ -65,10 +66,7 @@ pub(super) struct Recv {
 
     /// Latest local SETTINGS baseline queued before new request HEADERS.
     sent_initial_window_sz: WindowSize,
-    stream_window_update_policy: Option<crate::ext::WindowUpdatePolicy>,
-    connection_window_update_policy: Option<crate::ext::WindowUpdatePolicy>,
-    last_connection_window_update_at: Option<Instant>,
-    connection_window_update_pending: bool,
+    window_updates: RecvWindowUpdates,
 }
 
 #[derive(Debug)]
@@ -125,12 +123,7 @@ impl Recv {
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
             initial_target_stream_window_sz: None,
             sent_initial_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
-            stream_window_update_policy: config.stream_window_update_policy,
-            connection_window_update_policy: config.connection_window_update_policy,
-            last_connection_window_update_at: window_update_timer(
-                config.connection_window_update_policy,
-            ),
-            connection_window_update_pending: false,
+            window_updates: RecvWindowUpdates::new(config.window_update_policy),
         }
     }
 
@@ -181,7 +174,7 @@ impl Recv {
     ) -> Result<(), RecvHeaderBlockError> {
         tracing::trace!("opening stream; init_window={}", self.init_window_sz);
         let is_initial = stream.state.recv_open(&frame)?;
-        self.start_window_update_timer(stream);
+        self.window_updates.start_stream(stream);
 
         // Informational responses do not transition a remotely reserved stream
         // out of `ReservedRemote`. As a result, `recv_open` reports each of them
@@ -479,17 +472,12 @@ impl Recv {
         let _res = self.flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
 
-        if (capacity > 0 || self.connection_window_update_policy.is_none())
-            && self.flow.update_due(
-                self.connection_window_update_policy,
-                self.in_flight_data,
-                self.last_connection_window_update_at,
-            )
+        if self
+            .window_updates
+            .connection_release_due(&self.flow, self.in_flight_data, capacity)
+            && let Some(task) = task.take()
         {
-            self.connection_window_update_pending = true;
-            if let Some(task) = task.take() {
-                task.wake();
-            }
+            task.wake();
         }
     }
 
@@ -516,13 +504,7 @@ impl Recv {
         let _res = stream.recv_flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
 
-        if (capacity > 0 || self.stream_window_update_policy.is_none())
-            && stream.recv_flow.update_due(
-                self.stream_window_update_policy,
-                stream.in_flight_recv_data,
-                stream.last_window_update_at,
-            )
-        {
+        if self.window_updates.stream_release_due(stream, capacity) {
             // Queue the stream for sending the WINDOW_UPDATE frame.
             self.pending_window_updates.push(stream);
 
@@ -597,18 +579,10 @@ impl Recv {
             self.flow.claim_capacity(current - target)?;
         }
 
-        // Explicit target growth is independent of the optional release policy.
-        // Keep the original threshold when no policy is configured.
-        let increment = if self.connection_window_update_policy.is_some() {
-            self.flow.released_capacity()
-        } else {
-            self.flow.unclaimed_capacity()
-        };
-        if increment.is_some() {
-            self.connection_window_update_pending = true;
-            if let Some(task) = task.take() {
-                task.wake();
-            }
+        if self.window_updates.connection_target_changed(&self.flow)
+            && let Some(task) = task.take()
+        {
+            task.wake();
         }
         Ok(())
     }
@@ -660,11 +634,7 @@ impl Recv {
                         // Capacity released before the ACK can cross the
                         // WINDOW_UPDATE threshold once the window shrinks.
                         // Nothing else queues it, so the peer would stall.
-                        if stream.recv_flow.update_due(
-                            self.stream_window_update_policy,
-                            stream.in_flight_recv_data,
-                            None,
-                        ) {
+                        if self.window_updates.stream_window_changed(&stream) {
                             self.pending_window_updates.push(&mut stream);
                         }
                         Ok::<_, proto::Error>(())
@@ -804,14 +774,7 @@ impl Recv {
         // Track the data as in-flight
         stream.in_flight_recv_data += sz;
 
-        if matches!(
-            self.stream_window_update_policy,
-            Some(crate::ext::WindowUpdatePolicy::Threshold { .. })
-        ) && stream.recv_flow.update_due(
-            self.stream_window_update_policy,
-            stream.in_flight_recv_data,
-            None,
-        ) {
+        if self.window_updates.stream_receive_due(stream) {
             self.pending_window_updates.push(stream);
         }
 
@@ -880,16 +843,7 @@ impl Recv {
 
         // Track the data as in-flight
         self.in_flight_data += sz;
-        if matches!(
-            self.connection_window_update_policy,
-            Some(crate::ext::WindowUpdatePolicy::Threshold { .. })
-        ) && self.flow.update_due(
-            self.connection_window_update_policy,
-            self.in_flight_data,
-            None,
-        ) {
-            self.connection_window_update_pending = true;
-        }
+        self.window_updates.connection_received(&self.flow);
         Ok(())
     }
 
@@ -1206,14 +1160,7 @@ impl Recv {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        let increment = if self.connection_window_update_policy.is_none() {
-            self.flow.unclaimed_capacity()
-        } else if self.connection_window_update_pending {
-            self.flow.released_capacity()
-        } else {
-            None
-        };
-        if let Some(incr) = increment {
+        if let Some(incr) = self.window_updates.connection_increment(&self.flow) {
             let frame = frame::WindowUpdate::new(StreamId::zero(), incr);
 
             // Ensure the codec has capacity
@@ -1229,12 +1176,8 @@ impl Recv {
             self.flow
                 .inc_window(incr)
                 .expect("unexpected flow control state");
-            if let Some(last) = &mut self.last_connection_window_update_at {
-                *last = Instant::now();
-            }
+            self.window_updates.connection_buffered();
         }
-
-        self.connection_window_update_pending = false;
 
         Ok(BufferStatus::Complete)
     }
@@ -1277,12 +1220,7 @@ impl Recv {
                 }
 
                 // TODO: de-dup
-                let increment = if self.stream_window_update_policy.is_some() {
-                    stream.recv_flow.released_capacity()
-                } else {
-                    stream.recv_flow.unclaimed_capacity()
-                };
-                if let Some(incr) = increment {
+                if let Some(incr) = self.window_updates.stream_increment(stream) {
                     // Create the WINDOW_UPDATE frame
                     let frame = frame::WindowUpdate::new(stream.id, incr);
 
@@ -1295,9 +1233,7 @@ impl Recv {
                         .recv_flow
                         .inc_window(incr)
                         .expect("unexpected flow control state");
-                    if let Some(last) = &mut stream.last_window_update_at {
-                        *last = Instant::now();
-                    }
+                    self.window_updates.stream_buffered(stream);
                 }
             })
         }
@@ -1389,7 +1325,7 @@ impl Recv {
         stream: &mut Stream,
         headers: &mut frame::Headers,
     ) -> io::Result<()> {
-        self.start_window_update_timer(stream);
+        self.window_updates.start_stream(stream);
         if stream.initial_window != Some(stream::InitialWindow::Pending) {
             return Ok(());
         }
@@ -1479,20 +1415,6 @@ impl Recv {
         }
         Ok(true)
     }
-
-    fn start_window_update_timer(&self, stream: &mut Stream) {
-        if stream.last_window_update_at.is_none() {
-            stream.last_window_update_at = window_update_timer(self.stream_window_update_policy);
-        }
-    }
-}
-
-fn window_update_timer(policy: Option<crate::ext::WindowUpdatePolicy>) -> Option<Instant> {
-    matches!(
-        policy,
-        Some(crate::ext::WindowUpdatePolicy::TargetWindowHalf { max_delay: Some(_) })
-    )
-    .then(Instant::now)
 }
 
 #[cfg(test)]
@@ -1519,8 +1441,7 @@ mod tests {
             data_frame_budget: DataFrameBudget::Configured(DEFAULT_DATA_FRAME_BUDGET),
             headers_priority_policy: HeadersPriorityPolicy::default(),
             headers_pseudo_order: None,
-            stream_window_update_policy: None,
-            connection_window_update_policy: None,
+            window_update_policy: crate::ext::WindowUpdatePolicy::default(),
         };
         let mut recv = Recv::new(peer::Dyn::Server, &config);
         let mut store = Store::new();
