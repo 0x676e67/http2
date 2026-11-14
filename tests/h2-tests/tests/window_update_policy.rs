@@ -262,6 +262,41 @@ async fn only_connection_target_growth_bypasses_the_update_threshold() {
 }
 
 #[tokio::test]
+async fn withdrawing_growth_does_not_keep_a_rule_triggered_by_that_growth() {
+    let (io, mut peer) = mock::new();
+    let policy = WindowUpdatePolicy::default().connection(WindowUpdateRule::Threshold {
+        increment: 4_096,
+        low_window: 0,
+    });
+    let (mut client, mut conn) = client::Builder::new()
+        .window_update_policy(policy)
+        .handshake::<_, Bytes>(io)
+        .await
+        .unwrap();
+
+    conn.drive(peer.assert_client_handshake()).await;
+    let response = client.get("https://example.com/");
+    conn.drive(
+        peer.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        ),
+    )
+    .await;
+    peer.send_frame(frames::headers(1).response(200)).await;
+    peer.send_frame(frames::data(1, "a")).await;
+    let mut body = conn.drive(response).await.unwrap().into_body();
+    let data = conn.drive(body.data()).await.unwrap().unwrap();
+
+    conn.set_target_window_size(69_631);
+    body.flow_control().release_capacity(data.len()).unwrap();
+    conn.set_target_window_size(65_535);
+    conn.drive(util::yield_once()).await;
+    conn.drive(peer.ping_pong([0; 8])).await;
+}
+
+#[tokio::test]
 async fn withdrawing_connection_target_growth_keeps_a_due_update() {
     let (io, mut peer) = mock::new();
     let policy = WindowUpdatePolicy::default().connection(WindowUpdateRule::Threshold {

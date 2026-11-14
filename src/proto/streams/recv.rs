@@ -846,7 +846,8 @@ impl Recv {
 
         // Track the data as in-flight
         self.in_flight_data += sz;
-        self.window_updates.on_connection_data_received(&self.flow);
+        self.window_updates
+            .on_connection_data_received(&self.flow, self.in_flight_data);
         Ok(())
     }
 

@@ -199,6 +199,20 @@ impl FlowControl {
     pub(super) fn receive_target(&self, in_flight: WindowSize) -> i64 {
         i64::from(self.available.0) + i64::from(in_flight)
     }
+
+    /// Use the target before any unbuffered growth when evaluating a receive rule.
+    /// The peer's window and the live flow-control counters are unchanged.
+    pub(super) fn for_receive_rule(
+        mut self,
+        growth_from: Option<WindowSize>,
+        in_flight: WindowSize,
+    ) -> Self {
+        if let Some(target) = growth_from {
+            // Both counts fit in 31 bits. The difference can be negative.
+            self.available = Window(target as i32 - in_flight as i32);
+        }
+        self
+    }
 }
 
 /// The current capacity of a flow-controlled Window.

@@ -53,7 +53,7 @@ impl RecvWindowUpdates {
 
     /// Checks the rule after crediting released capacity and marks the update
     /// pending if due. A `true` result tells `Recv` to wake a parked connection.
-    /// A configured rule is checked only for a nonzero release.
+    /// A configured rule sees only nonzero releases and excludes unbuffered growth.
     pub(super) fn on_connection_capacity_released(
         &mut self,
         flow: &FlowControl,
@@ -63,7 +63,7 @@ impl RecvWindowUpdates {
         let due = (capacity > 0 || self.policy.connection.is_none())
             && update_due(
                 self.policy.connection,
-                flow,
+                &flow.for_receive_rule(self.connection_growth_from, in_flight),
                 in_flight,
                 self.connection_last_update_at,
             );
@@ -77,10 +77,17 @@ impl RecvWindowUpdates {
         update_due_on_data(self.policy.stream, &stream.recv_flow)
     }
 
-    /// Checks the threshold rule after DATA reduces the connection window and
-    /// marks an update pending if due.
-    pub(super) fn on_connection_data_received(&mut self, flow: &FlowControl) {
-        self.connection_rule_pending |= update_due_on_data(self.policy.connection, flow);
+    /// Checks the threshold after DATA reduces the connection window and marks
+    /// a due update pending, excluding credit from unbuffered growth.
+    pub(super) fn on_connection_data_received(
+        &mut self,
+        flow: &FlowControl,
+        in_flight: WindowSize,
+    ) {
+        self.connection_rule_pending |= update_due_on_data(
+            self.policy.connection,
+            &flow.for_receive_rule(self.connection_growth_from, in_flight),
+        );
     }
 
     /// Rechecks the stream rule after applying an acknowledged window reduction.
@@ -226,4 +233,41 @@ fn update_due(
 fn threshold_due(flow: &FlowControl, increment: WindowSize, low_window: WindowSize) -> bool {
     flow.released_capacity()
         .is_some_and(|released| released >= increment || flow.window_size() <= low_window)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_does_not_count_pending_growth_toward_the_threshold() {
+        let mut updates = RecvWindowUpdates::new(WindowUpdatePolicy::default().connection(
+            WindowUpdateRule::Threshold {
+                increment: 4_096,
+                low_window: 65_531,
+            },
+        ));
+        let mut flow = FlowControl::new();
+        flow.inc_window(65_535).unwrap();
+        flow.assign_capacity(65_535).unwrap();
+        flow.send_data(2).unwrap();
+        flow.assign_capacity(1).unwrap();
+        assert!(!updates.on_connection_capacity_released(&flow, 1, 1));
+
+        flow.assign_capacity(4_096).unwrap();
+        assert!(updates.on_connection_target_changed(&flow, 65_535, 69_631));
+        flow.send_data(1).unwrap();
+        updates.on_connection_data_received(&flow, 2);
+        flow.claim_capacity(4_096).unwrap();
+        assert!(!updates.on_connection_target_changed(&flow, 69_631, 65_535));
+        assert_eq!(updates.prepare_connection_update(&flow), None);
+
+        flow.assign_capacity(4_096).unwrap();
+        assert!(updates.on_connection_target_changed(&flow, 65_535, 69_631));
+        flow.send_data(1).unwrap();
+        updates.on_connection_data_received(&flow, 3);
+        flow.claim_capacity(4_096).unwrap();
+        assert!(!updates.on_connection_target_changed(&flow, 69_631, 65_535));
+        assert_eq!(updates.prepare_connection_update(&flow), Some(1));
+    }
 }
