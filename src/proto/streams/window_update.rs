@@ -102,7 +102,7 @@ impl RecvWindowUpdates {
     }
 
     /// Lets a target increase bypass the configured rule until the update is
-    /// buffered, the target returns to its pre-growth size or below, or no
+    /// buffered, the target returns to the growth baseline or below, or no
     /// released credit remains. Already scheduled rule updates stay pending.
     /// `Recv` wakes a parked connection when this returns `true`.
     pub(super) fn on_connection_target_changed(
@@ -115,13 +115,20 @@ impl RecvWindowUpdates {
             return flow.unclaimed_capacity().is_some();
         }
 
-        let growth_from = self.connection_growth_from.unwrap_or(previous_target);
-        let has_credit = flow.released_capacity().is_some();
-        if target <= growth_from || !has_credit {
+        let Some(released) = flow.released_capacity() else {
             self.connection_growth_from = None;
+            return false;
+        };
+        // Filling a shrink deficit adds no credit the peer can use.
+        let growth_from = self
+            .connection_growth_from
+            .unwrap_or_else(|| previous_target.max(target - released));
+        if target <= growth_from {
+            self.connection_growth_from = None;
+            return false;
         }
 
-        let due = target > previous_target && has_credit;
+        let due = target > previous_target;
         if due {
             self.connection_growth_from = Some(growth_from);
         }

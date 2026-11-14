@@ -297,6 +297,62 @@ async fn withdrawing_growth_does_not_keep_a_rule_triggered_by_that_growth() {
 }
 
 #[tokio::test]
+async fn withdrawing_growth_above_the_advertised_connection_window_stops_the_bypass() {
+    check_growth_after_connection_shrink(1, 65_535, None).await;
+}
+
+#[tokio::test]
+async fn growth_from_below_the_advertised_window_keeps_a_rule_triggered_by_release() {
+    check_growth_after_connection_shrink(8_192, 60_000, Some(2_657)).await;
+}
+
+async fn check_growth_after_connection_shrink(
+    release: usize,
+    target_after_growth: u32,
+    expected: Option<u32>,
+) {
+    let (io, mut peer) = mock::new();
+    let policy = WindowUpdatePolicy::default().connection(WindowUpdateRule::Threshold {
+        increment: 4_096,
+        low_window: 0,
+    });
+    let (mut client, mut conn) = client::Builder::new()
+        .window_update_policy(policy)
+        .handshake::<_, Bytes>(io)
+        .await
+        .unwrap();
+
+    conn.drive(peer.assert_client_handshake()).await;
+    let response = client.get("https://example.com/");
+    conn.drive(
+        peer.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        ),
+    )
+    .await;
+    peer.send_frame(frames::headers(1).response(200)).await;
+    peer.send_frame(frames::data(1, vec![0; 8_192])).await;
+    let mut body = conn.drive(response).await.unwrap().into_body();
+    drop(conn.drive(body.data()).await.unwrap().unwrap());
+
+    conn.set_target_window_size(60_000);
+    conn.set_target_window_size(66_535);
+    body.flow_control().release_capacity(release).unwrap();
+    conn.set_target_window_size(target_after_growth);
+
+    conn.drive(util::yield_once()).await;
+    peer.send_frame(frames::ping([0; 8])).await;
+    if let Some(expected) = expected {
+        conn.drive(peer.recv_frame(frames::window_update(0, expected)))
+            .await;
+    }
+    conn.drive(peer.recv_frame(frames::ping([0; 8]).pong()))
+        .await;
+}
+
+#[tokio::test]
 async fn withdrawing_connection_target_growth_keeps_a_due_update() {
     let (io, mut peer) = mock::new();
     let policy = WindowUpdatePolicy::default().connection(WindowUpdateRule::Threshold {

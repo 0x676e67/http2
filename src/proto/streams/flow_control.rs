@@ -200,7 +200,7 @@ impl FlowControl {
         i64::from(self.available.0) + i64::from(in_flight)
     }
 
-    /// Use the target before any unbuffered growth when evaluating a receive rule.
+    /// Use the growth baseline when evaluating a receive rule.
     /// The peer's window and the live flow-control counters are unchanged.
     pub(super) fn for_receive_rule(
         mut self,
