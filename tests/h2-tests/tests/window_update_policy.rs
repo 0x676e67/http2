@@ -232,21 +232,28 @@ async fn only_connection_target_growth_bypasses_the_update_threshold() {
     peer.send_frame(frames::data(1, vec![0; 4_096])).await;
     let mut body = conn.drive(response).await.unwrap().into_body();
     let data = conn.drive(body.data()).await.unwrap().unwrap();
+
+    // Shrinking back to the advertised window before release leaves no growth credit.
+    conn.set_target_window_size(60_000);
+    conn.set_target_window_size(66_535);
+    conn.set_target_window_size(65_535);
     body.flow_control().release_capacity(data.len()).unwrap();
+    conn.drive(util::yield_once()).await;
+    conn.drive(peer.ping_pong([0; 8])).await;
 
     // Both target changes happen before the connection can buffer an update.
     conn.set_target_window_size(66_535);
     conn.set_target_window_size(65_535);
-    conn.drive(util::yield_once()).await;
-    conn.drive(peer.ping_pong([0; 8])).await;
-
-    conn.set_target_window_size(64_535);
     conn.drive(util::yield_once()).await;
     conn.drive(peer.ping_pong([1; 8])).await;
 
     conn.set_target_window_size(64_535);
     conn.drive(util::yield_once()).await;
     conn.drive(peer.ping_pong([2; 8])).await;
+
+    conn.set_target_window_size(64_535);
+    conn.drive(util::yield_once()).await;
+    conn.drive(peer.ping_pong([3; 8])).await;
 
     conn.set_target_window_size(66_535);
     conn.set_target_window_size(65_535);
