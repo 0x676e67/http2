@@ -1,12 +1,17 @@
 //! Scheduling for receive-side `WINDOW_UPDATE` frames.
 //!
-//! `Recv` keeps the flow-control counters, queues streams, and buffers the
-//! frames. The rules use those counters to decide when to return credit.
+//! `Recv` accounts for received DATA and queues streams. This module decides
+//! when to return credit and advances the advertised window after buffering
+//! each update.
 
-use super::{FlowControl, Stream};
+use super::{BufferStatus, FlowControl, Stream};
+use crate::codec::Codec;
 use crate::ext::{WindowUpdatePolicy, WindowUpdateRule};
+use crate::frame::{StreamId, WindowUpdate};
 use crate::proto::WindowSize;
+use bytes::Buf;
 use std::time::Instant;
+use tokio::io::AsyncWrite;
 
 /// Applies the configured rules, tracks pending connection updates, and keeps
 /// the connection's delay timestamp. Each stream keeps its own timestamp.
@@ -137,7 +142,7 @@ impl RecvWindowUpdates {
 
     /// Recomputes the increment and clears both pending reasons if no credit
     /// is available. Otherwise both survive a full codec and can be retried.
-    pub(super) fn prepare_connection_update(&mut self, flow: &FlowControl) -> Option<WindowSize> {
+    fn prepare_connection_update(&mut self, flow: &FlowControl) -> Option<WindowSize> {
         if (self.policy.connection.is_none()
             || self.connection_rule_pending
             || self.connection_growth_from.is_some())
@@ -146,34 +151,67 @@ impl RecvWindowUpdates {
             return Some(increment);
         }
 
-        self.connection_rule_pending = false;
-        self.connection_growth_from = None;
+        self.clear_connection_pending();
         None
-    }
-
-    /// Recomputes the increment for a stream taken from the update queue.
-    pub(super) fn stream_increment(&self, stream: &Stream) -> Option<WindowSize> {
-        increment(self.policy.stream, &stream.recv_flow)
-    }
-
-    /// Clears both pending reasons and restarts the configured delay after the codec
-    /// accepts the frame and `Recv` advances the connection window.
-    pub(super) fn connection_buffered(&mut self) {
-        record_update(&mut self.connection_last_update_at);
-        self.connection_rule_pending = false;
-        self.connection_growth_from = None;
-    }
-
-    /// Restarts the stream's configured delay after the codec accepts its update
-    /// and `Recv` advances the stream window.
-    pub(super) fn stream_buffered(&self, stream: &mut Stream) {
-        record_update(&mut stream.last_window_update_at);
     }
 
     /// Starts the configured delay once the client finishes its initial write
     /// and enters `Open`.
     pub(super) fn start_connection(&mut self) {
         self.connection_last_update_at = initial_update_at(self.policy.connection);
+    }
+
+    /// Buffers a due connection update and clears its pending reasons on success.
+    /// With no increment, stale reasons are cleared even when the codec is full.
+    /// If the increment is ready but the codec is full, the update can be retried.
+    pub(super) fn buffer_connection_update<T, B>(
+        &mut self,
+        flow: &mut FlowControl,
+        dst: &mut Codec<T, B>,
+    ) -> BufferStatus
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        let Some(increment) = self.prepare_connection_update(flow) else {
+            return BufferStatus::Complete;
+        };
+        if !dst.has_send_capacity() {
+            return BufferStatus::CodecFull;
+        }
+
+        buffer_update(
+            dst,
+            StreamId::zero(),
+            increment,
+            flow,
+            &mut self.connection_last_update_at,
+        );
+        self.clear_connection_pending();
+        BufferStatus::Complete
+    }
+
+    /// Buffers any available credit for a queued stream still receiving DATA.
+    /// `Recv` checks codec capacity before removing the stream from the queue.
+    pub(super) fn buffer_stream_update<T, B>(&self, stream: &mut Stream, dst: &mut Codec<T, B>)
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let Some(increment) = increment(self.policy.stream, &stream.recv_flow) {
+            buffer_update(
+                dst,
+                stream.id,
+                increment,
+                &mut stream.recv_flow,
+                &mut stream.last_window_update_at,
+            );
+        }
+    }
+
+    fn clear_connection_pending(&mut self) {
+        self.connection_rule_pending = false;
+        self.connection_growth_from = None;
     }
 }
 
@@ -183,12 +221,6 @@ fn initial_update_at(rule: Option<WindowUpdateRule>) -> Option<Instant> {
         Some(WindowUpdateRule::TargetWindowHalf { max_delay: Some(_) })
     )
     .then(Instant::now)
-}
-
-fn record_update(last_update: &mut Option<Instant>) {
-    if let Some(last) = last_update {
-        *last = Instant::now();
-    }
 }
 
 fn increment(rule: Option<WindowUpdateRule>, flow: &FlowControl) -> Option<WindowSize> {
@@ -238,6 +270,25 @@ fn update_due(
 fn threshold_due(flow: &FlowControl, increment: WindowSize, low_window: WindowSize) -> bool {
     flow.released_capacity()
         .is_some_and(|released| released >= increment || flow.window_size() <= low_window)
+}
+
+fn buffer_update<T, B>(
+    dst: &mut Codec<T, B>,
+    id: StreamId,
+    increment: WindowSize,
+    flow: &mut FlowControl,
+    last_update_at: &mut Option<Instant>,
+) where
+    T: AsyncWrite + Unpin,
+    B: Buf,
+{
+    dst.buffer(WindowUpdate::new(id, increment).into())
+        .expect("invalid WINDOW_UPDATE frame");
+    flow.inc_window(increment)
+        .expect("unexpected flow control state");
+    if let Some(last_update_at) = last_update_at {
+        *last_update_at = Instant::now();
+    }
 }
 
 #[cfg(test)]

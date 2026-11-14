@@ -1164,26 +1164,9 @@ impl Recv {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        if let Some(incr) = self.window_updates.prepare_connection_update(&self.flow) {
-            let frame = frame::WindowUpdate::new(StreamId::zero(), incr);
-
-            // Ensure the codec has capacity
-            if !dst.has_send_capacity() {
-                return Ok(BufferStatus::CodecFull);
-            }
-
-            // Buffer the WINDOW_UPDATE frame
-            dst.buffer(frame.into())
-                .expect("invalid WINDOW_UPDATE frame");
-
-            // Update flow control
-            self.flow
-                .inc_window(incr)
-                .expect("unexpected flow control state");
-            self.window_updates.connection_buffered();
-        }
-
-        Ok(BufferStatus::Complete)
+        Ok(self
+            .window_updates
+            .buffer_connection_update(&mut self.flow, dst))
     }
 
     /// Send stream level window update
@@ -1223,22 +1206,7 @@ impl Recv {
                     return;
                 }
 
-                // TODO: de-dup
-                if let Some(incr) = self.window_updates.stream_increment(stream) {
-                    // Create the WINDOW_UPDATE frame
-                    let frame = frame::WindowUpdate::new(stream.id, incr);
-
-                    // Buffer it
-                    dst.buffer(frame.into())
-                        .expect("invalid WINDOW_UPDATE frame");
-
-                    // Update flow control
-                    stream
-                        .recv_flow
-                        .inc_window(incr)
-                        .expect("unexpected flow control state");
-                    self.window_updates.stream_buffered(stream);
-                }
+                self.window_updates.buffer_stream_update(stream, dst);
             })
         }
     }
