@@ -138,19 +138,17 @@ impl RecvWindowUpdates {
     /// Recomputes the increment and clears both pending reasons if no credit
     /// is available. Otherwise both survive a full codec and can be retried.
     pub(super) fn prepare_connection_update(&mut self, flow: &FlowControl) -> Option<WindowSize> {
-        let increment = if self.policy.connection.is_none()
+        if (self.policy.connection.is_none()
             || self.connection_rule_pending
-            || self.connection_growth_from.is_some()
+            || self.connection_growth_from.is_some())
+            && let Some(increment) = increment(self.policy.connection, flow)
         {
-            increment(self.policy.connection, flow)
-        } else {
-            None
-        };
-        if increment.is_none() {
-            self.connection_rule_pending = false;
-            self.connection_growth_from = None;
+            return Some(increment);
         }
-        increment
+
+        self.connection_rule_pending = false;
+        self.connection_growth_from = None;
+        None
     }
 
     /// Recomputes the increment for a stream taken from the update queue.
