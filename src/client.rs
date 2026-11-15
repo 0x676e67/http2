@@ -148,6 +148,8 @@ pub use crate::frame::{
     SettingsOrder, SettingsOrderBuilder, StreamDependency,
 };
 
+pub use crate::proto::streams::{WindowUpdatePolicy, WindowUpdateRule};
+
 #[cfg(feature = "tracing")]
 use ::tracing::Instrument;
 use bytes::{Buf, Bytes};
@@ -390,7 +392,7 @@ pub struct Builder {
 
     /// Initial target receive window size for locally initiated streams.
     initial_target_stream_window_size: Option<u32>,
-    window_update_policy: crate::ext::WindowUpdatePolicy,
+    window_update_policy: WindowUpdatePolicy,
 }
 
 #[derive(Debug)]
@@ -721,7 +723,7 @@ impl Builder {
             preface_ping: None,
             preface_ping_timeout: None,
             initial_target_stream_window_size: None,
-            window_update_policy: crate::ext::WindowUpdatePolicy::default(),
+            window_update_policy: WindowUpdatePolicy::default(),
         }
     }
 
@@ -1579,29 +1581,11 @@ impl Builder {
         self
     }
 
-    /// Sets the policy for returning released stream receive capacity.
-    /// `None` preserves the default remaining-window threshold.
-    pub fn stream_window_update_policy(
-        &mut self,
-        rule: Option<crate::ext::WindowUpdateRule>,
-    ) -> &mut Self {
-        self.window_update_policy.stream = rule;
-        self
-    }
-
-    /// Sets the policy for returning released connection receive capacity.
-    /// `None` preserves the default remaining-window threshold.
-    pub fn connection_window_update_policy(
-        &mut self,
-        rule: Option<crate::ext::WindowUpdateRule>,
-    ) -> &mut Self {
-        self.window_update_policy.connection = rule;
-        self
-    }
-
-    /// Sets the receive window update rules for streams and the connection.
-    /// The default policy preserves the original remaining-window thresholds.
-    pub fn window_update_policy(&mut self, policy: crate::ext::WindowUpdatePolicy) -> &mut Self {
+    /// Replaces the receive window update rules for streams and the connection.
+    ///
+    /// Each level without a rule uses the default remaining-window threshold.
+    /// Pass [`WindowUpdatePolicy::default()`] to reset both levels.
+    pub fn window_update_policy(&mut self, policy: WindowUpdatePolicy) -> &mut Self {
         self.window_update_policy = policy;
         self
     }

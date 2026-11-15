@@ -117,6 +117,7 @@
 
 use crate::codec::{Codec, UserError};
 use crate::frame::{self, Pseudo, PushPromiseHeaderError, Reason, Settings, StreamId};
+use crate::proto::streams::WindowUpdatePolicy;
 use crate::proto::{self, Config, Error, Prioritized};
 use crate::{FlowControl, PingPong, RecvStream, SendStream, tracing};
 
@@ -1598,7 +1599,7 @@ where
                             priorities: None,
                             preface_ping: None,
                             preface_ping_timeout: None,
-                            window_update_policy: crate::ext::WindowUpdatePolicy::default(),
+                            window_update_policy: WindowUpdatePolicy::default(),
                         },
                     );
 

@@ -1,4 +1,4 @@
-use h2::ext::{WindowUpdatePolicy, WindowUpdateRule};
+use h2::client::{WindowUpdatePolicy, WindowUpdateRule};
 use h2_support::prelude::*;
 use std::time::Duration;
 use tokio::sync::mpsc;

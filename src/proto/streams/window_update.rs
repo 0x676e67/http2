@@ -1,32 +1,31 @@
 //! Scheduling for receive-side `WINDOW_UPDATE` frames.
 //!
 //! `Recv` accounts for received DATA and queues streams. `UpdateRule` decides
-//! when each window is due for an update. `RecvWindowUpdates` tracks why a
+//! when each window is due for an update. `WindowUpdateScheduler` tracks why a
 //! connection update is pending and advances the advertised window only after
 //! the codec accepts the frame.
 
 use super::{BufferStatus, FlowControl, Stream};
 use crate::codec::Codec;
-use crate::ext::{WindowUpdatePolicy, WindowUpdateRule};
 use crate::frame::{StreamId, WindowUpdate};
 use crate::proto::WindowSize;
 use bytes::Buf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWrite;
 
 /// Applies the configured rules, tracks pending connection updates, and keeps
 /// the connection's delay timestamp. Each stream keeps its own timestamp.
 #[derive(Debug)]
-pub(super) struct RecvWindowUpdates {
+pub(super) struct WindowUpdateScheduler {
     stream_rule: UpdateRule,
     connection_rule: UpdateRule,
     connection_last_update_at: Option<Instant>,
     connection_pending: PendingConnectionUpdate,
 }
 
-// ===== impl RecvWindowUpdates =====
+// ===== impl WindowUpdateScheduler =====
 
-impl RecvWindowUpdates {
+impl WindowUpdateScheduler {
     pub(super) fn new(policy: WindowUpdatePolicy) -> Self {
         Self {
             stream_rule: UpdateRule(policy.stream),
@@ -354,13 +353,66 @@ impl PendingConnectionUpdate {
     }
 }
 
+/// Controls when the receiver advertises released capacity with `WINDOW_UPDATE`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum WindowUpdateRule {
+    /// Updates after releasing strictly more than half the receive target.
+    /// An optional delay also permits an update on the next nonzero release;
+    /// elapsed time alone does not send a frame.
+    TargetWindowHalf {
+        /// Time since opening the stream/connection or its last update.
+        max_delay: Option<Duration>,
+    },
+    /// Updates when released capacity reaches `increment`, or the peer's
+    /// remaining window falls to `low_window` or below.
+    Threshold {
+        /// Minimum accumulated release, in bytes. Zero updates on every release.
+        increment: u32,
+        /// Remaining receive window at which any released capacity is returned.
+        low_window: u32,
+    },
+}
+
+/// Receive window update rules for streams and the connection.
+/// The default uses the library's remaining-window thresholds for both.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WindowUpdatePolicy {
+    stream: Option<WindowUpdateRule>,
+    connection: Option<WindowUpdateRule>,
+}
+
+// ===== impl WindowUpdatePolicy =====
+
+impl WindowUpdatePolicy {
+    /// Uses the same rule for streams and the connection.
+    pub fn both(rule: WindowUpdateRule) -> Self {
+        Self {
+            stream: Some(rule),
+            connection: Some(rule),
+        }
+    }
+
+    /// Sets the rule for all receive streams on the connection.
+    pub fn stream(mut self, rule: WindowUpdateRule) -> Self {
+        self.stream = Some(rule);
+        self
+    }
+
+    /// Sets the rule for the connection receive window.
+    pub fn connection(mut self, rule: WindowUpdateRule) -> Self {
+        self.connection = Some(rule);
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn data_does_not_count_pending_growth_toward_the_threshold() {
-        let mut updates = RecvWindowUpdates::new(WindowUpdatePolicy::default().connection(
+        let mut scheduler = WindowUpdateScheduler::new(WindowUpdatePolicy::default().connection(
             WindowUpdateRule::Threshold {
                 increment: 4_096,
                 low_window: 65_531,
@@ -371,22 +423,22 @@ mod tests {
         flow.assign_capacity(65_535).unwrap();
         flow.send_data(2).unwrap();
         flow.assign_capacity(1).unwrap();
-        assert!(!updates.on_connection_capacity_released(&flow, 1, 1));
+        assert!(!scheduler.on_connection_capacity_released(&flow, 1, 1));
 
         flow.assign_capacity(4_096).unwrap();
-        assert!(updates.on_connection_target_changed(&flow, 65_535, 69_631));
+        assert!(scheduler.on_connection_target_changed(&flow, 65_535, 69_631));
         flow.send_data(1).unwrap();
-        updates.on_connection_data_received(&flow, 2);
+        scheduler.on_connection_data_received(&flow, 2);
         flow.claim_capacity(4_096).unwrap();
-        assert!(!updates.on_connection_target_changed(&flow, 69_631, 65_535));
-        assert_eq!(updates.prepare_connection_update(&flow), None);
+        assert!(!scheduler.on_connection_target_changed(&flow, 69_631, 65_535));
+        assert_eq!(scheduler.prepare_connection_update(&flow), None);
 
         flow.assign_capacity(4_096).unwrap();
-        assert!(updates.on_connection_target_changed(&flow, 65_535, 69_631));
+        assert!(scheduler.on_connection_target_changed(&flow, 65_535, 69_631));
         flow.send_data(1).unwrap();
-        updates.on_connection_data_received(&flow, 3);
+        scheduler.on_connection_data_received(&flow, 3);
         flow.claim_capacity(4_096).unwrap();
-        assert!(!updates.on_connection_target_changed(&flow, 69_631, 65_535));
-        assert_eq!(updates.prepare_connection_update(&flow), Some(1));
+        assert!(!scheduler.on_connection_target_changed(&flow, 69_631, 65_535));
+        assert_eq!(scheduler.prepare_connection_update(&flow), Some(1));
     }
 }

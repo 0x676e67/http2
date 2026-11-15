@@ -1,5 +1,6 @@
 use crate::codec::UserError;
 use crate::frame::{Priorities, Priority, PseudoOrder, Reason, StreamId};
+use crate::proto::streams::WindowUpdatePolicy;
 use crate::{client, server, tracing};
 
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
@@ -97,7 +98,7 @@ pub(crate) struct Config {
     pub priorities: Option<Priorities>,
     pub preface_ping: Option<Duration>,
     pub preface_ping_timeout: Option<Duration>,
-    pub window_update_policy: crate::ext::WindowUpdatePolicy,
+    pub window_update_policy: WindowUpdatePolicy,
 }
 
 #[derive(Clone, Copy, Debug)]

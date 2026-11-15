@@ -1,5 +1,5 @@
 use super::stream::ContentLength;
-use super::window_update::RecvWindowUpdates;
+use super::window_update::WindowUpdateScheduler;
 use super::*;
 use crate::codec::UserError;
 use crate::frame::{DEFAULT_INITIAL_WINDOW_SIZE, PushPromiseHeaderError, Reason};
@@ -66,7 +66,7 @@ pub(super) struct Recv {
 
     /// Latest local SETTINGS baseline queued before new request HEADERS.
     sent_initial_window_sz: WindowSize,
-    window_updates: RecvWindowUpdates,
+    window_update: WindowUpdateScheduler,
 }
 
 #[derive(Debug)]
@@ -123,7 +123,7 @@ impl Recv {
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
             initial_target_stream_window_sz: None,
             sent_initial_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
-            window_updates: RecvWindowUpdates::new(config.window_update_policy),
+            window_update: WindowUpdateScheduler::new(config.window_update_policy),
         }
     }
 
@@ -174,7 +174,7 @@ impl Recv {
     ) -> Result<(), RecvHeaderBlockError> {
         tracing::trace!("opening stream; init_window={}", self.init_window_sz);
         let is_initial = stream.state.recv_open(&frame)?;
-        self.window_updates.start_stream_delay(stream);
+        self.window_update.start_stream_delay(stream);
 
         // Informational responses do not transition a remotely reserved stream
         // out of `ReservedRemote`. As a result, `recv_open` reports each of them
@@ -472,7 +472,7 @@ impl Recv {
         let _res = self.flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
 
-        if self.window_updates.on_connection_capacity_released(
+        if self.window_update.on_connection_capacity_released(
             &self.flow,
             self.in_flight_data,
             capacity,
@@ -506,7 +506,7 @@ impl Recv {
         debug_assert!(_res.is_ok());
 
         if self
-            .window_updates
+            .window_update
             .stream_update_due_on_release(stream, capacity)
         {
             // Queue the stream for sending the WINDOW_UPDATE frame.
@@ -584,7 +584,7 @@ impl Recv {
         }
 
         if self
-            .window_updates
+            .window_update
             .on_connection_target_changed(&self.flow, current, target)
             && let Some(task) = task.take()
         {
@@ -640,7 +640,7 @@ impl Recv {
                         // Capacity released before the ACK can cross the
                         // WINDOW_UPDATE threshold once the window shrinks.
                         // Nothing else queues it, so the peer would stall.
-                        if self.window_updates.stream_update_due_after_shrink(&stream) {
+                        if self.window_update.stream_update_due_after_shrink(&stream) {
                             self.pending_window_updates.push(&mut stream);
                         }
                         Ok::<_, proto::Error>(())
@@ -780,7 +780,7 @@ impl Recv {
         // Track the data as in-flight
         stream.in_flight_recv_data += sz;
 
-        if self.window_updates.stream_update_due_on_data(stream) {
+        if self.window_update.stream_update_due_on_data(stream) {
             self.pending_window_updates.push(stream);
         }
 
@@ -849,7 +849,7 @@ impl Recv {
 
         // Track the data as in-flight
         self.in_flight_data += sz;
-        self.window_updates
+        self.window_update
             .on_connection_data_received(&self.flow, self.in_flight_data);
         Ok(())
     }
@@ -1168,7 +1168,7 @@ impl Recv {
         B: Buf,
     {
         Ok(self
-            .window_updates
+            .window_update
             .buffer_connection_update(&mut self.flow, dst))
     }
 
@@ -1209,7 +1209,7 @@ impl Recv {
                     return;
                 }
 
-                self.window_updates.buffer_stream_update(stream, dst);
+                self.window_update.buffer_stream_update(stream, dst);
             })
         }
     }
@@ -1300,7 +1300,7 @@ impl Recv {
         stream: &mut Stream,
         headers: &mut frame::Headers,
     ) -> io::Result<()> {
-        self.window_updates.start_stream_delay(stream);
+        self.window_update.start_stream_delay(stream);
         if stream.initial_window != Some(stream::InitialWindow::Pending) {
             return Ok(());
         }
@@ -1392,7 +1392,7 @@ impl Recv {
     }
 
     pub(super) fn start_connection_window_updates(&mut self) {
-        self.window_updates.start_connection_delay();
+        self.window_update.start_connection_delay();
     }
 }
 
@@ -1420,7 +1420,7 @@ mod tests {
             data_frame_budget: DataFrameBudget::Configured(DEFAULT_DATA_FRAME_BUDGET),
             headers_priority_policy: HeadersPriorityPolicy::default(),
             headers_pseudo_order: None,
-            window_update_policy: crate::ext::WindowUpdatePolicy::default(),
+            window_update_policy: WindowUpdatePolicy::default(),
         };
         let mut recv = Recv::new(peer::Dyn::Server, &config);
         let mut store = Store::new();
