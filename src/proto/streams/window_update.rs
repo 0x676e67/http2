@@ -1,8 +1,9 @@
 //! Scheduling for receive-side `WINDOW_UPDATE` frames.
 //!
-//! `Recv` accounts for received DATA and queues streams. This module decides
-//! when to return credit and advances the advertised window after buffering
-//! each update.
+//! `Recv` accounts for received DATA and queues streams. `UpdateRule` decides
+//! when each window is due for an update. `RecvWindowUpdates` tracks why a
+//! connection update is pending and advances the advertised window only after
+//! the codec accepts the frame.
 
 use super::{BufferStatus, FlowControl, Stream};
 use crate::codec::Codec;
@@ -17,10 +18,10 @@ use tokio::io::AsyncWrite;
 /// the connection's delay timestamp. Each stream keeps its own timestamp.
 #[derive(Debug)]
 pub(super) struct RecvWindowUpdates {
-    policy: WindowUpdatePolicy,
+    stream_rule: UpdateRule,
+    connection_rule: UpdateRule,
     connection_last_update_at: Option<Instant>,
-    connection_rule_pending: bool,
-    connection_growth_from: Option<WindowSize>,
+    connection_pending: PendingConnectionUpdate,
 }
 
 // ===== impl RecvWindowUpdates =====
@@ -28,28 +29,31 @@ pub(super) struct RecvWindowUpdates {
 impl RecvWindowUpdates {
     pub(super) fn new(policy: WindowUpdatePolicy) -> Self {
         Self {
-            policy,
+            stream_rule: UpdateRule(policy.stream),
+            connection_rule: UpdateRule(policy.connection),
             connection_last_update_at: None,
-            connection_rule_pending: false,
-            connection_growth_from: None,
+            connection_pending: PendingConnectionUpdate::default(),
         }
     }
 
     /// Starts the configured delay when preparing request `HEADERS` or handling
     /// the first incoming non-trailer `HEADERS`, which may be a `1xx` response.
     /// Keeps any timestamp already set.
-    pub(super) fn start_stream(&self, stream: &mut Stream) {
+    pub(super) fn start_stream_delay(&self, stream: &mut Stream) {
         if stream.last_window_update_at.is_none() {
-            stream.last_window_update_at = initial_update_at(self.policy.stream);
+            stream.last_window_update_at = self.stream_rule.initial_update_at();
         }
     }
 
     /// Checks whether to queue the stream after crediting released capacity.
     /// A configured rule is checked only for a nonzero release.
-    pub(super) fn stream_release_due(&self, stream: &Stream, capacity: WindowSize) -> bool {
-        (capacity > 0 || self.policy.stream.is_none())
-            && update_due(
-                self.policy.stream,
+    pub(super) fn stream_update_due_on_release(
+        &self,
+        stream: &Stream,
+        capacity: WindowSize,
+    ) -> bool {
+        self.stream_rule.checks_release(capacity)
+            && self.stream_rule.update_due(
                 &stream.recv_flow,
                 stream.in_flight_recv_data,
                 stream.last_window_update_at,
@@ -65,21 +69,20 @@ impl RecvWindowUpdates {
         in_flight: WindowSize,
         capacity: WindowSize,
     ) -> bool {
-        let due = (capacity > 0 || self.policy.connection.is_none())
-            && update_due(
-                self.policy.connection,
-                &flow.for_receive_rule(self.connection_growth_from, in_flight),
+        let due = self.connection_rule.checks_release(capacity)
+            && self.connection_rule.update_due(
+                &self.connection_pending.flow_for_rule(flow, in_flight),
                 in_flight,
                 self.connection_last_update_at,
             );
-        self.connection_rule_pending |= due;
+        self.connection_pending.mark_rule_due(due);
         due
     }
 
     /// Checks whether DATA lowered the stream window enough to return credit
     /// that has already been released. Applies only to the threshold rule.
     pub(super) fn stream_update_due_on_data(&self, stream: &Stream) -> bool {
-        update_due_on_data(self.policy.stream, &stream.recv_flow)
+        self.stream_rule.update_due_on_data(&stream.recv_flow)
     }
 
     /// Checks the threshold after DATA reduces the connection window and marks
@@ -89,21 +92,17 @@ impl RecvWindowUpdates {
         flow: &FlowControl,
         in_flight: WindowSize,
     ) {
-        self.connection_rule_pending |= update_due_on_data(
-            self.policy.connection,
-            &flow.for_receive_rule(self.connection_growth_from, in_flight),
-        );
+        let due = self
+            .connection_rule
+            .update_due_on_data(&self.connection_pending.flow_for_rule(flow, in_flight));
+        self.connection_pending.mark_rule_due(due);
     }
 
     /// Rechecks the stream rule after applying an acknowledged window reduction.
     /// The delay is checked only when capacity is released.
     pub(super) fn stream_update_due_after_shrink(&self, stream: &Stream) -> bool {
-        update_due(
-            self.policy.stream,
-            &stream.recv_flow,
-            stream.in_flight_recv_data,
-            None,
-        )
+        self.stream_rule
+            .update_due(&stream.recv_flow, stream.in_flight_recv_data, None)
     }
 
     /// Lets a target increase bypass the configured rule until the update is
@@ -116,49 +115,34 @@ impl RecvWindowUpdates {
         previous_target: WindowSize,
         target: WindowSize,
     ) -> bool {
-        if self.policy.connection.is_none() {
+        if self.connection_rule.is_default() {
+            // A target change can leave enough credit to cross the default
+            // threshold and schedule a connection WINDOW_UPDATE.
             return flow.unclaimed_capacity().is_some();
         }
 
-        let Some(released) = flow.released_capacity() else {
-            self.connection_growth_from = None;
-            return false;
-        };
-        // Filling a shrink deficit adds no credit the peer can use.
-        let growth_from = self
-            .connection_growth_from
-            .unwrap_or_else(|| previous_target.max(target - released));
-        if target <= growth_from {
-            self.connection_growth_from = None;
-            return false;
-        }
-
-        let due = target > previous_target;
-        if due {
-            self.connection_growth_from = Some(growth_from);
-        }
-        due
+        self.connection_pending
+            .on_target_changed(previous_target, target, flow.released_capacity())
     }
 
-    /// Recomputes the increment and clears both pending reasons if no credit
-    /// is available. Otherwise both survive a full codec and can be retried.
+    /// Recomputes the increment from the live window. The adjusted window
+    /// used to check the rule excludes growth that this frame can advertise.
+    /// Clears both pending reasons if no update can be sent.
     fn prepare_connection_update(&mut self, flow: &FlowControl) -> Option<WindowSize> {
-        if (self.policy.connection.is_none()
-            || self.connection_rule_pending
-            || self.connection_growth_from.is_some())
-            && let Some(increment) = increment(self.policy.connection, flow)
+        if (self.connection_rule.is_default() || self.connection_pending.is_due())
+            && let Some(increment) = self.connection_rule.increment(flow)
         {
             return Some(increment);
         }
 
-        self.clear_connection_pending();
+        self.connection_pending.clear();
         None
     }
 
     /// Starts the configured delay once the client finishes its initial write
     /// and enters `Open`.
-    pub(super) fn start_connection(&mut self) {
-        self.connection_last_update_at = initial_update_at(self.policy.connection);
+    pub(super) fn start_connection_delay(&mut self) {
+        self.connection_last_update_at = self.connection_rule.initial_update_at();
     }
 
     /// Buffers a due connection update and clears its pending reasons on success.
@@ -176,6 +160,7 @@ impl RecvWindowUpdates {
         let Some(increment) = self.prepare_connection_update(flow) else {
             return BufferStatus::Complete;
         };
+        // Ensure the codec has capacity before committing the update.
         if !dst.has_send_capacity() {
             return BufferStatus::CodecFull;
         }
@@ -187,7 +172,7 @@ impl RecvWindowUpdates {
             flow,
             &mut self.connection_last_update_at,
         );
-        self.clear_connection_pending();
+        self.connection_pending.clear();
         BufferStatus::Complete
     }
 
@@ -198,7 +183,7 @@ impl RecvWindowUpdates {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        if let Some(increment) = increment(self.policy.stream, &stream.recv_flow) {
+        if let Some(increment) = self.stream_rule.increment(&stream.recv_flow) {
             buffer_update(
                 dst,
                 stream.id,
@@ -208,62 +193,80 @@ impl RecvWindowUpdates {
             );
         }
     }
+}
 
-    fn clear_connection_pending(&mut self) {
-        self.connection_rule_pending = false;
-        self.connection_growth_from = None;
+/// Evaluates the receive rule for one window. `None` uses the default
+/// flow-control threshold.
+#[derive(Debug)]
+struct UpdateRule(Option<WindowUpdateRule>);
+
+// ===== impl UpdateRule =====
+
+impl UpdateRule {
+    fn is_default(&self) -> bool {
+        self.0.is_none()
     }
-}
 
-fn initial_update_at(rule: Option<WindowUpdateRule>) -> Option<Instant> {
-    matches!(
-        rule,
-        Some(WindowUpdateRule::TargetWindowHalf { max_delay: Some(_) })
-    )
-    .then(Instant::now)
-}
-
-fn increment(rule: Option<WindowUpdateRule>, flow: &FlowControl) -> Option<WindowSize> {
-    if rule.is_some() {
-        flow.released_capacity()
-    } else {
-        flow.unclaimed_capacity()
+    /// Only the default rule rechecks the window on a zero-byte release.
+    fn checks_release(&self, capacity: WindowSize) -> bool {
+        capacity > 0 || self.is_default()
     }
-}
 
-fn update_due_on_data(rule: Option<WindowUpdateRule>, flow: &FlowControl) -> bool {
-    let Some(WindowUpdateRule::Threshold {
-        increment,
-        low_window,
-    }) = rule
-    else {
-        return false;
-    };
-    threshold_due(flow, increment, low_window)
-}
+    /// Reads the clock only when a delay is configured.
+    fn initial_update_at(&self) -> Option<Instant> {
+        matches!(
+            self.0,
+            Some(WindowUpdateRule::TargetWindowHalf { max_delay: Some(_) })
+        )
+        .then(Instant::now)
+    }
 
-fn update_due(
-    rule: Option<WindowUpdateRule>,
-    flow: &FlowControl,
-    in_flight: WindowSize,
-    last_update: Option<Instant>,
-) -> bool {
-    let Some(rule) = rule else {
-        return flow.unclaimed_capacity().is_some();
-    };
-    match rule {
-        WindowUpdateRule::TargetWindowHalf { max_delay } => {
-            flow.released_capacity().is_some_and(|released| {
-                i64::from(released) > flow.receive_target(in_flight) / 2
-                    || max_delay
-                        .zip(last_update)
-                        .is_some_and(|(delay, last)| last.elapsed() >= delay)
-            })
+    /// Computes the increment from live flow-control credit. The default rule
+    /// checks its threshold here. With a configured rule, the caller has
+    /// already scheduled the update, possibly because the connection grew.
+    fn increment(&self, flow: &FlowControl) -> Option<WindowSize> {
+        if self.is_default() {
+            flow.unclaimed_capacity()
+        } else {
+            flow.released_capacity()
         }
-        WindowUpdateRule::Threshold {
+    }
+
+    /// Rechecks the threshold rule when DATA lowers the remaining window.
+    fn update_due_on_data(&self, flow: &FlowControl) -> bool {
+        let Some(WindowUpdateRule::Threshold {
             increment,
             low_window,
-        } => threshold_due(flow, increment, low_window),
+        }) = self.0
+        else {
+            return false;
+        };
+        threshold_due(flow, increment, low_window)
+    }
+
+    /// Checks the rule after a release or stream window reduction. A window
+    /// reduction supplies no timestamp, so it cannot trigger the delay.
+    fn update_due(
+        &self,
+        flow: &FlowControl,
+        in_flight: WindowSize,
+        last_update: Option<Instant>,
+    ) -> bool {
+        match self.0 {
+            None => flow.unclaimed_capacity().is_some(),
+            Some(WindowUpdateRule::TargetWindowHalf { max_delay }) => {
+                flow.released_capacity().is_some_and(|released| {
+                    i64::from(released) > flow.receive_target(in_flight) / 2
+                        || max_delay
+                            .zip(last_update)
+                            .is_some_and(|(delay, last)| last.elapsed() >= delay)
+                })
+            }
+            Some(WindowUpdateRule::Threshold {
+                increment,
+                low_window,
+            }) => threshold_due(flow, increment, low_window),
+        }
     }
 }
 
@@ -272,6 +275,7 @@ fn threshold_due(flow: &FlowControl, increment: WindowSize, low_window: WindowSi
         .is_some_and(|released| released >= increment || flow.window_size() <= low_window)
 }
 
+/// Buffers the WINDOW_UPDATE frame before updating flow control and the timer.
 fn buffer_update<T, B>(
     dst: &mut Codec<T, B>,
     id: StreamId,
@@ -288,6 +292,65 @@ fn buffer_update<T, B>(
         .expect("unexpected flow control state");
     if let Some(last_update_at) = last_update_at {
         *last_update_at = Instant::now();
+    }
+}
+
+/// The two reasons a connection update can be pending at the same time.
+#[derive(Debug, Default)]
+struct PendingConnectionUpdate {
+    /// A rule already triggered on released credit.
+    rule_due: bool,
+    /// Baseline for unbuffered growth, excluding any shrink deficit.
+    growth_from: Option<WindowSize>,
+}
+
+// ===== impl PendingConnectionUpdate =====
+
+impl PendingConnectionUpdate {
+    fn is_due(&self) -> bool {
+        self.rule_due || self.growth_from.is_some()
+    }
+
+    fn mark_rule_due(&mut self, due: bool) {
+        self.rule_due |= due;
+    }
+
+    /// Excludes unbuffered growth while checking whether the rule is due.
+    fn flow_for_rule(&self, flow: &FlowControl, in_flight: WindowSize) -> FlowControl {
+        flow.for_receive_rule(self.growth_from, in_flight)
+    }
+
+    /// Revokes only the growth reason when the target falls back or credit
+    /// runs out. A rule that already triggered stays pending.
+    fn on_target_changed(
+        &mut self,
+        previous_target: WindowSize,
+        target: WindowSize,
+        released: Option<WindowSize>,
+    ) -> bool {
+        let Some(released) = released else {
+            self.growth_from = None;
+            return false;
+        };
+        // Filling a shrink deficit adds no credit the peer can use.
+        let growth_from = self
+            .growth_from
+            .unwrap_or_else(|| previous_target.max(target - released));
+        if target <= growth_from {
+            self.growth_from = None;
+            return false;
+        }
+
+        let due = target > previous_target;
+        if due {
+            self.growth_from = Some(growth_from);
+        }
+        due
+    }
+
+    /// Clears both reasons after buffering an update or finding no increment.
+    fn clear(&mut self) {
+        *self = Self::default();
     }
 }
 

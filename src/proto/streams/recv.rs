@@ -174,7 +174,7 @@ impl Recv {
     ) -> Result<(), RecvHeaderBlockError> {
         tracing::trace!("opening stream; init_window={}", self.init_window_sz);
         let is_initial = stream.state.recv_open(&frame)?;
-        self.window_updates.start_stream(stream);
+        self.window_updates.start_stream_delay(stream);
 
         // Informational responses do not transition a remotely reserved stream
         // out of `ReservedRemote`. As a result, `recv_open` reports each of them
@@ -505,7 +505,10 @@ impl Recv {
         let _res = stream.recv_flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
 
-        if self.window_updates.stream_release_due(stream, capacity) {
+        if self
+            .window_updates
+            .stream_update_due_on_release(stream, capacity)
+        {
             // Queue the stream for sending the WINDOW_UPDATE frame.
             self.pending_window_updates.push(stream);
 
@@ -1297,7 +1300,7 @@ impl Recv {
         stream: &mut Stream,
         headers: &mut frame::Headers,
     ) -> io::Result<()> {
-        self.window_updates.start_stream(stream);
+        self.window_updates.start_stream_delay(stream);
         if stream.initial_window != Some(stream::InitialWindow::Pending) {
             return Ok(());
         }
@@ -1389,7 +1392,7 @@ impl Recv {
     }
 
     pub(super) fn start_connection_window_updates(&mut self) {
-        self.window_updates.start_connection();
+        self.window_updates.start_connection_delay();
     }
 }
 
