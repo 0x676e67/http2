@@ -143,13 +143,6 @@ use crate::frame::{Headers, Pseudo, Reason, Settings, StreamId};
 use crate::proto::{self, Error};
 use crate::{FlowControl, PingPong, RecvStream, SendStream, tracing};
 
-pub use crate::frame::{
-    Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, PseudoOrderBuilder, SettingId,
-    SettingsOrder, SettingsOrderBuilder, StreamDependency,
-};
-
-pub use crate::proto::streams::{WindowUpdatePolicy, WindowUpdateRule};
-
 #[cfg(feature = "tracing")]
 use ::tracing::Instrument;
 use bytes::{Buf, Bytes};
@@ -160,6 +153,14 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+pub use crate::{
+    frame::{
+        Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, PseudoOrderBuilder,
+        SettingId, SettingsOrder, SettingsOrderBuilder, StreamDependency,
+    },
+    proto::streams::{WindowUpdatePolicy, WindowUpdateRule},
+};
 
 // The fixed 24-byte sequence that starts the client connection preface. The
 // initial SETTINGS frame completes the preface.
