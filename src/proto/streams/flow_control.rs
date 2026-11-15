@@ -188,6 +188,8 @@ impl FlowControl {
         Ok(())
     }
 
+    /// Returns positive receive credit that can be advertised in one `WINDOW_UPDATE`.
+    /// The live connection counters can include an unadvertised target increase.
     pub(super) fn released_capacity(&self) -> Option<WindowSize> {
         // A SETTINGS reduction can leave a negative window. Each increment
         // still fits 31 bits (RFC 9113 §6.9).
@@ -196,6 +198,8 @@ impl FlowControl {
         (released > 0).then_some(released.min(i64::from(MAX_WINDOW_SIZE)) as WindowSize)
     }
 
+    /// Reconstructs the receive target from local available capacity and
+    /// received bytes awaiting release.
     pub(super) fn receive_target(&self, in_flight: WindowSize) -> i64 {
         i64::from(self.available.0) + i64::from(in_flight)
     }

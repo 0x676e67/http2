@@ -472,6 +472,7 @@ impl Recv {
         let _res = self.flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
 
+        // Record a due update before looking for a parked task to wake.
         if self.window_update.on_connection_capacity_released(
             &self.flow,
             self.in_flight_data,
@@ -780,6 +781,8 @@ impl Recv {
         // Track the data as in-flight
         stream.in_flight_recv_data += sz;
 
+        // DATA can cross the low-water mark and make previously released
+        // credit eligible for an update before these bytes are released.
         if self.window_update.stream_update_due_on_data(stream) {
             self.pending_window_updates.push(stream);
         }
