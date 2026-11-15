@@ -895,6 +895,10 @@ where
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Pass received SETTINGS by value instead of allocating before queueing the ACK"
+)]
 enum ReceivedFrame {
     Refused(StreamId),
     Settings(frame::Settings),
