@@ -156,9 +156,11 @@ impl WindowUpdateScheduler {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
+        // Check the rule and any growth reason before buffering the update.
         let Some(increment) = self.prepare_connection_update(flow) else {
             return BufferStatus::Complete;
         };
+
         // Ensure the codec has capacity before committing the update.
         if !dst.has_send_capacity() {
             return BufferStatus::CodecFull;
@@ -285,10 +287,14 @@ fn buffer_update<T, B>(
     T: AsyncWrite + Unpin,
     B: Buf,
 {
+    // Buffer the WINDOW_UPDATE frame
     dst.buffer(WindowUpdate::new(id, increment).into())
         .expect("invalid WINDOW_UPDATE frame");
+
+    // Update flow control
     flow.inc_window(increment)
         .expect("unexpected flow control state");
+
     if let Some(last_update_at) = last_update_at {
         *last_update_at = Instant::now();
     }
