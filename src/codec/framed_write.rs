@@ -125,6 +125,10 @@ const CHAIN_THRESHOLD: usize = 256;
 /// fragmented data being sent, and hereby improve the throughput.
 const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
 
+/// Buffered bytes below which a write is small: the connection can yield
+/// before it, so that more frames share it.
+const SMALL_WRITE_LIMIT: usize = 1024;
+
 /// Max slices `poll_write_buf` passes to one vectored write (tokio-util's
 /// private `MAX_BUFS`).
 const WRITE_SLICES: usize = 64;
@@ -259,6 +263,12 @@ where
         }
 
         Poll::Ready(Ok(()))
+    }
+
+    /// Returns the size of the next write, if it is small enough to share
+    /// one with frames queued a moment later.
+    pub(crate) fn small_write_len(&self) -> Option<usize> {
+        self.encoder.small_write_len()
     }
 
     /// Flush buffered data to the wire
@@ -497,6 +507,17 @@ where
 
     fn has_capacity(&self) -> bool {
         self.has_capacity_after(0)
+    }
+
+    /// A chained payload makes a write big. With one frame per write, no
+    /// frame shares one.
+    fn small_write_len(&self) -> Option<usize> {
+        let len = self.buf.remaining();
+
+        (self.next.is_none()
+            && self.one_frame_per_write == OneFramePerWrite::Off
+            && (1..SMALL_WRITE_LIMIT).contains(&len))
+        .then_some(len)
     }
 
     fn is_empty(&self) -> bool {
