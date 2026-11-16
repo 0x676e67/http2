@@ -1,9 +1,15 @@
+use crate::codec::UserError;
 use crate::{Reason, tracing};
 
+use super::recv::Event;
+use super::state::RecvStatus;
+use super::sync::{Mutex, MutexGuard};
 use super::*;
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::task::{Context, Waker};
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
 /// Tracks Stream related state
@@ -88,8 +94,6 @@ pub(super) struct Stream {
     /// Receive data flow control
     pub recv_flow: FlowControl,
 
-    pub in_flight_recv_data: WindowSize,
-
     /// Next node in the linked list of streams waiting to send window updates.
     pub next_window_update: Option<store::Key>,
 
@@ -102,14 +106,14 @@ pub(super) struct Stream {
     /// Next node in list of reset streams that should expire eventually
     pub next_reset_expire: Option<store::Key>,
 
-    /// Frames pending for this stream to read
-    pub pending_recv: buffer::Deque,
+    /// Receive queue shared with the stream's handles
+    pub shared: Arc<Shared>,
+
+    /// Receive status last published to `shared`
+    recv_status: RecvStatus,
 
     /// When the RecvStream drop occurs, no data should be received.
     pub is_recv: bool,
-
-    /// Task tracking receiving frames
-    pub recv_task: Option<Waker>,
 
     /// Task tracking pushed promises.
     pub push_task: Option<Waker>,
@@ -125,6 +129,54 @@ pub(super) struct Stream {
 
     /// `HeadersDependency::Chain` link of a client request.
     pub chain_link: Option<ChainLink>,
+}
+
+/// Receive state a stream shares with its handles.
+///
+/// A handle reaches it through its own `Arc`, so reading a queued frame takes
+/// this lock alone. The connection takes it while holding the lock on all
+/// streams, never the other way round.
+#[derive(Debug)]
+pub(super) struct Shared {
+    recv: Mutex<RecvQueue>,
+}
+
+/// Frames a stream has received, and the task waiting for more.
+///
+/// Laid out as declared, like [`Events`]: what every frame reads and writes
+/// comes first, next to the lock, and the frames it rarely reaches last.
+#[derive(Debug)]
+#[repr(C)]
+pub(super) struct RecvQueue {
+    /// Task tracking receiving frames
+    task: Option<Waker>,
+
+    /// Received DATA whose capacity is yet to be released
+    pub in_flight: WindowSize,
+
+    /// What the stream's state allows once `pending` is empty
+    status: RecvStatus,
+
+    /// Frames pending for this stream to read
+    pub pending: Events,
+}
+
+/// A queue of received frames, oldest first.
+///
+/// The first few are held in place. A message is mostly read before more
+/// than its head, a DATA frame and its trailers are queued, and then takes
+/// no allocation.
+#[derive(Debug, Default)]
+#[repr(C)]
+pub(super) struct Events {
+    head: usize,
+    len: usize,
+
+    /// Frames received while the ring was full or these were queued
+    rest: VecDeque<Event>,
+
+    /// Ring of the oldest frames, starting at `head`
+    ring: [Option<Event>; Events::INLINE],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,7 +215,24 @@ pub(super) struct NextOpen;
 pub(super) struct NextResetExpire;
 
 impl Stream {
+    /// Creates a stream with a receive queue of its own.
+    #[cfg(test)]
     pub fn new(id: StreamId, init_send_window: WindowSize, init_recv_window: WindowSize) -> Stream {
+        Self::with_shared(
+            id,
+            init_send_window,
+            init_recv_window,
+            Arc::new(Shared::new()),
+        )
+    }
+
+    /// Creates a stream on `shared`, which no other stream or handle uses.
+    pub fn with_shared(
+        id: StreamId,
+        init_send_window: WindowSize,
+        init_recv_window: WindowSize,
+        shared: Arc<Shared>,
+    ) -> Stream {
         let mut send_flow = FlowControl::new();
         let mut recv_flow = FlowControl::new();
 
@@ -204,14 +273,13 @@ impl Stream {
             next_pending_accept: None,
             is_pending_accept: false,
             recv_flow,
-            in_flight_recv_data: 0,
             next_window_update: None,
             is_pending_window_update: false,
             reset_at: None,
             next_reset_expire: None,
-            pending_recv: buffer::Deque::new(),
+            shared,
+            recv_status: RecvStatus::Open,
             is_recv: true,
-            recv_task: None,
             push_task: None,
             pending_push_promises: store::Queue::new(),
             content_length: ContentLength::Omitted,
@@ -383,10 +451,10 @@ impl Stream {
 
     pub fn notify_send(&mut self) {
         if let Some(task) = self.send_task.take() {
-            task.wake();
+            sync::defer_wake(task);
         }
         if let Some(task) = self.open_task.take() {
-            task.wake();
+            sync::defer_wake(task);
         }
     }
 
@@ -398,15 +466,76 @@ impl Stream {
         self.send_task = Some(cx.waker().clone());
     }
 
+    /// Locks the receive queue shared with the stream's handles.
+    #[inline]
+    pub fn recv(&self) -> MutexGuard<'_, RecvQueue> {
+        self.shared.recv()
+    }
+
+    /// Queues a received frame and notifies the receiver.
+    ///
+    /// The frame is queued together with the status the state has reached by
+    /// receiving it, so a handle never reads the last frame as one of more.
+    pub fn push_recv(&mut self, event: Event) {
+        self.push_recv_in_flight(event, 0);
+    }
+
+    /// Queues a received DATA frame like `push_recv`. Its payload is in
+    /// flight until its capacity is released.
+    pub fn push_recv_data(&mut self, data: recv::DataEvent) {
+        let in_flight = data.payload.len() as WindowSize;
+        self.push_recv_in_flight(Event::Data(data), in_flight);
+    }
+
+    // Inlined, so that a frame whose kind is known is written in place.
+    #[inline]
+    fn push_recv_in_flight(&mut self, event: Event, in_flight: WindowSize) {
+        self.recv_status = self.state.recv_status();
+
+        let mut recv = self.shared.recv();
+        recv.status = self.recv_status;
+        recv.in_flight += in_flight;
+        recv.pending.push_back(event);
+        recv.notify();
+    }
+
     pub fn notify_recv(&mut self) {
-        if let Some(task) = self.recv_task.take() {
-            task.wake();
+        // A state change is what the receiver is most often notified of.
+        if !self.publish_recv_status() {
+            self.recv().notify();
         }
+    }
+
+    /// Publishes what the state allows the receiver, and returns whether that
+    /// changed, in which case the receiver was notified.
+    ///
+    /// Handles read the published status without the lock on all streams, so
+    /// every change of `state` must be followed by this, which
+    /// `Counts::transition_after` and `notify_recv` see to.
+    #[inline]
+    pub fn publish_recv_status(&mut self) -> bool {
+        let status = self.state.recv_status();
+        if status == self.recv_status {
+            return false;
+        }
+        self.set_recv_status(status);
+        true
+    }
+
+    /// A stream changes its status a few times at most, so this is kept out
+    /// of the check that runs after every action on it.
+    #[cold]
+    fn set_recv_status(&mut self, status: RecvStatus) {
+        self.recv_status = status;
+
+        let mut recv = self.shared.recv();
+        recv.status = status;
+        recv.notify();
     }
 
     pub(super) fn notify_push(&mut self) {
         if let Some(task) = self.push_task.take() {
-            task.wake();
+            sync::defer_wake(task);
         }
     }
 
@@ -451,18 +580,12 @@ impl fmt::Debug for Stream {
             .h2_field_some("next_pending_accept", &self.next_pending_accept)
             .h2_field_if("is_pending_accept", &self.is_pending_accept)
             .field("recv_flow", &self.recv_flow)
-            .field("in_flight_recv_data", &self.in_flight_recv_data)
             .h2_field_some("next_window_update", &self.next_window_update)
             .h2_field_if("is_pending_window_update", &self.is_pending_window_update)
             .h2_field_some("reset_at", &self.reset_at)
             .h2_field_some("next_reset_expire", &self.next_reset_expire)
-            .h2_field_if_then(
-                "pending_recv",
-                !self.pending_recv.is_empty(),
-                &self.pending_recv,
-            )
+            .field("recv_status", &self.recv_status)
             .h2_field_if("is_recv", &self.is_recv)
-            .h2_field_some("recv_task", &self.recv_task.as_ref().map(|_| ()))
             .h2_field_some("push_task", &self.push_task.as_ref().map(|_| ()))
             .h2_field_if_then(
                 "pending_push_promises",
@@ -620,6 +743,247 @@ impl store::Next for NextResetExpire {
     }
 }
 
+// ===== impl Shared =====
+
+impl Shared {
+    pub fn new() -> Self {
+        Shared {
+            recv: Mutex::new(RecvQueue {
+                task: None,
+                in_flight: 0,
+                status: RecvStatus::Open,
+                pending: Events::default(),
+            }),
+        }
+    }
+
+    /// Returns the queue to its initial state, for the next stream to use.
+    pub fn reset(&mut self) {
+        let recv = self.recv.get_mut();
+        while recv.pending.pop_front().is_some() {}
+        recv.in_flight = 0;
+        recv.task = None;
+        recv.status = RecvStatus::Open;
+    }
+
+    /// Locks the receive queue.
+    #[inline]
+    pub fn recv(&self) -> MutexGuard<'_, RecvQueue> {
+        self.recv.lock()
+    }
+}
+
+// ===== impl RecvQueue =====
+
+impl RecvQueue {
+    /// Registers the task to notify when a frame arrives or the status changes.
+    pub fn wait(&mut self, cx: &Context) {
+        self.task = Some(cx.waker().clone());
+    }
+
+    /// Wakes the waiting task, which a connection that wakes the readers of
+    /// its frames in batches holds back for the batch.
+    pub fn notify(&mut self) {
+        if let Some(task) = self.task.take() {
+            sync::defer_wake(task);
+        }
+    }
+
+    /// Takes the request head a server stream's queue starts with.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the queue has no `Event::Headers` at its front.
+    pub fn take_request(&mut self) -> http::Request<()> {
+        match self.pending.pop_front() {
+            Some(Event::Headers(peer::PollMessage::Server(request))) => request,
+            _ => unreachable!("server stream queue must start with Headers"),
+        }
+    }
+
+    /// Polls for the response head, as `Recv::poll_response` does. `None`
+    /// leaves the outcome to the stream's state.
+    pub fn poll_response(&mut self, cx: &Context) -> Option<Poll<http::Response<()>>> {
+        use peer::PollMessage::Client;
+
+        loop {
+            match self.pending.front() {
+                Some(Event::Headers(Client(_))) => break,
+                // Interim responses are read through `poll_informational`.
+                Some(Event::InformationalHeaders(_)) => {
+                    self.pending.pop_front();
+                }
+                Some(_) => return None,
+                None if self.status == RecvStatus::Open => {
+                    self.wait(cx);
+                    return Some(Poll::Pending);
+                }
+                None => return None,
+            }
+        }
+
+        match self.pending.pop_front() {
+            Some(Event::Headers(Client(response))) => Some(Poll::Ready(response)),
+            _ => None,
+        }
+    }
+
+    /// Polls for a DATA frame, as `Recv::poll_data` does. `None` leaves the
+    /// outcome to the stream's state.
+    pub fn poll_data(&mut self, cx: &Context) -> Option<Poll<Option<recv::DataEvent>>> {
+        if let Some(data) = self.pending.pop_front_data() {
+            return Some(Poll::Ready(Some(data)));
+        }
+
+        match self.pending.front() {
+            // The frame is trailers, which may already be waited for.
+            Some(_) => {
+                self.notify();
+                Some(Poll::Ready(None))
+            }
+            None => self.poll_empty(cx),
+        }
+    }
+
+    /// Polls for trailers, as `Recv::poll_trailers` does. `None` leaves the
+    /// outcome to the stream's state.
+    pub fn poll_trailers(&mut self, cx: &Context) -> Option<Poll<Option<http::HeaderMap>>> {
+        match self.pending.front() {
+            Some(Event::Trailers(_)) => match self.pending.pop_front() {
+                Some(Event::Trailers(trailers)) => Some(Poll::Ready(Some(trailers))),
+                _ => None,
+            },
+            // Not trailers yet, so the frames ahead must be read first.
+            Some(_) => {
+                self.wait(cx);
+                Some(Poll::Pending)
+            }
+            None => self.poll_empty(cx),
+        }
+    }
+
+    /// The outcome of polling an empty queue for a body frame.
+    fn poll_empty<T>(&mut self, cx: &Context) -> Option<Poll<Option<T>>> {
+        match self.status {
+            RecvStatus::Open => {
+                self.wait(cx);
+                Some(Poll::Pending)
+            }
+            RecvStatus::EndStream => Some(Poll::Ready(None)),
+            RecvStatus::Closed => None,
+        }
+    }
+
+    /// Returns whether END_STREAM was received and every frame before it read.
+    pub fn is_end_stream(&self) -> bool {
+        self.status == RecvStatus::EndStream && self.pending.is_empty()
+    }
+
+    /// Takes `capacity` off the received data that is yet to be released.
+    pub fn release_in_flight(&mut self, capacity: WindowSize) -> Result<(), UserError> {
+        if capacity > self.in_flight {
+            return Err(UserError::ReleaseCapacityTooBig);
+        }
+        self.in_flight -= capacity;
+        Ok(())
+    }
+}
+
+// ===== impl Events =====
+
+impl Events {
+    const INLINE: usize = 3;
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0 && self.rest.is_empty()
+    }
+
+    pub fn front(&self) -> Option<&Event> {
+        if self.len == 0 {
+            return self.rest.front();
+        }
+        self.ring[self.head].as_ref()
+    }
+
+    #[inline]
+    pub fn push_back(&mut self, event: Event) {
+        // The ring only holds frames older than all of `rest`.
+        if self.len == Self::INLINE || !self.rest.is_empty() {
+            self.rest.push_back(event);
+            return;
+        }
+
+        self.ring[Self::wrap(self.head + self.len)] = Some(event);
+        self.len += 1;
+    }
+
+    pub fn push_front(&mut self, event: Event) {
+        // Make room by moving the ring's newest frame ahead of `rest`.
+        if self.len == Self::INLINE {
+            let newest = Self::wrap(self.head + self.len - 1);
+            if let Some(newest) = self.ring[newest].take() {
+                self.rest.push_front(newest);
+            }
+            self.len -= 1;
+        }
+
+        self.head = Self::wrap(self.head + Self::INLINE - 1);
+        self.ring[self.head] = Some(event);
+        self.len += 1;
+    }
+
+    pub fn pop_front(&mut self) -> Option<Event> {
+        if self.len == 0 {
+            return self.rest.pop_front();
+        }
+
+        let event = self.ring[self.head].take();
+        self.advance();
+        event
+    }
+
+    /// Like `pop_front` if a DATA frame is at the front, of which only the
+    /// frame itself is moved, not a slot sized for a message head.
+    pub fn pop_front_data(&mut self) -> Option<recv::DataEvent> {
+        if self.len == 0 {
+            return match self.rest.front() {
+                Some(Event::Data(_)) => match self.rest.pop_front() {
+                    Some(Event::Data(data)) => Some(data),
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+
+        let slot = &mut self.ring[self.head];
+        let Some(Event::Data(data)) = slot else {
+            return None;
+        };
+        let data = recv::DataEvent {
+            payload: std::mem::take(&mut data.payload),
+            is_budgeted: data.is_budgeted,
+        };
+        *slot = None;
+        self.advance();
+        Some(data)
+    }
+
+    /// Moves past the ring's oldest slot, which was just emptied.
+    fn advance(&mut self) {
+        self.len -= 1;
+        // An emptied ring starts over, so that a stream read as fast as it
+        // receives keeps to one slot of it.
+        self.head = match self.len {
+            0 => 0,
+            _ => Self::wrap(self.head + 1),
+        };
+    }
+
+    fn wrap(index: usize) -> usize {
+        index % Self::INLINE
+    }
+}
+
 // ===== impl ContentLength =====
 
 impl ContentLength {
@@ -637,5 +1001,60 @@ impl ContentLength {
         status.is_some_and(|status| {
             status.is_informational() || (matches!(*self, Self::Connect) && status.is_success())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recv::DataEvent;
+    use super::*;
+
+    fn event(n: u8) -> Event {
+        Event::Data(DataEvent {
+            payload: Bytes::from(vec![n]),
+            is_budgeted: false,
+        })
+    }
+
+    fn pop(events: &mut Events) -> Option<u8> {
+        events.pop_front_data().map(|data| data.payload[0])
+    }
+
+    #[test]
+    fn events_keep_their_order_in_and_past_the_ring() {
+        let mut events = Events::default();
+        assert!(events.is_empty() && events.front().is_none());
+
+        // Fill the ring and spill, then drain it while more frames arrive:
+        // these must stay behind the spilled ones.
+        for n in 0..5 {
+            events.push_back(event(n));
+        }
+        assert_eq!(pop(&mut events), Some(0));
+        assert_eq!(pop(&mut events), Some(1));
+        events.push_back(event(5));
+        assert_eq!(pop(&mut events), Some(2));
+
+        // A frame put back goes first, whether or not the ring has room.
+        events.push_front(event(2));
+        events.push_front(event(1));
+        events.push_front(event(0));
+        events.push_front(event(9));
+        assert!(matches!(events.front(), Some(Event::Data(data)) if data.payload[0] == 9));
+
+        let drained: Vec<_> = std::iter::from_fn(|| pop(&mut events)).collect();
+        assert_eq!(drained, [9, 0, 1, 2, 3, 4, 5]);
+
+        // The emptied ring takes frames again. Only DATA is taken as such,
+        // in the ring and past it.
+        events.push_back(event(6));
+        events.push_back(Event::Trailers(http::HeaderMap::new()));
+        (7..10).for_each(|n| events.push_back(event(n)));
+        assert_eq!((pop(&mut events), pop(&mut events)), (Some(6), None));
+        assert!(matches!(events.pop_front(), Some(Event::Trailers(_))));
+        events.push_back(Event::Trailers(http::HeaderMap::new()));
+        assert_eq!(std::iter::from_fn(|| pop(&mut events)).count(), 3);
+        assert!(matches!(events.pop_front(), Some(Event::Trailers(_))));
+        assert!(events.is_empty());
     }
 }

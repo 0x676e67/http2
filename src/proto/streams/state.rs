@@ -54,6 +54,17 @@ pub struct State {
     inner: Inner,
 }
 
+/// Whether a stream's state lets more frames arrive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecvStatus {
+    /// More frames can arrive.
+    Open,
+    /// END_STREAM was received.
+    EndStream,
+    /// No frame will arrive, for a reason the state holds.
+    Closed,
+}
+
 #[derive(Debug, Clone)]
 enum Inner {
     Idle,
@@ -455,6 +466,18 @@ impl State {
         matches!(self.inner, Idle)
     }
 
+    /// What a receiver that has read every queued frame can expect, as
+    /// `ensure_recv_open` and `is_recv_end_stream` tell it.
+    pub fn recv_status(&self) -> RecvStatus {
+        match self.inner {
+            Idle | ReservedRemote | Open { .. } | HalfClosedLocal(..) => RecvStatus::Open,
+            Closed(Cause::EndStream | Cause::ErrorAfterEndStream(_)) | HalfClosedRemote(..) => {
+                RecvStatus::EndStream
+            }
+            Closed(..) | ReservedLocal => RecvStatus::Closed,
+        }
+    }
+
     pub fn ensure_recv_open(&self) -> Result<bool, proto::Error> {
         // TODO: Is this correct?
         match self.inner {
@@ -541,6 +564,44 @@ mod tests {
         state.recv_open(&headers).unwrap();
         assert!(state.is_recv_end_stream());
         state
+    }
+
+    #[test]
+    fn recv_status_matches_what_the_stream_lock_reports() {
+        let error = Error::library_go_away(Reason::INTERNAL_ERROR);
+        let states = [
+            Idle,
+            ReservedLocal,
+            ReservedRemote,
+            Open {
+                local: Streaming,
+                remote: AwaitingHeaders,
+            },
+            HalfClosedLocal(Streaming),
+            HalfClosedRemote(Streaming),
+            Closed(Cause::EndStream),
+            Closed(Cause::Error(error.clone())),
+            Closed(Cause::ErrorAfterEndStream(error)),
+            Closed(Cause::ScheduledLibraryReset(Reason::CANCEL)),
+        ];
+
+        // A handle acts on the status alone, where it once asked the state.
+        for inner in states {
+            let state = State { inner };
+            let expected = match state.ensure_recv_open() {
+                Ok(true) => RecvStatus::Open,
+                _ if state.is_recv_end_stream() => RecvStatus::EndStream,
+                _ => RecvStatus::Closed,
+            };
+
+            assert_eq!(state.recv_status(), expected, "{state:?}");
+            // Only a clean end lets a handle report it without the state.
+            assert_eq!(
+                state.recv_status() == RecvStatus::EndStream,
+                matches!(state.ensure_recv_open(), Ok(false)) && state.is_recv_end_stream(),
+                "{state:?}"
+            );
+        }
     }
 
     #[test]

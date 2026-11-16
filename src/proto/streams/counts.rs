@@ -85,6 +85,9 @@ pub(super) struct Counts {
     /// Whether the DATA frame budget follows the target connection window.
     data_frame_budget_is_auto: bool,
 
+    /// How much of what handles have released is counted in, as a running sum.
+    released_data_frames: usize,
+
     /// Number of consecutive empty, non-final DATA frames received since the
     /// last DATA frame carrying payload.
     num_recv_empty_data_frames: usize,
@@ -111,6 +114,7 @@ impl Counts {
             num_local_error_reset_streams: 0,
             data_frame_budget: Budget::new(config.data_frame_budget.resolve(None)),
             data_frame_budget_is_auto: config.data_frame_budget.is_auto(),
+            released_data_frames: 0,
             num_recv_empty_data_frames: 0,
             chain_parents: ChainParents::default(),
         }
@@ -147,9 +151,24 @@ impl Counts {
     /// Releases the framing overhead of a DATA frame that is no longer
     /// buffered internally.
     pub fn release_data_frame(&mut self, payload_len: usize) {
+        self.data_frame_budget
+            .replenish(Self::data_frame_overhead(payload_len));
+    }
+
+    /// Counts in the budget handles have released by reading DATA frames,
+    /// given as its running sum, which wraps.
+    pub fn sync_released_data_frames(&mut self, released: usize) {
+        let amount = released.wrapping_sub(self.released_data_frames);
+        self.released_data_frames = released;
+        self.data_frame_budget.replenish(amount);
+    }
+
+    /// The budget a buffered DATA frame of `payload_len` holds until released.
+    pub fn data_frame_overhead(payload_len: usize) -> usize {
         if payload_len != 0 && payload_len < DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD {
-            self.data_frame_budget
-                .replenish(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len);
+            DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len
+        } else {
+            0
         }
     }
 
@@ -329,7 +348,13 @@ impl Counts {
             self.num_send_streams
         );
 
-        self.chain_parents.detach(&mut stream);
+        {
+            // Resolved once for both, as this runs after every action.
+            let stream = &mut *stream;
+            self.chain_parents.detach(stream);
+            // Handles read the receive status without the lock.
+            stream.publish_recv_status();
+        }
 
         // The reset slot belongs to the expiration queue entry, so it is freed
         // once the stream leaves the queue, even with frames still to send.
