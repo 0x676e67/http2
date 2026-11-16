@@ -441,6 +441,14 @@ where
         let me = self.inner.lock();
         me.counts.max_recv_streams()
     }
+
+    pub(crate) fn start_connection_window_updates(&mut self) {
+        self.inner
+            .lock()
+            .actions
+            .recv
+            .start_connection_window_updates();
+    }
 }
 
 impl<B> DynStreams<'_, B> {

@@ -143,11 +143,6 @@ use crate::frame::{Headers, Pseudo, Reason, Settings, StreamId};
 use crate::proto::{self, Error};
 use crate::{FlowControl, PingPong, RecvStream, SendStream, tracing};
 
-pub use crate::frame::{
-    Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, PseudoOrderBuilder, SettingId,
-    SettingsOrder, SettingsOrderBuilder, StreamDependency,
-};
-
 #[cfg(feature = "tracing")]
 use ::tracing::Instrument;
 use bytes::{Buf, Bytes};
@@ -158,6 +153,14 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+pub use crate::{
+    frame::{
+        Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, PseudoOrderBuilder,
+        SettingId, SettingsOrder, SettingsOrderBuilder, StreamDependency,
+    },
+    proto::streams::{WindowUpdatePolicy, WindowUpdateRule},
+};
 
 // The fixed 24-byte sequence that starts the client connection preface. The
 // initial SETTINGS frame completes the preface.
@@ -390,6 +393,7 @@ pub struct Builder {
 
     /// Initial target receive window size for locally initiated streams.
     initial_target_stream_window_size: Option<u32>,
+    window_update_policy: WindowUpdatePolicy,
 }
 
 #[derive(Debug)]
@@ -720,6 +724,7 @@ impl Builder {
             preface_ping: None,
             preface_ping_timeout: None,
             initial_target_stream_window_size: None,
+            window_update_policy: WindowUpdatePolicy::default(),
         }
     }
 
@@ -1576,6 +1581,15 @@ impl Builder {
         self.preface_ping_timeout = Some(timeout);
         self
     }
+
+    /// Replaces the receive window update rules for streams and the connection.
+    ///
+    /// Each level without a rule uses the default remaining-window threshold.
+    /// Pass [`WindowUpdatePolicy::default()`] to reset both levels.
+    pub fn window_update_policy(&mut self, policy: WindowUpdatePolicy) -> &mut Self {
+        self.window_update_policy = policy;
+        self
+    }
 }
 
 impl Default for Builder {
@@ -1724,6 +1738,7 @@ where
                 priorities: builder.priorities,
                 preface_ping: builder.preface_ping,
                 preface_ping_timeout: builder.preface_ping_timeout,
+                window_update_policy: builder.window_update_policy,
             },
         );
         let send_request = SendRequest {

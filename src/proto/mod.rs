@@ -4,7 +4,7 @@ mod go_away;
 mod peer;
 mod ping_pong;
 mod settings;
-mod streams;
+pub(crate) mod streams;
 
 pub(crate) use self::connection::{Config, Connection, DataFrameBudget};
 pub use self::error::{Error, Initiator};

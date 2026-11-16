@@ -125,6 +125,7 @@ pub(super) struct Stream {
 
     /// `HeadersDependency::Chain` link of a client request.
     pub chain_link: Option<ChainLink>,
+    pub last_window_update_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,6 +218,7 @@ impl Stream {
             content_length: ContentLength::Omitted,
             initial_window: None,
             chain_link: None,
+            last_window_update_at: None,
         }
     }
 
