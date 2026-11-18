@@ -478,6 +478,14 @@ where
 
     /// Advances the internal state of the connection.
     pub fn poll(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        let polled = self.poll_streams(cx);
+        if polled.is_pending() {
+            self.inner.streams.leave_poll(cx);
+        }
+        polled
+    }
+
+    fn poll_streams(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         // XXX(eliza): cloning the span is unfortunately necessary here in
         // order to placate the borrow checker — `self` is mutably borrowed by
         // `poll2`, which means that we can't borrow `self.span` to enter it.
@@ -586,7 +594,13 @@ where
         // second (and thus, the clock wouldn't have changed enough to matter).
         self.clear_expired_reset_streams();
 
+        let wakes = self.inner.streams.wake_scope();
+
         loop {
+            if let Some(wakes) = &wakes {
+                wakes.wake_full_batch();
+            }
+
             // First, ensure that the `Connection` is able to receive a frame
             //
             // The order here matters:

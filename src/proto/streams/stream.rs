@@ -383,10 +383,10 @@ impl Stream {
 
     pub fn notify_send(&mut self) {
         if let Some(task) = self.send_task.take() {
-            task.wake();
+            sync::defer_wake(task);
         }
         if let Some(task) = self.open_task.take() {
-            task.wake();
+            sync::defer_wake(task);
         }
     }
 
@@ -400,13 +400,13 @@ impl Stream {
 
     pub fn notify_recv(&mut self) {
         if let Some(task) = self.recv_task.take() {
-            task.wake();
+            sync::defer_wake(task);
         }
     }
 
     pub(super) fn notify_push(&mut self) {
         if let Some(task) = self.push_task.take() {
-            task.wake();
+            sync::defer_wake(task);
         }
     }
 
