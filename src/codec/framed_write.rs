@@ -125,6 +125,10 @@ const CHAIN_THRESHOLD: usize = 256;
 /// fragmented data being sent, and hereby improve the throughput.
 const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
 
+/// Buffered bytes below which a write is small: the connection can yield
+/// before it, so that more frames share it.
+const SMALL_WRITE_LIMIT: usize = 1024;
+
 /// Max slices `poll_write_buf` passes to one vectored write (tokio-util's
 /// private `MAX_BUFS`).
 const WRITE_SLICES: usize = 64;
@@ -259,6 +263,12 @@ where
         }
 
         Poll::Ready(Ok(()))
+    }
+
+    /// Returns the size of the next write, if it is small enough to share
+    /// one with frames queued a moment later.
+    pub(crate) fn small_write_len(&self) -> Option<usize> {
+        self.encoder.small_write_len()
     }
 
     /// Flush buffered data to the wire
@@ -497,6 +507,17 @@ where
 
     fn has_capacity(&self) -> bool {
         self.has_capacity_after(0)
+    }
+
+    /// A chained payload makes a write big. With one frame per write, no
+    /// frame shares one.
+    fn small_write_len(&self) -> Option<usize> {
+        let len = self.buf.remaining();
+
+        (self.next.is_none()
+            && self.one_frame_per_write == OneFramePerWrite::Off
+            && (1..SMALL_WRITE_LIMIT).contains(&len))
+        .then_some(len)
     }
 
     fn is_empty(&self) -> bool {
@@ -955,6 +976,31 @@ mod tests {
         codec.set_one_frame_per_write();
         codec.buffer(data(&[8_000])).unwrap();
         assert!(!codec.has_capacity());
+    }
+
+    #[test]
+    fn small_write_len_is_that_of_a_write_more_frames_could_share() {
+        let mut codec = FramedWrite::new(Writes::default());
+        assert_eq!(codec.small_write_len(), None);
+
+        // Copied frames add up, until the write is no small one
+        codec.buffer(ping()).unwrap();
+        codec.buffer(data(&[SMALL_WRITE_LIMIT - 27])).unwrap();
+        assert_eq!(codec.small_write_len(), Some(SMALL_WRITE_LIMIT - 1));
+        codec.buffer(data(&[0])).unwrap();
+        assert_eq!(codec.small_write_len(), None);
+        send(&mut codec, []);
+
+        // A chained payload goes with what is buffered, however small
+        codec.set_max_data_frame_size(16_375);
+        codec.buffer(data(&[100])).unwrap();
+        assert_eq!(codec.small_write_len(), None);
+
+        // With one frame per write no frame shares one, the first write aside
+        let mut codec = FramedWrite::new(Writes::default());
+        codec.set_one_frame_per_write();
+        codec.buffer(ping()).unwrap();
+        assert_eq!(codec.small_write_len(), None);
     }
 
     #[test]
