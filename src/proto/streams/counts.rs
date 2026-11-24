@@ -296,13 +296,10 @@ impl Counts {
     where
         F: FnOnce(&mut Self, &mut store::Ptr) -> U,
     {
-        // TODO: Does this need to be computed before performing the action?
-        let is_pending_reset = stream.is_pending_reset_expiration();
-
         // Run the action
         let ret = f(self, &mut stream);
 
-        self.transition_after(stream, is_pending_reset);
+        self.transition_after(stream);
 
         ret
     }
@@ -313,9 +310,8 @@ impl Counts {
         self.chain_parents.attach(stream)
     }
 
-    /// Settles the stream's counts after an action. `is_reset_counted` tells
-    /// whether it held a reset slot, i.e. was queued to expire, beforehand.
-    pub fn transition_after(&mut self, mut stream: store::Ptr, is_reset_counted: bool) {
+    /// Settles the stream's counts after an action.
+    pub fn transition_after(&mut self, mut stream: store::Ptr) {
         tracing::trace!(
             "transition_after; stream={:?}; state={:?}; is_closed={:?}; \
              pending_send_empty={:?}; buffered_send_data={}; \
@@ -330,12 +326,6 @@ impl Counts {
         );
 
         self.chain_parents.detach(&mut stream);
-
-        // The reset slot belongs to the expiration queue entry, so it is freed
-        // once the stream leaves the queue, even with frames still to send.
-        if is_reset_counted && !stream.is_pending_reset_expiration() {
-            self.dec_num_reset_streams();
-        }
 
         if stream.is_closed() {
             if !stream.is_pending_reset_expiration() {
@@ -381,7 +371,7 @@ impl Counts {
         }
     }
 
-    fn dec_num_reset_streams(&mut self) {
+    pub fn dec_num_reset_streams(&mut self) {
         assert!(self.num_local_reset_streams > 0);
         self.num_local_reset_streams -= 1;
     }
@@ -564,7 +554,7 @@ mod tests {
         // Writing it later frees the stream without a second decrement.
         let mut stream = store.find_mut(&id).unwrap();
         stream.pending_send.pop_front(&mut buffer);
-        counts.transition_after(stream, false);
+        counts.transition_after(stream);
         assert!(store.find_mut(&id).is_none());
     }
 }

@@ -532,7 +532,10 @@ where
 
                             // Frames that may rely on received SETTINGS
                             // follow their ACK.
-                            ready!(self.inner.settings.poll_send_acks(cx, &mut self.codec))?;
+                            ready!(self.inner.settings.poll_send_acks(cx, &mut self.codec))
+                                .map_err(|err| {
+                                    self.remote_go_away_if_idle().unwrap_or_else(|| err.into())
+                                })?;
 
                             // Ensure all window updates have been sent.
                             //
@@ -541,7 +544,10 @@ where
                                 cx,
                                 &mut self.codec,
                                 self.inner.ping_pong.preface_ping_mut()
-                            ))?;
+                            ))
+                            .map_err(|err| {
+                                self.remote_go_away_if_idle().unwrap_or_else(|| err.into())
+                            })?;
 
                             if (self.inner.error.is_some()
                                 || self.inner.go_away.should_close_on_idle())
@@ -559,13 +565,22 @@ where
                         }
                     };
 
+                    if matches!(&result, Err(Error::Io(..)))
+                        && let Some(err) = self.remote_go_away_if_idle()
+                    {
+                        return Poll::Ready(Err(err));
+                    }
+
                     self.inner.as_dyn().handle_poll2_result(result)?
                 }
                 State::Closing(reason, initiator) => {
                     tracing::trace!("connection closing after flush");
                     // Flush/shutdown the codec, without waiting for a peer
                     // that timed out a preface PING.
-                    if self.codec.shutdown(cx)?.is_pending() && !self.preface_ping_expired() {
+                    let shutdown = self.codec.shutdown(cx).map_err(|err| {
+                        self.remote_go_away_if_idle().unwrap_or_else(|| err.into())
+                    })?;
+                    if shutdown.is_pending() && !self.preface_ping_expired() {
                         self.discard_input(cx);
                         return Poll::Pending;
                     }
@@ -669,6 +684,20 @@ where
     /// Returns the remote extended CONNECT setting, or `None` before its initial SETTINGS.
     pub(crate) fn remote_extended_connect(&self) -> Option<bool> {
         self.inner.settings.remote_extended_connect()
+    }
+
+    fn remote_go_away_if_idle(&self) -> Option<Error> {
+        let frame = self.inner.error.as_ref()?;
+        if frame.reason() == Reason::NO_ERROR || self.inner.streams.has_streams() {
+            return None;
+        }
+
+        // Preserve the peer's shutdown reason if transport I/O fails after
+        // all streams have finished or been rejected.
+        Some(Error::remote_go_away(
+            frame.debug_data().clone(),
+            frame.reason(),
+        ))
     }
 }
 
