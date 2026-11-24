@@ -407,7 +407,7 @@ impl Prioritize {
             // `Store::for_each`. The caller transitions its own stream.
             if !(stream.state.is_send_streaming() || stream.buffered_send_data > 0) {
                 if held_key != Some(stream.key()) && stream.is_released() {
-                    counts.transition_after(stream, false);
+                    counts.transition_after(stream);
                 }
                 continue;
             }
@@ -557,9 +557,8 @@ impl Prioritize {
                 stream.initial_window == Some(stream::InitialWindow::Pending)
                     && (stream.state.is_reset() || stream.state.is_scheduled_reset())
             }) {
-                let is_pending_reset = stream.is_pending_reset_expiration();
                 self.discard_unopened_request(buffer, &mut stream, counts);
-                counts.transition_after(stream, is_pending_reset);
+                counts.transition_after(stream);
             }
 
             if let Some(mut stream) = self.pop_pending_open(store, counts) {
@@ -738,11 +737,10 @@ impl Prioritize {
 
     pub fn clear_pending_send(&mut self, store: &mut Store, counts: &mut Counts) {
         while let Some(mut stream) = self.pending_send.pop(store) {
-            let is_pending_reset = stream.is_pending_reset_expiration();
             if let Some(reason) = stream.state.get_scheduled_reset() {
                 stream.set_reset(reason, Initiator::Library);
             }
-            counts.transition_after(stream, is_pending_reset);
+            counts.transition_after(stream);
         }
     }
 
@@ -752,8 +750,7 @@ impl Prioritize {
             // or when it was never tracked, misses the connection-wide
             // notification, so wake `SendRequest::poll_ready` waiting on it here.
             stream.notify_send();
-            let is_pending_reset = stream.is_pending_reset_expiration();
-            counts.transition_after(stream, is_pending_reset);
+            counts.transition_after(stream);
         }
     }
 
@@ -777,20 +774,13 @@ impl Prioritize {
             };
             let _span = tracing::trace_span!("popped", ?stream.id, ?stream.state);
 
-            // It's possible that this stream, besides having data to send,
-            // is also queued to send a reset, and thus is already in the queue
-            // to wait for "some time" after a reset.
-            //
-            // To be safe, we just always ask the stream.
-            let is_pending_reset = stream.is_pending_reset_expiration();
-
-            tracing::trace!(is_pending_reset);
+            tracing::trace!(is_pending_reset = stream.is_pending_reset_expiration());
 
             if stream.initial_window == Some(stream::InitialWindow::Pending)
                 && (stream.state.is_reset() || stream.state.is_scheduled_reset())
             {
                 self.discard_unopened_request(buffer, &mut stream, counts);
-                counts.transition_after(stream, is_pending_reset);
+                counts.transition_after(stream);
                 continue;
             }
 
@@ -964,7 +954,7 @@ impl Prioritize {
                         // Since this should only happen as a consequence of `clear_queue`,
                         // we must be in a closed state of some kind.
                         debug_assert!(stream.state.is_closed());
-                        counts.transition_after(stream, is_pending_reset);
+                        counts.transition_after(stream);
                         continue;
                     }
                 }
@@ -985,7 +975,7 @@ impl Prioritize {
                 self.pending_send.push(&mut stream);
             }
 
-            counts.transition_after(stream, is_pending_reset);
+            counts.transition_after(stream);
 
             return Ok(Some(frame));
         }
