@@ -1586,6 +1586,10 @@ impl Builder {
     ///
     /// Each level without a rule uses the default remaining-window threshold.
     /// Pass [`WindowUpdatePolicy::default()`] to reset both levels.
+    ///
+    /// Increasing the connection target can bypass the connection rule and
+    /// return previously released capacity in the same `WINDOW_UPDATE`.
+    /// See [`Connection::set_target_window_size`].
     pub fn window_update_policy(&mut self, policy: WindowUpdatePolicy) -> &mut Self {
         self.window_update_policy = policy;
         self
@@ -1759,9 +1763,11 @@ where
 
     /// Sets the target window size for the whole connection.
     ///
-    /// If `size` is greater than the current value, then a `WINDOW_UPDATE`
-    /// frame will be immediately sent to the remote, increasing the connection
-    /// level window by `size - current_value`.
+    /// If increasing `size` makes more capacity available to the peer, the
+    /// connection can advertise it in a `WINDOW_UPDATE`. The increment can
+    /// also include previously released capacity that has yet to be advertised.
+    /// With a connection rule set through [`Builder::window_update_policy`],
+    /// the update can be queued without waiting for the rule to trigger.
     ///
     /// If `size` is less than the current value, nothing will happen
     /// immediately. However, as window capacity is released by
