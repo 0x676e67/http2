@@ -11,12 +11,14 @@ mod stream;
 #[allow(clippy::module_inception)]
 mod streams;
 mod sync;
+mod window_update;
 
 pub(crate) use self::headers_priority::HeadersPriorityPolicy;
 pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
 pub(crate) use self::send::PollReset;
 pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, RecvOutcome, StreamRef, Streams};
+pub use self::window_update::{WindowUpdatePolicy, WindowUpdateRule};
 
 use self::buffer::Buffer;
 use self::counts::Counts;
@@ -91,6 +93,7 @@ pub struct Config {
 
     /// Pseudo order of the headers stream
     pub headers_pseudo_order: Option<PseudoOrder>,
+    pub window_update_policy: WindowUpdatePolicy,
 }
 
 trait DebugStructExt<'a, 'b> {
